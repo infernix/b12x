@@ -13,7 +13,9 @@ from .kernel import (
     _should_use_schedule_multi_row_kernel,
     clear_sparse_nsa_indexer_kernel_cache,
     _should_use_schedule_single_row_kernel,
+    run_sparse_nsa_paged_decode_topk_kernel,
     run_sparse_nsa_paged_logits_kernel,
+    supports_sparse_nsa_paged_decode_topk_kernel,
     supports_sparse_nsa_paged_logits_kernel,
 )
 from .extend_kernel import (
@@ -448,6 +450,173 @@ def sparse_nsa_index_decode_logits_paged(
     )
     logits[:valid_q_rows].copy_(logits_valid)
     return logits
+
+
+def sparse_nsa_index_decode_topk_paged(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    metadata: NSAIndexerPagedDecodeMetadata,
+    topk: int,
+    page_size: int = 64,
+    output_values: torch.Tensor | None = None,
+    output_indices: torch.Tensor | None = None,
+    active_width_override: torch.Tensor | None = None,
+    chunk_pages: int | None = None,
+    contract_phantoms: dict[str, torch.Tensor] | None = None,
+    workspace=None,
+) -> torch.Tensor:
+    """Return exact paged decode top-k indices without returning full logits.
+
+    Experimental SM120 path for the current single-row/topk=512 decode regime.
+    Unsupported shapes are rejected rather than silently routed through the
+    full-logits API.
+    """
+    topk = int(topk)
+    if topk != 512:
+        raise ValueError(f"paged decode topk currently supports topk=512, got {topk}")
+    if workspace is not None:
+        raise ValueError("paged decode topk does not support workspace-backed staging yet")
+    if contract_phantoms is not None:
+        raise ValueError("paged decode topk does not support contract_phantoms yet")
+
+    weights_f = _validate_paged_decode_inputs(
+        q_fp8=q_fp8,
+        weights=weights,
+        real_page_table=metadata.real_page_table,
+        cache_seqlens_int32=metadata.cache_seqlens_int32,
+        paged_mqa_schedule_metadata=metadata.paged_mqa_schedule_metadata,
+    )
+    valid_q_rows = int(metadata.real_page_table.shape[0])
+    full_q_rows = int(q_fp8.shape[0])
+    if full_q_rows not in (0, 1):
+        raise ValueError(
+            "paged decode topk currently supports exactly one q row, got "
+            f"{full_q_rows}"
+        )
+    if valid_q_rows not in (0, full_q_rows):
+        raise ValueError(
+            "paged decode topk requires real_page_table rows to be either zero "
+            f"or match q rows, got valid_q_rows={valid_q_rows}, q_rows={full_q_rows}"
+        )
+
+    if output_indices is None:
+        result = torch.empty((full_q_rows, topk), dtype=torch.int32, device=q_fp8.device)
+    else:
+        if output_indices.dtype != torch.int32:
+            raise ValueError(f"output_indices must have dtype torch.int32, got {output_indices.dtype}")
+        if output_indices.device != q_fp8.device:
+            raise ValueError("output_indices device must match q_fp8")
+        if output_indices.ndim != 2 or output_indices.shape[0] < full_q_rows or output_indices.shape[1] < topk:
+            raise ValueError(
+                f"output_indices must have shape at least ({full_q_rows}, {topk}), "
+                f"got {tuple(output_indices.shape)}"
+            )
+        result = output_indices[:full_q_rows, :topk]
+    result.fill_(-1)
+
+    values_view = None
+    if output_values is not None:
+        if output_values.dtype != torch.float32:
+            raise ValueError(f"output_values must have dtype torch.float32, got {output_values.dtype}")
+        if output_values.device != q_fp8.device:
+            raise ValueError("output_values device must match q_fp8")
+        if output_values.ndim != 2 or output_values.shape[0] < full_q_rows or output_values.shape[1] < topk:
+            raise ValueError(
+                f"output_values must have shape at least ({full_q_rows}, {topk}), "
+                f"got {tuple(output_values.shape)}"
+            )
+        values_view = output_values[:full_q_rows, :topk]
+        values_view.fill_(float("-inf"))
+
+    width_tokens = int(metadata.real_page_table.shape[1]) * int(page_size)
+    if full_q_rows == 0 or valid_q_rows == 0 or width_tokens == 0:
+        return result
+
+    seqlens_valid = metadata.cache_seqlens_int32.contiguous()
+    if active_width_override is None:
+        active_width = _make_active_width_tensor(seqlens_per_query=seqlens_valid, width=width_tokens)
+    else:
+        if active_width_override.shape != (1,):
+            raise ValueError(
+                f"active_width_override must have shape (1,), got {tuple(active_width_override.shape)}"
+            )
+        if active_width_override.dtype != torch.int32:
+            raise ValueError(
+                "active_width_override must have dtype torch.int32, got "
+                f"{active_width_override.dtype}"
+            )
+        if active_width_override.device != q_fp8.device:
+            raise ValueError(
+                "active_width_override device "
+                f"{active_width_override.device} does not match q_fp8 device {q_fp8.device}"
+            )
+        active_width = active_width_override
+
+    validate_page_ids = q_fp8.device.type != "cuda" or (
+        _VALIDATE_PAGE_IDS and not _is_cuda_graph_capture_active(q_fp8.device)
+    )
+    if validate_page_ids:
+        active_width_host = min(width_tokens, int(active_width.item()), int(seqlens_valid.amax().item()))
+        if active_width_host > 0:
+            max_page_capacity = index_k_cache.shape[0]
+            positions = torch.arange(
+                active_width_host,
+                dtype=torch.int32,
+                device=q_fp8.device,
+            ).unsqueeze(0)
+            page_cols = torch.div(positions, page_size, rounding_mode="floor").to(torch.long)
+            candidate_pages = metadata.real_page_table.gather(1, page_cols)
+            candidate_valid_mask = (positions < seqlens_valid.unsqueeze(1)) & (candidate_pages >= 0)
+            overflow_mask = candidate_valid_mask & (candidate_pages >= max_page_capacity)
+            if torch.any(overflow_mask):
+                bad = int(candidate_pages[overflow_mask].max().item())
+                raise ValueError(
+                    f"real_page_table page id {bad} exceeds index_k_cache page capacity {max_page_capacity}"
+                )
+
+    kernel_indices = result
+    if tuple(kernel_indices.shape) != (1, topk) or not kernel_indices.is_contiguous():
+        kernel_indices = torch.empty((1, topk), dtype=torch.int32, device=q_fp8.device)
+    kernel_values = values_view
+    if kernel_values is not None and (tuple(kernel_values.shape) != (1, topk) or not kernel_values.is_contiguous()):
+        kernel_values = torch.empty((1, topk), dtype=torch.float32, device=q_fp8.device)
+
+    if not supports_sparse_nsa_paged_decode_topk_kernel(
+        q_fp8=q_fp8[:valid_q_rows],
+        weights=weights_f[:valid_q_rows],
+        index_k_cache=index_k_cache,
+        real_page_table=metadata.real_page_table,
+        seqlens_per_query=seqlens_valid,
+        page_size=page_size,
+        topk=topk,
+        output_values=kernel_values,
+        output_indices=kernel_indices,
+    ):
+        raise ValueError(
+            "paged decode topk requires CUDA FP8 q, float32 weights, uint8 packed "
+            "index cache, int32 page metadata, q_rows=1, topk=512, and page_size=64"
+        )
+
+    topk_valid = run_sparse_nsa_paged_decode_topk_kernel(
+        q_fp8=q_fp8[:valid_q_rows],
+        weights=weights_f[:valid_q_rows],
+        index_k_cache=index_k_cache,
+        real_page_table=metadata.real_page_table,
+        seqlens_per_query=seqlens_valid,
+        active_width=active_width,
+        page_size=page_size,
+        topk=topk,
+        output_values=kernel_values,
+        output_indices=kernel_indices,
+        chunk_pages=chunk_pages if chunk_pages is not None else 32,
+    )
+    if topk_valid is not result:
+        result.copy_(topk_valid)
+    if values_view is not None and kernel_values is not values_view:
+        values_view.copy_(kernel_values)
+    return result
 
 
 def sparse_nsa_index_extend_logits(

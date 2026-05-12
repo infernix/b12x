@@ -31,6 +31,7 @@ from b12x.cute.fp4 import (
 )
 from b12x.runtime_control import raise_if_kernel_resolution_frozen
 from b12x.cute.utils import current_cuda_stream
+from .tiled_topk import run_tiled_topk
 
 
 _INDEX_HEAD_DIM = 128
@@ -49,6 +50,10 @@ _SCHEDULE_MULTI_ROW_MAX_Q_ROWS = 8
 _MAX_SUPPORTED_Q_HEADS = 64
 _EAGER_HOST_LAUNCHER_CACHE_SIZE = 32
 _PAGED_Q_HEAD_TILE = 16
+_PAGED_DECODE_TOPK = 512
+_PAGED_DECODE_TOPK_BLOCK_K = 512
+_PAGED_DECODE_TOPK_PAGES_PER_TILE = _PAGED_DECODE_TOPK_BLOCK_K // _PAGE_SIZE
+_PAGED_DECODE_TOPK_CHUNK_PAGES = 32
 _PAGED_K_TMA_DESC_CACHE_SIZE = 32
 _BLACKWELL_TMA_DESC_WORDS = 16
 _BLACKWELL_TMA_DESC_MIN_BACKING_BYTES = 128 * 1024
@@ -1478,6 +1483,53 @@ def supports_sparse_nsa_paged_logits_kernel(
     return True
 
 
+def supports_sparse_nsa_paged_decode_topk_kernel(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    real_page_table: torch.Tensor,
+    seqlens_per_query: torch.Tensor,
+    page_size: int,
+    topk: int,
+    output_values: torch.Tensor | None = None,
+    output_indices: torch.Tensor | None = None,
+) -> bool:
+    if int(topk) != _PAGED_DECODE_TOPK:
+        return False
+    if q_fp8.ndim != 3 or q_fp8.shape[0] != 1:
+        return False
+    if real_page_table.ndim != 2 or real_page_table.shape[0] != 1:
+        return False
+    if not supports_sparse_nsa_paged_logits_kernel(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=real_page_table,
+        seqlens_per_query=seqlens_per_query,
+        page_size=page_size,
+    ):
+        return False
+    expected_shape = (int(q_fp8.shape[0]), int(topk))
+    if output_indices is not None:
+        if (
+            output_indices.dtype != torch.int32
+            or output_indices.device != q_fp8.device
+            or tuple(output_indices.shape) != expected_shape
+            or not output_indices.is_contiguous()
+        ):
+            return False
+    if output_values is not None:
+        if (
+            output_values.dtype != torch.float32
+            or output_values.device != q_fp8.device
+            or tuple(output_values.shape) != expected_shape
+            or not output_values.is_contiguous()
+        ):
+            return False
+    return True
+
+
 def run_sparse_nsa_paged_logits_kernel(
     *,
     q_fp8: torch.Tensor,
@@ -1664,3 +1716,209 @@ def run_sparse_nsa_paged_logits_kernel(
         )
     _run_cached_host_launcher(kernel, cache_key, args)
     return logits_view
+
+
+def _pad_decode_topk_page_table(
+    page_table: torch.Tensor,
+    *,
+    padded_pages: int,
+) -> torch.Tensor:
+    raw_pages = int(page_table.shape[1])
+    if raw_pages == int(padded_pages):
+        return page_table
+    padded = torch.full(
+        (int(page_table.shape[0]), int(padded_pages)),
+        -1,
+        dtype=page_table.dtype,
+        device=page_table.device,
+    )
+    if raw_pages:
+        padded[:, :raw_pages].copy_(page_table)
+    return padded
+
+
+def run_sparse_nsa_paged_decode_topk_kernel(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    real_page_table: torch.Tensor,
+    seqlens_per_query: torch.Tensor,
+    active_width: torch.Tensor | None = None,
+    page_size: int = _PAGE_SIZE,
+    topk: int = _PAGED_DECODE_TOPK,
+    output_values: torch.Tensor | None = None,
+    output_indices: torch.Tensor | None = None,
+    chunk_pages: int = _PAGED_DECODE_TOPK_CHUNK_PAGES,
+) -> torch.Tensor:
+    """Exact q_rows=1 paged decode top-k without a full-width logits output."""
+    topk = int(topk)
+    if active_width is None:
+        active_width = torch.tensor(
+            [int(real_page_table.shape[1]) * int(page_size)],
+            dtype=torch.int32,
+            device=q_fp8.device,
+        )
+    if active_width.shape != (1,):
+        raise ValueError(f"active_width must have shape (1,), got {tuple(active_width.shape)}")
+    if active_width.dtype != torch.int32:
+        raise ValueError(f"active_width must have dtype torch.int32, got {active_width.dtype}")
+    if active_width.device != q_fp8.device:
+        raise ValueError(
+            f"active_width device {active_width.device} does not match q_fp8 device {q_fp8.device}"
+        )
+    if not supports_sparse_nsa_paged_decode_topk_kernel(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=real_page_table,
+        seqlens_per_query=seqlens_per_query,
+        page_size=page_size,
+        topk=topk,
+        output_values=output_values,
+        output_indices=output_indices,
+    ):
+        raise ValueError(
+            "sparse NSA paged decode topk currently supports only the exact CUDA "
+            "q_rows=1, topk=512, page_size=64 FP8 contract with contiguous outputs"
+        )
+
+    rows = int(q_fp8.shape[0])
+    if output_indices is None:
+        topk_indices = torch.empty((rows, topk), dtype=torch.int32, device=q_fp8.device)
+    else:
+        topk_indices = output_indices
+    topk_indices.fill_(-1)
+
+    if output_values is None:
+        best_values = torch.empty((rows, topk), dtype=torch.float32, device=q_fp8.device)
+    else:
+        best_values = output_values
+    best_values.fill_(float("-inf"))
+
+    max_pages = int(real_page_table.shape[1])
+    width_tokens = max_pages * int(page_size)
+    if width_tokens == 0:
+        return topk_indices
+
+    scan_pages = max_pages
+    if not torch.cuda.is_current_stream_capturing():
+        host_width = min(
+            width_tokens,
+            max(0, int(active_width.item())),
+            max(0, int(seqlens_per_query.amax().item())),
+        )
+        scan_pages = min(max_pages, (host_width + int(page_size) - 1) // int(page_size))
+    if scan_pages == 0:
+        return topk_indices
+
+    if scan_pages <= 128:
+        full_lengths = torch.minimum(seqlens_per_query, active_width).contiguous()
+        full_logits = run_sparse_nsa_paged_logits_kernel(
+            q_fp8=q_fp8,
+            weights=weights,
+            index_k_cache=index_k_cache,
+            real_page_table=real_page_table,
+            seqlens_per_query=seqlens_per_query,
+            schedule_metadata=None,
+            active_width=active_width,
+            page_size=page_size,
+            contract_phantoms=None,
+            workspace=None,
+            preinitialize_invalid_logits=True,
+        )
+        torch.ops._C.top_k_per_row_decode(
+            full_logits,
+            1,
+            full_lengths,
+            topk_indices,
+            rows,
+            full_logits.stride(0),
+            full_logits.stride(1),
+            topk,
+        )
+        if output_values is not None:
+            gather_indices = topk_indices.clamp(min=0).to(torch.int64)
+            torch.gather(full_logits, 1, gather_indices, out=best_values)
+            best_values.masked_fill_(topk_indices < 0, float("-inf"))
+        return topk_indices
+
+    pages_per_tile = int(_PAGED_DECODE_TOPK_PAGES_PER_TILE)
+    chunk_pages = max(int(chunk_pages), pages_per_tile)
+    chunk_pages = ((chunk_pages + pages_per_tile - 1) // pages_per_tile) * pages_per_tile
+    chunk_pages = min(chunk_pages, scan_pages)
+
+    row_starts = torch.zeros((rows,), dtype=torch.int32, device=q_fp8.device)
+    chunk_values = torch.empty((rows, topk), dtype=torch.float32, device=q_fp8.device)
+    chunk_indices = torch.empty((rows, topk), dtype=torch.int32, device=q_fp8.device)
+    merge_values = torch.empty((rows, topk * 2), dtype=torch.float32, device=q_fp8.device)
+    merge_indices = torch.empty((rows, topk * 2), dtype=torch.int32, device=q_fp8.device)
+    next_best_values = torch.empty((rows, topk), dtype=torch.float32, device=q_fp8.device)
+    selected = torch.empty((rows, topk), dtype=torch.int64, device=q_fp8.device)
+
+    for page_start in range(0, scan_pages, chunk_pages):
+        raw_pages = min(chunk_pages, scan_pages - page_start)
+        padded_pages = ((raw_pages + pages_per_tile - 1) // pages_per_tile) * pages_per_tile
+        token_start = page_start * int(page_size)
+        raw_token_count = raw_pages * int(page_size)
+        chunk_page_table = _pad_decode_topk_page_table(
+            real_page_table[:, page_start:page_start + raw_pages],
+            padded_pages=padded_pages,
+        )
+        local_lens = torch.clamp(
+            seqlens_per_query - token_start,
+            min=0,
+            max=raw_token_count,
+        ).contiguous()
+        local_active_width = torch.clamp(
+            active_width - token_start,
+            min=0,
+            max=raw_token_count,
+        ).contiguous()
+        chunk_logits = run_sparse_nsa_paged_logits_kernel(
+            q_fp8=q_fp8,
+            weights=weights,
+            index_k_cache=index_k_cache,
+            real_page_table=chunk_page_table,
+            seqlens_per_query=local_lens,
+            schedule_metadata=None,
+            active_width=local_active_width,
+            page_size=page_size,
+            contract_phantoms=None,
+            workspace=None,
+            preinitialize_invalid_logits=True,
+        )
+        run_tiled_topk(
+            tile_logits=chunk_logits,
+            k_start=row_starts,
+            lengths=local_lens,
+            topk=topk,
+            block_q=1,
+            block_k=_PAGED_DECODE_TOPK_BLOCK_K,
+            output_values=chunk_values,
+            output_indices=chunk_indices,
+            num_k_tiles=padded_pages // pages_per_tile,
+        )
+        valid_chunk_indices = chunk_indices >= 0
+        chunk_indices.add_(token_start)
+        chunk_indices.masked_fill_(~valid_chunk_indices, -1)
+
+        merge_values[:, :topk].copy_(best_values)
+        merge_values[:, topk:].copy_(chunk_values)
+        merge_indices[:, :topk].copy_(topk_indices)
+        merge_indices[:, topk:].copy_(chunk_indices)
+        torch.topk(
+            merge_values,
+            topk,
+            dim=1,
+            largest=True,
+            sorted=False,
+            out=(next_best_values, selected),
+        )
+        torch.gather(merge_indices, 1, selected, out=topk_indices)
+        best_values, next_best_values = next_best_values, best_values
+        topk_indices.masked_fill_(~torch.isfinite(best_values), -1)
+
+    if output_values is not None and best_values is not output_values:
+        output_values.copy_(best_values)
+    return topk_indices

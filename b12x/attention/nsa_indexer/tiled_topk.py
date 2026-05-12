@@ -37,8 +37,16 @@ from b12x.runtime_control import raise_if_kernel_resolution_frozen
 
 _THREADS_PER_CTA = 1024
 _TOPK = 2048
+_TOPK_THREADS = {
+    512: 256,
+    _TOPK: _THREADS_PER_CTA,
+}
 _RADIX = 256
 _SMEM_CANDS = 4096
+_TOPK_SMEM_CANDS = {
+    512: 2048,
+    _TOPK: _SMEM_CANDS,
+}
 _SCAN_UNROLL = 4
 _SUPERTILE_K_ENV = "B12X_NSA_EXTEND_TOPK_SUPERTILE_K"
 _SUPERTILE_K_DEFAULT = 32768
@@ -206,10 +214,13 @@ def _run_cached_host_launcher(kernel, cache_key, args):
 
 
 class SparseNSATiledTopkKernel:
-    def __init__(self, *, is_tiled: bool = False, block_q: int = 1, block_k: int = 1):
+    def __init__(self, *, is_tiled: bool = False, block_q: int = 1, block_k: int = 1, topk: int = _TOPK):
         self.is_tiled = is_tiled
         self.block_q = int(block_q)
         self.block_k = int(block_k)
+        self.topk = int(topk)
+        self.threads_per_cta = int(_TOPK_THREADS[self.topk])
+        self.smem_cands = int(_TOPK_SMEM_CANDS[self.topk])
 
     @cute.jit
     def __call__(
@@ -224,7 +235,7 @@ class SparseNSATiledTopkKernel:
             input_index_offset, input_extent, output_index_offset,
         ).launch(
             grid=(batch_size, 1, 1),
-            block=[_THREADS_PER_CTA, 1, 1],
+            block=[self.threads_per_cta, 1, 1],
             stream=stream,
         )
 
@@ -268,7 +279,7 @@ class SparseNSATiledTopkKernel:
             else:
                 row_start = Int32(0)
                 length = Int32(0)
-        topk_static = Int32(_TOPK)
+        topk_static = Int32(self.topk)
         out_base = bid * topk_static
         row_base = bid * input_stride
         if cutlass.const_expr(self.is_tiled):
@@ -289,22 +300,22 @@ class SparseNSATiledTopkKernel:
         class SharedStorage:
             hist0: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 384], 128]
             hist1: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 384], 128]
-            out_idx: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, _TOPK], 128]
+            out_idx: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, self.topk], 128]
             counter: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 128]
             thr_id: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 128]
             ni0: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 128]
             ni1: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 128]
             last_rem: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 128]
-            cand0: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, _SMEM_CANDS], 128]
-            cand1: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, _SMEM_CANDS], 128]
+            cand0: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, self.smem_cands], 128]
+            cand1: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, self.smem_cands], 128]
 
         storage = smem_alloc.allocate(SharedStorage)
 
         s_hist0 = storage.hist0.get_tensor(cute.make_layout((384,), stride=(1,)))
         s_hist1 = storage.hist1.get_tensor(cute.make_layout((384,), stride=(1,)))
-        s_out = storage.out_idx.get_tensor(cute.make_layout((_TOPK,), stride=(1,)))
-        s_cand0 = storage.cand0.get_tensor(cute.make_layout((_SMEM_CANDS,), stride=(1,)))
-        s_cand1 = storage.cand1.get_tensor(cute.make_layout((_SMEM_CANDS,), stride=(1,)))
+        s_out = storage.out_idx.get_tensor(cute.make_layout((self.topk,), stride=(1,)))
+        s_cand0 = storage.cand0.get_tensor(cute.make_layout((self.smem_cands,), stride=(1,)))
+        s_cand1 = storage.cand1.get_tensor(cute.make_layout((self.smem_cands,), stride=(1,)))
 
         h0 = shared_ptr_to_u32(storage.hist0.data_ptr())
         h1 = shared_ptr_to_u32(storage.hist1.data_ptr())
@@ -333,7 +344,7 @@ class SparseNSATiledTopkKernel:
                     else Float32(float("-inf"))
                 )
                 indices[out_base + i] = row_start + i + output_index_offset if is_valid else Int32(-1)
-                i = i + Int32(_THREADS_PER_CTA)
+                i = i + Int32(self.threads_per_cta)
 
         if need_radix:
             topk = topk_static
@@ -343,10 +354,10 @@ class SparseNSATiledTopkKernel:
             cute.arch.sync_threads()
 
             idx_base = Int32(tx)
-            full_scan_limit = length - Int32((_SCAN_UNROLL - 1) * _THREADS_PER_CTA)
+            full_scan_limit = length - Int32((_SCAN_UNROLL - 1) * self.threads_per_cta)
             while idx_base < full_scan_limit:
                 for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
-                    idx = idx_base + Int32(scan_u * _THREADS_PER_CTA)
+                    idx = idx_base + Int32(scan_u * self.threads_per_cta)
                     val = _load_topk_input_from_row_base(
                         input_tensor,
                         row_base,
@@ -357,7 +368,7 @@ class SparseNSATiledTopkKernel:
                     )
                     bin8 = _convert_to_uint8(val)
                     _smem_red_add(h0, Int32(bin8), Int32(1))
-                idx_base = idx_base + Int32(_THREADS_PER_CTA * _SCAN_UNROLL)
+                idx_base = idx_base + Int32(self.threads_per_cta * _SCAN_UNROLL)
             while idx_base < length:
                 val = _load_topk_input_from_row_base(
                     input_tensor,
@@ -369,7 +380,7 @@ class SparseNSATiledTopkKernel:
                 )
                 bin8 = _convert_to_uint8(val)
                 _smem_red_add(h0, Int32(bin8), Int32(1))
-                idx_base = idx_base + Int32(_THREADS_PER_CTA)
+                idx_base = idx_base + Int32(self.threads_per_cta)
 
             cute.arch.sync_threads()
 
@@ -405,10 +416,10 @@ class SparseNSATiledTopkKernel:
 
             if topk == Int32(0):
                 idx_base = Int32(tx)
-                full_scan_limit = length - Int32((_SCAN_UNROLL - 1) * _THREADS_PER_CTA)
+                full_scan_limit = length - Int32((_SCAN_UNROLL - 1) * self.threads_per_cta)
                 while idx_base < full_scan_limit:
                     for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
-                        idx = idx_base + Int32(scan_u * _THREADS_PER_CTA)
+                        idx = idx_base + Int32(scan_u * self.threads_per_cta)
                         val = _load_topk_input_from_row_base(
                             input_tensor,
                             row_base,
@@ -421,7 +432,7 @@ class SparseNSATiledTopkKernel:
                         if Int32(bin8) > threshold_bin:
                             pos = _smem_xadd(ctr, Int32(0), Int32(1))
                             s_out[pos] = idx
-                    idx_base = idx_base + Int32(_THREADS_PER_CTA * _SCAN_UNROLL)
+                    idx_base = idx_base + Int32(self.threads_per_cta * _SCAN_UNROLL)
                 while idx_base < length:
                     val = _load_topk_input_from_row_base(
                         input_tensor,
@@ -435,7 +446,7 @@ class SparseNSATiledTopkKernel:
                     if Int32(bin8) > threshold_bin:
                         pos = _smem_xadd(ctr, Int32(0), Int32(1))
                         s_out[pos] = idx_base
-                    idx_base = idx_base + Int32(_THREADS_PER_CTA)
+                    idx_base = idx_base + Int32(self.threads_per_cta)
 
             if topk != Int32(0):
                 cute.arch.sync_threads()
@@ -445,10 +456,10 @@ class SparseNSATiledTopkKernel:
                 cute.arch.sync_threads()
 
                 idx_base = Int32(tx)
-                full_scan_limit = length - Int32((_SCAN_UNROLL - 1) * _THREADS_PER_CTA)
+                full_scan_limit = length - Int32((_SCAN_UNROLL - 1) * self.threads_per_cta)
                 while idx_base < full_scan_limit:
                     for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
-                        idx = idx_base + Int32(scan_u * _THREADS_PER_CTA)
+                        idx = idx_base + Int32(scan_u * self.threads_per_cta)
                         raw_input = _load_topk_input_from_row_base(
                             input_tensor,
                             row_base,
@@ -464,12 +475,12 @@ class SparseNSATiledTopkKernel:
                         else:
                             if Int32(bin8) == threshold_bin:
                                 cand_pos = _smem_xadd(ni0, Int32(0), Int32(1))
-                                if cand_pos < Int32(_SMEM_CANDS):
+                                if cand_pos < Int32(self.smem_cands):
                                     s_cand0[cand_pos] = idx
                                     key32 = _convert_to_uint32(raw_input)
                                     sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
                                     _smem_red_add(h0, Int32(sub_bin), Int32(1))
-                    idx_base = idx_base + Int32(_THREADS_PER_CTA * _SCAN_UNROLL)
+                    idx_base = idx_base + Int32(self.threads_per_cta * _SCAN_UNROLL)
                 while idx_base < length:
                     raw_input = _load_topk_input_from_row_base(
                         input_tensor,
@@ -486,12 +497,12 @@ class SparseNSATiledTopkKernel:
                     else:
                         if Int32(bin8) == threshold_bin:
                             cand_pos = _smem_xadd(ni0, Int32(0), Int32(1))
-                            if cand_pos < Int32(_SMEM_CANDS):
+                            if cand_pos < Int32(self.smem_cands):
                                 s_cand0[cand_pos] = idx_base
                                 key32 = _convert_to_uint32(raw_input)
                                 sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
                                 _smem_red_add(h0, Int32(sub_bin), Int32(1))
-                    idx_base = idx_base + Int32(_THREADS_PER_CTA)
+                    idx_base = idx_base + Int32(self.threads_per_cta)
 
                 cute.arch.sync_threads()
 
@@ -502,7 +513,7 @@ class SparseNSATiledTopkKernel:
                         r_idx_next_is_0 = not r_idx_is_0
 
                         raw_num_input = _smem_ld(ni0, Int32(0)) if cutlass.const_expr(r_idx_is_0) else _smem_ld(ni1, Int32(0))
-                        num_input = raw_num_input if raw_num_input < Int32(_SMEM_CANDS) else Int32(_SMEM_CANDS)
+                        num_input = raw_num_input if raw_num_input < Int32(self.smem_cands) else Int32(self.smem_cands)
 
                         # Prefix sum
                         for stage in cutlass.range_constexpr(8):
@@ -556,7 +567,7 @@ class SparseNSATiledTopkKernel:
                                 if Int32(bin) > sub_threshold:
                                     pos = _smem_xadd(ctr, Int32(0), Int32(1))
                                     s_out[pos] = c_idx
-                                i = i + Int32(_THREADS_PER_CTA)
+                                i = i + Int32(self.threads_per_cta)
                             topk = Int32(-1)
 
                         # Continue refinement
@@ -593,7 +604,7 @@ class SparseNSATiledTopkKernel:
                                                 s_out[topk_static - old_rem] = c_idx
                                         else:
                                             cand_pos = _smem_xadd(ni0, Int32(0), Int32(1)) if cutlass.const_expr(r_idx_next_is_0) else _smem_xadd(ni1, Int32(0), Int32(1))
-                                            if cand_pos < Int32(_SMEM_CANDS):
+                                            if cand_pos < Int32(self.smem_cands):
                                                 if cutlass.const_expr(r_idx_next_is_0):
                                                     s_cand0[cand_pos] = c_idx
                                                 else:
@@ -601,38 +612,40 @@ class SparseNSATiledTopkKernel:
                                                 sub_bin = (key32 >> Uint32(24 - (round_idx + 1) * 8)) & Uint32(0xFF)
                                                 _smem_red_add(h0, Int32(sub_bin), Int32(1))
 
-                                i = i + Int32(_THREADS_PER_CTA)
+                                i = i + Int32(self.threads_per_cta)
 
                             cute.arch.sync_threads()
 
             cute.arch.sync_threads()
             idx0 = Int32(tx)
-            selected0 = Int32(s_out[idx0])
-            values[out_base + idx0] = _load_topk_input_from_row_base(
-                input_tensor,
-                row_base,
-                row_start + selected0,
-                self.block_q,
-                self.block_k,
-                self.is_tiled,
-            )
-            indices[out_base + idx0] = row_start + selected0 + output_index_offset
-            idx1 = idx0 + Int32(_THREADS_PER_CTA)
-            selected1 = Int32(s_out[idx1])
-            values[out_base + idx1] = _load_topk_input_from_row_base(
-                input_tensor,
-                row_base,
-                row_start + selected1,
-                self.block_q,
-                self.block_k,
-                self.is_tiled,
-            )
-            indices[out_base + idx1] = row_start + selected1 + output_index_offset
+            if idx0 < topk_static:
+                selected0 = Int32(s_out[idx0])
+                values[out_base + idx0] = _load_topk_input_from_row_base(
+                    input_tensor,
+                    row_base,
+                    row_start + selected0,
+                    self.block_q,
+                    self.block_k,
+                    self.is_tiled,
+                )
+                indices[out_base + idx0] = row_start + selected0 + output_index_offset
+            idx1 = idx0 + Int32(self.threads_per_cta)
+            if idx1 < topk_static:
+                selected1 = Int32(s_out[idx1])
+                values[out_base + idx1] = _load_topk_input_from_row_base(
+                    input_tensor,
+                    row_base,
+                    row_start + selected1,
+                    self.block_q,
+                    self.block_k,
+                    self.is_tiled,
+                )
+                indices[out_base + idx1] = row_start + selected1 + output_index_offset
 
 
-@lru_cache(maxsize=16)
-def _build_tiled_topk_kernel(block_q: int, block_k: int):
-    return SparseNSATiledTopkKernel(is_tiled=True, block_q=block_q, block_k=block_k)
+@lru_cache(maxsize=32)
+def _build_tiled_topk_kernel(block_q: int, block_k: int, topk: int = _TOPK):
+    return SparseNSATiledTopkKernel(is_tiled=True, block_q=block_q, block_k=block_k, topk=topk)
 
 
 def clear_tiled_topk_kernel_cache() -> None:
@@ -656,8 +669,8 @@ def run_tiled_topk(
     input_extent: int = 0,
     output_index_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if topk != _TOPK:
-        raise ValueError(f"run_tiled_topk currently matches the native TopK={_TOPK} kernel; got topk={topk}")
+    if topk not in _TOPK_THREADS:
+        raise ValueError(f"run_tiled_topk supports topk in {tuple(_TOPK_THREADS)}, got topk={topk}")
     if k_end is None and lengths is None:
         raise ValueError("run_tiled_topk requires either k_end or lengths")
     if not tile_logits.is_contiguous():
@@ -714,7 +727,7 @@ def run_tiled_topk(
     flat_values = topk_values.reshape(-1).contiguous()
     flat_indices = topk_indices.reshape(-1).contiguous()
 
-    kernel = _build_tiled_topk_kernel(block_q, block_k)
+    kernel = _build_tiled_topk_kernel(block_q, block_k, topk)
     args = (
         _to_kernel_tensor(flat_input, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(k_start, cutlass.Int32, assumed_align=4),
@@ -801,8 +814,8 @@ def run_tiled_supertile_topk(
     supertile_k: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Exact topk over tiled logits by local-selecting K supertiles then merging candidates."""
-    if topk != _TOPK:
-        raise ValueError(f"run_tiled_supertile_topk currently supports topk={_TOPK}, got {topk}")
+    if topk not in _TOPK_THREADS:
+        raise ValueError(f"run_tiled_supertile_topk supports topk in {tuple(_TOPK_THREADS)}, got {topk}")
     if not tile_logits.is_contiguous():
         raise ValueError("tile_logits must be contiguous")
     if not k_start.is_contiguous() or not k_end.is_contiguous():
