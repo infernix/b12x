@@ -281,16 +281,27 @@ def _sm121_gqa8_decode_chunk_budget(
         and int(head_dim_vo) == 256
         and int(page_size) == 64
         and int(batch) == 1
-        and 480 <= int(max_effective_kv_pages) <= 544
+        and (
+            224 <= int(max_effective_kv_pages) <= 288
+            or 480 <= int(max_effective_kv_pages) <= 544
+            or 992 <= int(max_effective_kv_pages) <= 1056
+        )
         and int(window_left) < 0
         and tuple(torch.cuda.get_device_capability(device)) == (12, 1)
     ):
         return None
-    # Graph-first sweeps at 32K context on the 48-SM GB10 found stable latency
-    # knees at 14 useful chunks for BF16 KV and 18 for FP8 KV.  Express the
-    # result as a maximum chunk count so the device LUT remains adaptive for
-    # every live length captured by the same serving graph.
-    return 14 if kv_dtype == torch.bfloat16 else 18
+    # Graph-first sweeps on the 48-SM GB10 found distinct latency knees at the
+    # 16K, 32K, and 64K serving capacities.  Express them as maximum chunk
+    # counts so the device LUT remains adaptive for every live length captured
+    # by the same graph.
+    max_pages = int(max_effective_kv_pages)
+    if 224 <= max_pages <= 288:
+        return 19 if kv_dtype == torch.bfloat16 else 22
+    if 480 <= max_pages <= 544:
+        return 14 if kv_dtype == torch.bfloat16 else 18
+    if 992 <= max_pages <= 1056:
+        return 17 if kv_dtype == torch.bfloat16 else 18
+    return None
 
 
 def _is_laguna_fp8_gqa6_analytic_decode_graph(

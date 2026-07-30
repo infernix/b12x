@@ -1085,7 +1085,7 @@ def test_decode_graph_chunk_pages_uses_finer_fp8_minimax_bs1_splits() -> None:
     )
 
 
-def test_decode_graph_sm121_bf16_gqa8_bs1_uses_measured_chunk_budget(
+def test_decode_graph_sm121_bf16_gqa8_bs1_uses_measured_capacity_budgets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1130,11 +1130,30 @@ def test_decode_graph_sm121_bf16_gqa8_bs1_uses_measured_chunk_budget(
         batch=1,
         max_cache_page_count=257,
     )
-    assert shorter_bucket.max_chunks_per_request == 192
-    assert shorter_bucket.chunk_pages_lut[-1] == 2
+    assert shorter_bucket.max_chunks_per_request == 19
+    assert shorter_bucket.max_work_items == 19
+    assert shorter_bucket.max_partial_rows == 19
+    assert shorter_bucket.chunk_pages_lut[-1] == 14
+
+    longer_bucket = plan_decode_graph_capacity(
+        device=torch.device("cuda:0"),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        num_q_heads=8,
+        num_kv_heads=1,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        page_size=64,
+        batch=1,
+        max_cache_page_count=1025,
+    )
+    assert longer_bucket.max_chunks_per_request == 17
+    assert longer_bucket.max_work_items == 17
+    assert longer_bucket.max_partial_rows == 17
+    assert longer_bucket.chunk_pages_lut[-1] == 61
 
 
-def test_decode_graph_sm121_fp8_gqa8_bs1_uses_measured_chunk_budget(
+def test_decode_graph_sm121_fp8_gqa8_bs1_uses_measured_capacity_budgets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1179,8 +1198,27 @@ def test_decode_graph_sm121_fp8_gqa8_bs1_uses_measured_chunk_budget(
         batch=1,
         max_cache_page_count=257,
     )
-    assert shorter_bucket.max_chunks_per_request == 96
-    assert shorter_bucket.chunk_pages_lut[-1] == 3
+    assert shorter_bucket.max_chunks_per_request == 22
+    assert shorter_bucket.max_work_items == 22
+    assert shorter_bucket.max_partial_rows == 22
+    assert shorter_bucket.chunk_pages_lut[-1] == 12
+
+    longer_bucket = plan_decode_graph_capacity(
+        device=torch.device("cuda:0"),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        num_q_heads=8,
+        num_kv_heads=1,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        page_size=64,
+        batch=1,
+        max_cache_page_count=1025,
+    )
+    assert longer_bucket.max_chunks_per_request == 18
+    assert longer_bucket.max_work_items == 18
+    assert longer_bucket.max_partial_rows == 18
+    assert longer_bucket.chunk_pages_lut[-1] == 57
 
     monkeypatch.setattr(
         torch.cuda,
