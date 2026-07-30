@@ -256,7 +256,7 @@ def _laguna_page128_one_wave_chunk_budget(
     )
 
 
-def _sm121_bf16_gqa8_decode_chunk_budget(
+def _sm121_gqa8_decode_chunk_budget(
     *,
     device: torch.device,
     q_dtype: torch.dtype,
@@ -270,11 +270,11 @@ def _sm121_bf16_gqa8_decode_chunk_budget(
     max_effective_kv_pages: int,
     window_left: int,
 ) -> int | None:
-    """Return the measured GB10 split budget for the BF16 H256 GQA8 contract."""
+    """Return the measured GB10 split budget for the H256 GQA8 contract."""
 
     if not (
         q_dtype == torch.bfloat16
-        and kv_dtype == torch.bfloat16
+        and kv_dtype in (torch.bfloat16, _FP8_KV_DTYPE)
         and int(num_q_heads) == 8
         and int(num_kv_heads) == 1
         and int(head_dim_qk) == 256
@@ -286,12 +286,11 @@ def _sm121_bf16_gqa8_decode_chunk_budget(
         and tuple(torch.cuda.get_device_capability(device)) == (12, 1)
     ):
         return None
-    # A graph-first sweep at 32K context on the 48-SM GB10 found a stable
-    # latency knee at 14 useful chunks: 15 chunks left merge overhead on the
-    # table, while 13 chunks made each forward CTA too long.  Express the
+    # Graph-first sweeps at 32K context on the 48-SM GB10 found stable latency
+    # knees at 14 useful chunks for BF16 KV and 18 for FP8 KV.  Express the
     # result as a maximum chunk count so the device LUT remains adaptive for
     # every live length captured by the same serving graph.
-    return 14
+    return 14 if kv_dtype == torch.bfloat16 else 18
 
 
 def _is_laguna_fp8_gqa6_analytic_decode_graph(
@@ -1173,7 +1172,7 @@ def plan_decode_graph_capacity(
     )
     if one_wave_chunks is not None:
         max_chunks_budget = min(max_chunks_budget, one_wave_chunks)
-    sm121_bf16_gqa8_chunks = _sm121_bf16_gqa8_decode_chunk_budget(
+    sm121_gqa8_chunks = _sm121_gqa8_decode_chunk_budget(
         device=device,
         q_dtype=q_dtype,
         kv_dtype=kv_dtype,
@@ -1186,8 +1185,8 @@ def plan_decode_graph_capacity(
         max_effective_kv_pages=max_effective_kv_pages,
         window_left=window_left,
     )
-    if sm121_bf16_gqa8_chunks is not None:
-        max_chunks_budget = min(max_chunks_budget, sm121_bf16_gqa8_chunks)
+    if sm121_gqa8_chunks is not None:
+        max_chunks_budget = min(max_chunks_budget, sm121_gqa8_chunks)
 
     split_policy_supported = q_dtype == torch.bfloat16 and (
         _merge_backend_supports_split_kv(
