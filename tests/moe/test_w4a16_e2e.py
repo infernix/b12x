@@ -204,9 +204,12 @@ def _reference_w4a16(
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     reference_topk_ids = topk_ids
+    reference_topk_weights = topk_weights
     if expert_map is not None:
         reference_topk_ids = expert_map[topk_ids.long()].to(torch.int32)
-        assert bool((reference_topk_ids >= 0).all().item())
+        active = reference_topk_ids >= 0
+        reference_topk_weights = topk_weights.masked_fill(~active, 0.0)
+        reference_topk_ids = reference_topk_ids.clamp_min(0)
     return moe_reference_w4a16(
         x,
         w13,
@@ -216,7 +219,7 @@ def _reference_w4a16(
         w2_blockscale,
         w2_global_scale,
         reference_topk_ids,
-        topk_weights,
+        reference_topk_weights,
         w13.shape[0],
         w2.shape[1],
         w2.shape[2] * 2,
@@ -365,6 +368,171 @@ def test_w4a16_fp4_e8m0_k32_kernel_matches_raw_e8m0_oracle(
         assert bool(torch.isfinite(buffers.output).all().item())
         assert torch.equal(buffers.output, eager)
         _assert_matches_oracle(buffers.output, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("tc_decode", [False, True], ids=["route-packed", "tc-decode"])
+def test_w4a16_packed_runtime_expert_count_reuses_compiled_kernel(
+    tc_decode: bool,
+) -> None:
+    """Packed tier size is runtime data, while the launch geometry stays static."""
+    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+
+    torch.manual_seed(20260730)
+    device = torch.device("cuda", torch.cuda.current_device())
+    hidden_size = intermediate_size = 128
+    activation = "situ"
+    rows = 2 * intermediate_size
+    m, topk = 4, 2
+    props = torch.cuda.get_device_properties(device)
+    max_shared_mem = int(
+        getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
+    )
+    w4a16_kernel.clear_w4a16_kernel_cache()
+
+    compiled_after_first: dict[tuple, int] | None = None
+    for experts in (2, 3):
+        w13 = torch.randint(
+            0,
+            256,
+            (experts, rows, hidden_size // 2),
+            dtype=torch.uint8,
+            device=device,
+        )
+        w2 = torch.randint(
+            0,
+            256,
+            (experts, hidden_size, intermediate_size // 2),
+            dtype=torch.uint8,
+            device=device,
+        )
+        w13_scale = _pattern_e8m0(
+            (experts, rows, hidden_size // 32), offset=experts
+        )
+        w2_scale = _pattern_e8m0(
+            (experts, hidden_size, intermediate_size // 32),
+            offset=experts + 1,
+        )
+        w13_global_scale = torch.ones(
+            experts, dtype=torch.float32, device=device
+        )
+        w2_global_scale = torch.ones(
+            experts, dtype=torch.float32, device=device
+        )
+        prepared = prepare_w4a16_packed_weights(
+            w13,
+            w13_scale,
+            w13_global_scale,
+            w2,
+            w2_scale,
+            w2_global_scale,
+            activation=activation,
+            params_dtype=torch.bfloat16,
+            source_format="fp4_e8m0_k32",
+        )
+        buffers = make_w4a16_buffers(
+            prepared,
+            m=m,
+            topk=topk,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        x = (torch.randn(m, hidden_size, device=device) * 0.125).to(
+            torch.bfloat16
+        )
+        topk_ids = torch.tensor(
+            [
+                [0, experts - 1],
+                [experts - 1, 0],
+                [experts - 1, experts - 1],
+                [0, experts - 1],
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        topk_weights = torch.softmax(
+            torch.randn(m, topk, dtype=torch.float32, device=device), dim=-1
+        )
+        fused_launch = compile_w4a16_fused_moe(
+            size_m=m,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=experts,
+            top_k=topk,
+            activation=activation,
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            moe_block_size=8,
+            # Capacity metadata legitimately changes with the tier's expert
+            # count, but it is not device-code geometry either.
+            max_m_blocks=m * topk + experts,
+            element_dtype="bf16",
+            sms=int(props.multi_processor_count),
+            max_shared_mem=max_shared_mem,
+            weight_layout="packed",
+            scale_format="e8m0_k32",
+            w13_layout="packed",
+            direct_topk_routes=tc_decode,
+            tc_decode_fused_sum=tc_decode,
+            force_tile_config=(64, 128, 64, 128),
+        )
+        assert fused_launch.num_experts == experts
+        topk_sum_launch = (
+            None
+            if tc_decode
+            else compile_w4a16_topk_sum(
+                m=m,
+                topk=topk,
+                hidden_size=hidden_size,
+                element_dtype="bf16",
+            )
+        )
+        actual = run_w4a16_moe(
+            x,
+            prepared,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            fused_launch=fused_launch,
+            topk_sum_launch=topk_sum_launch,
+        ).clone()
+        expected = moe_reference_w4a16_fp4_e8m0_k32(
+            x,
+            w13,
+            w13_scale,
+            w13_global_scale,
+            w2,
+            w2_scale,
+            w2_global_scale,
+            topk_ids,
+            topk_weights,
+            experts,
+            hidden_size,
+            intermediate_size,
+            activation=activation,
+            w13_layout="w13",
+        )
+        torch.cuda.synchronize(device)
+        _assert_matches_oracle(actual, expected, activation=activation)
+
+        compiled_now = {
+            key: id(value.compiled)
+            for key, value in w4a16_kernel._FUSED_CACHE.items()
+        }
+        if compiled_after_first is None:
+            compiled_after_first = compiled_now
+            assert len(compiled_after_first) == 1
+        else:
+            assert compiled_now == compiled_after_first
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1097,6 +1265,273 @@ def test_w4a16_small_m_packed_direct_topk_routes_matches_oracle(m: int) -> None:
     torch.cuda.synchronize()
 
     _assert_matches_oracle(actual, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("m", [1, 8])
+def test_w4a16_mapped_decode_consumes_global_map_without_route_pack(
+    m: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+
+    torch.manual_seed(20260730 + m)
+    global_experts, local_experts = 12, 8
+    hidden_size, intermediate_size = 128, 128
+    topk, activation = 2, "silu"
+    weights = _make_weights(
+        experts=local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    expert_map = torch.full(
+        (global_experts,), -1, dtype=torch.int32, device="cuda"
+    )
+    mapped_global_ids = torch.tensor(
+        [0, 2, 3, 5, 7, 8, 10, 11], dtype=torch.int32, device="cuda"
+    )
+    expert_map[mapped_global_ids] = torch.arange(
+        local_experts, dtype=torch.int32, device="cuda"
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
+    topk_ids = torch.randint(
+        0,
+        global_experts,
+        (m, topk),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    # Exercise both a fully inactive token and mixed valid/inactive routes.
+    topk_ids[0] = torch.tensor([1, 4], dtype=torch.int32, device="cuda")
+    if m > 1:
+        topk_ids[1] = torch.tensor([2, 6], dtype=torch.int32, device="cuda")
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+
+    prepared = prepare_w4a16_weights(
+        *weights,
+        activation=activation,
+        params_dtype=x.dtype,
+    )
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=x.dtype,
+        device=x.device,
+        route_num_experts=global_experts,
+    )
+
+    def run() -> torch.Tensor:
+        return run_w4a16_moe(
+            x,
+            prepared,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            expert_map=expert_map,
+            fast_math=True,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+        )
+
+    def route_pack_must_not_run(*args, **kwargs):
+        raise AssertionError("mapped decode unexpectedly invoked route packing")
+
+    compiled_launches = []
+    compile_fused = w4a16_kernel.compile_w4a16_fused_moe
+
+    def record_compile(*args, **kwargs):
+        launch = compile_fused(*args, **kwargs)
+        if kwargs.get("use_expert_map"):
+            compiled_launches.append(launch)
+        return launch
+
+    expected = _reference_w4a16(
+        x,
+        *weights,
+        topk_ids,
+        topk_weights,
+        activation=activation,
+        expert_map=expert_map,
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            w4a16_kernel,
+            "pack_topk_routes_by_expert",
+            route_pack_must_not_run,
+        )
+        patch.setattr(w4a16_kernel, "compile_w4a16_fused_moe", record_compile)
+        eager = run().clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run()
+        graph.replay()
+    torch.cuda.synchronize()
+
+    _assert_matches_oracle(eager, expected, activation=activation)
+    assert torch.equal(captured, eager)
+    assert any(
+        launch.use_expert_map
+        and launch.direct_topk_routes
+        and launch.tc_decode_fused_sum
+        for launch in compiled_launches
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sparkinfer.moe import fused_moe
+    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+
+    torch.manual_seed(20260731)
+    global_experts, local_experts = 12, 8
+    hidden_size, intermediate_size = 128, 128
+    topk, activation = 2, "silu"
+    device = torch.device("cuda", torch.cuda.current_device())
+    w1 = torch.randint(
+        0,
+        256,
+        (local_experts, 2 * intermediate_size, hidden_size // 2),
+        dtype=torch.uint8,
+        device=device,
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (local_experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device=device,
+    )
+    w1_scale = _pattern_e8m0(
+        (local_experts, 2 * intermediate_size, hidden_size // 32)
+    )
+    w2_scale = _pattern_e8m0(
+        (local_experts, hidden_size, intermediate_size // 32),
+        offset=1,
+    )
+    w1_global = torch.ones(local_experts, dtype=torch.float32, device=device)
+    w2_global = torch.ones(local_experts, dtype=torch.float32, device=device)
+    weight_plan = fused_moe.plan_weights(
+        quant_modes="w4a16",
+        source_format="fp4_e8m0_k32",
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        num_experts=local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        w13_layout="w13",
+    )
+    prepared = fused_moe.prepare_weights(
+        plan=weight_plan,
+        params_dtype=torch.bfloat16,
+        w1_fp4=w1,
+        w1_blockscale=w1_scale,
+        w1_global_scale=w1_global,
+        a1_gscale=torch.ones_like(w1_global),
+        w2_fp4=w2,
+        w2_blockscale=w2_scale,
+        w2_global_scale=w2_global,
+        a2_gscale=torch.ones_like(w2_global),
+    )
+    plan = fused_moe.plan(
+        fused_moe.Caps(
+            max_tokens=8,
+            num_topk=topk,
+            route_num_experts=global_experts,
+            device=device,
+            weight_plan=prepared.plan,
+            quant_mode="w4a16",
+            core_token_counts=(1, 8),
+            frozen=True,
+        )
+    )
+    scratch_spec = plan.scratch_specs()[0]
+    scratch = torch.empty(
+        scratch_spec.shape,
+        dtype=scratch_spec.dtype,
+        device=scratch_spec.device,
+    )
+    x = (torch.randn(1, hidden_size, device=device) * 0.25).to(torch.bfloat16)
+    topk_ids = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+    topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32, device=device)
+    expert_map = torch.full(
+        (global_experts,), -1, dtype=torch.int32, device=device
+    )
+    expert_map[::2] = torch.arange(
+        local_experts - 2, dtype=torch.int32, device=device
+    )
+    output = torch.empty_like(x)
+    binding = plan.bind(
+        scratch=scratch,
+        a=x,
+        experts=prepared,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        output=output,
+        input_scales_static=True,
+        unit_scale_contract=True,
+        route_expert_map=expert_map,
+    )
+    legacy_ids = torch.zeros_like(topk_ids)
+    legacy_weights = torch.zeros_like(topk_weights)
+    legacy_weights[0, 0] = topk_weights[0, 0]
+    legacy_output = torch.empty_like(x)
+    legacy_binding = plan.bind(
+        scratch=scratch,
+        a=x,
+        experts=prepared,
+        topk_weights=legacy_weights,
+        topk_ids=legacy_ids,
+        output=legacy_output,
+        input_scales_static=True,
+        unit_scale_contract=True,
+    )
+
+    def route_pack_must_not_run(*args, **kwargs):
+        raise AssertionError("mapped scratch-plan decode invoked route packing")
+
+    compiled_launches = []
+    compile_fused = w4a16_kernel.compile_w4a16_fused_moe
+
+    def record_compile(*args, **kwargs):
+        launch = compile_fused(*args, **kwargs)
+        if kwargs.get("use_expert_map"):
+            compiled_launches.append(launch)
+        return launch
+
+    expected = fused_moe.run(binding=legacy_binding).clone()
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            w4a16_kernel,
+            "pack_topk_routes_by_expert",
+            route_pack_must_not_run,
+        )
+        patch.setattr(w4a16_kernel, "compile_w4a16_fused_moe", record_compile)
+        eager = fused_moe.run(binding=binding).clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = fused_moe.run(binding=binding)
+        graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(eager, expected)
+    assert torch.equal(captured, eager)
+    assert any(
+        launch.use_expert_map
+        and launch.direct_topk_routes
+        and launch.tc_decode_fused_sum
+        for launch in compiled_launches
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

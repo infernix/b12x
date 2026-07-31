@@ -300,6 +300,14 @@ def plan_w4a16_buffers(
             )
     route_slots = max_packed_route_slots(routed_rows, block_size_m, route_num_experts)
     route_blocks = (route_slots + block_size_m - 1) // block_size_m
+    # Small-M tensor-core decode may bypass expert packing and assign one full
+    # M block to every top-k route. Its accumulation scratch is therefore
+    # sized from ``routed_rows * block_size_m``, which can exceed the packed
+    # upper bound once routed_rows > route_num_experts. Keep the generic buffer
+    # helper graph-safe for every currently supported TC-decode shape.
+    gemm_route_slots = route_slots
+    if int(m) <= 8 and bool(prepared.is_gated):
+        gemm_route_slots = max(gemm_route_slots, routed_rows * block_size_m)
     scratch_sms = int(sms)
     return W4A16BufferPlan(
         routed_rows=routed_rows,
@@ -308,13 +316,13 @@ def plan_w4a16_buffers(
         route_blocks=route_blocks,
         fc1_c_tmp_elements=packed_gemm_scratch_elements(
             size_n=fc1_cols,
-            route_slots=route_slots,
+            route_slots=gemm_route_slots,
             moe_block_size=block_size_m,
             sms=scratch_sms,
         ),
         fc2_c_tmp_elements=packed_gemm_scratch_elements(
             size_n=hidden_size,
-            route_slots=route_slots,
+            route_slots=gemm_route_slots,
             moe_block_size=block_size_m,
             sms=scratch_sms,
         ),
