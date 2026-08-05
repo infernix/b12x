@@ -1,4 +1,4 @@
-# sparkinfer
+# b12x
 
 `b12x` is an SM120/SM121 CuTe DSL kernel library for local LLM inference.
 It specifically targets DGX Spark, RTX Spark and the Blackwell-based RTX
