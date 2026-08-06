@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.comm.pcie.pcie_dcp_topk import (
+from b12x.comm.pcie.pcie_dcp_topk import (
     PCIeDCPTopKOwnerExchange,
     _candidate_staging_layout,
     owner_stage_reference,

@@ -13,7 +13,7 @@ _TILE = 128
 
 def _host_row_gs(x: torch.Tensor, fmt: str) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference per-row recipe from ``dense_fp6_linear_expanded``."""
-    from sparkinfer._lib.fp6 import mx_gs_numerator
+    from b12x._lib.fp6 import mx_gs_numerator
 
     amax = x.abs().amax(dim=1, keepdim=True).float()
     # f64 divide + f32 cast == div.rn.f32 (see the host-path comments).
@@ -28,7 +28,7 @@ def _host_row_gs(x: torch.Tensor, fmt: str) -> tuple[torch.Tensor, torch.Tensor]
 # reduction and its tail elements are covered as well as the single-pass case.
 @pytest.mark.parametrize("k", [512, 2048])
 def test_row_gs_kernel_matches_host_recipe(k, fmt):
-    from sparkinfer.quantization.mxfp6.fp6_row_gs import compile_fp6_row_gs
+    from b12x.quantization.mxfp6.fp6_row_gs import compile_fp6_row_gs
 
     torch.manual_seed(0)
     m = 256
@@ -63,7 +63,7 @@ def test_row_gs_kernel_matches_host_recipe(k, fmt):
 @pytest.mark.parametrize("m", [128, 256])
 def test_per_row_quantizer_matches_host_chain(m, fmt):
     """Fused two-kernel path == host pre-scale + unit-gs TMA quantization."""
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         _quantize_matrix_fp6_bytes,
         _quantize_matrix_fp6_bytes_per_row,
     )
@@ -101,7 +101,7 @@ def test_large_m_linear_fused_vs_host_chain_bit_exact(m, monkeypatch):
     (m % 128 != 0) case where zero padding rows flow through the fused
     RowGsKernel clamp path.
     """
-    import sparkinfer.quantization.mxfp6.fp6_dense_weights as fdw
+    import b12x.quantization.mxfp6.fp6_dense_weights as fdw
 
     torch.manual_seed(2)
     w = fdw.quantize_dense_weight_to_fp6(
@@ -119,8 +119,8 @@ def test_large_m_linear_fused_vs_host_chain_bit_exact(m, monkeypatch):
 
 @cuda_required
 def test_per_row_compile_guards():
-    from sparkinfer.quantization.mxfp6 import compile_bf16_to_fp6_tma
-    from sparkinfer.quantization.mxfp6.fp6_row_gs import compile_fp6_row_gs
+    from b12x.quantization.mxfp6 import compile_bf16_to_fp6_tma
+    from b12x.quantization.mxfp6.fp6_row_gs import compile_fp6_row_gs
 
     with pytest.raises(ValueError, match="emit='bytes'"):
         compile_bf16_to_fp6_tma(128, 512, fmt="e3m2", emit="packed", per_row=True)
@@ -130,7 +130,7 @@ def test_per_row_compile_guards():
 
 @cuda_required
 def test_row_gs_launch_rejects_misaligned_input():
-    from sparkinfer.quantization.mxfp6.fp6_row_gs import compile_fp6_row_gs
+    from b12x.quantization.mxfp6.fp6_row_gs import compile_fp6_row_gs
 
     m, k = 128, 512
     storage = torch.empty(m * k + 1, dtype=torch.bfloat16, device="cuda")
@@ -147,7 +147,7 @@ def test_row_gs_launch_rejects_misaligned_input():
 
 @cuda_required
 def test_per_row_tma_launch_validates_scale_shape():
-    from sparkinfer.quantization.mxfp6 import (
+    from b12x.quantization.mxfp6 import (
         allocate_bf16_to_fp6_tma_outputs,
         compile_bf16_to_fp6_tma,
     )

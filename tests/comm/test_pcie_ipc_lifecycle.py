@@ -6,13 +6,13 @@ import weakref
 import pytest
 import torch
 
-from sparkinfer.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A, PCIeDCPA2APool
-from sparkinfer.comm.pcie.pcie_oneshot import (
+from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A, PCIeDCPA2APool
+from b12x.comm.pcie.pcie_oneshot import (
     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
     PCIeOneshotAllReduce,
     PCIeOneshotAllReducePool,
 )
-from sparkinfer.comm.pcie.pcie_twoshot import PCIeTwoShotSP
+from b12x.comm.pcie.pcie_twoshot import PCIeTwoShotSP
 
 
 class _FakeChannel:
@@ -42,15 +42,15 @@ def test_pool_explicit_close_coordinates_imports_before_exports(monkeypatch) -> 
     pool._all_channels = [channel_a, channel_b]
     pool._channels = {1: channel_a, 2: channel_b}
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
+        "b12x.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
         lambda device: events.append("synchronize"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_status, group: [local_status, ()],
     )
 
@@ -87,7 +87,7 @@ def test_pool_destructor_is_nonblocking_and_does_not_touch_cuda_ownership(
     pool._all_channels = [channel]
     pool._channels = {1: channel}
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
 
@@ -248,15 +248,15 @@ def test_twoshot_explicit_close_coordinates_unmap_then_free(monkeypatch) -> None
     runtime = _fake_twoshot(events)
     runtime.device = torch.device("cuda:0")
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
+        "b12x.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
         lambda device: events.append("synchronize"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_status, group: [local_status, ()],
     )
 
@@ -285,7 +285,7 @@ def test_twoshot_destructor_retains_imports_and_exports_without_cuda_calls(
     events: list[object] = []
     runtime = _fake_twoshot(events)
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
 
@@ -496,15 +496,15 @@ def test_peer_unmap_failure_is_exchanged_before_any_local_export_free(
     )
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
+        "b12x.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
         lambda device: events.append("synchronize"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_status, group: next(peer_statuses)(local_status),
     )
 
@@ -541,11 +541,11 @@ def test_status_exchange_failure_retains_local_exports(monkeypatch) -> None:
         raise RuntimeError("status exchange failed")
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         fail_status_exchange,
     )
 
@@ -582,15 +582,15 @@ def test_rank_that_freed_locally_retries_until_peer_free_succeeds(
     )
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
+        "b12x.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
         lambda device: events.append("synchronize"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_status, group: next(peer_statuses)(local_status),
     )
 

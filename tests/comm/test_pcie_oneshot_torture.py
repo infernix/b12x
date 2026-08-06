@@ -9,22 +9,22 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sparkinfer.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
+from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("SPARKINFER_RUN_PCIE_ONESHOT_TORTURE") != "1",
-    reason="set SPARKINFER_RUN_PCIE_ONESHOT_TORTURE=1 to run PCIe oneshot CUDA torture tests",
+    os.getenv("B12X_RUN_PCIE_ONESHOT_TORTURE") != "1",
+    reason="set B12X_RUN_PCIE_ONESHOT_TORTURE=1 to run PCIe oneshot CUDA torture tests",
 )
 
 TORTURE_EAGER_ITERS = int(
-    os.getenv("SPARKINFER_PCIE_ONESHOT_TORTURE_EAGER_ITERS", "256")
+    os.getenv("B12X_PCIE_ONESHOT_TORTURE_EAGER_ITERS", "256")
 )
 TORTURE_GRAPH_REPLAYS = int(
-    os.getenv("SPARKINFER_PCIE_ONESHOT_TORTURE_GRAPH_REPLAYS", "256")
+    os.getenv("B12X_PCIE_ONESHOT_TORTURE_GRAPH_REPLAYS", "256")
 )
 TORTURE_MULTISTREAM_ITERS = int(
-    os.getenv("SPARKINFER_PCIE_ONESHOT_TORTURE_MULTISTREAM_ITERS", "256")
+    os.getenv("B12X_PCIE_ONESHOT_TORTURE_MULTISTREAM_ITERS", "256")
 )
 
 
@@ -218,7 +218,7 @@ def test_pcie_oneshot_eager_graph_and_multistream_torture():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
     available = torch.cuda.device_count()
-    requested = int(os.getenv("SPARKINFER_PCIE_ONESHOT_TORTURE_WORLD_SIZE", "2"))
+    requested = int(os.getenv("B12X_PCIE_ONESHOT_TORTURE_WORLD_SIZE", "2"))
     if requested not in (2, 4, 6, 8, 10):
         pytest.skip("PCIe oneshot only supports world sizes 2, 4, 6, 8, and 10")
     if available < requested:

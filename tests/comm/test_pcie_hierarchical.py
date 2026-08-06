@@ -6,12 +6,12 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-import sparkinfer.comm.pcie.pcie_allreduce as pcie_allreduce
-from sparkinfer.comm.pcie.pcie_allreduce import (
+import b12x.comm.pcie.pcie_allreduce as pcie_allreduce
+from b12x.comm.pcie.pcie_allreduce import (
     PCIeAllReduce,
     _algorithm_for_world_size,
 )
-from sparkinfer.comm.pcie.pcie_hierarchical import (
+from b12x.comm.pcie.pcie_hierarchical import (
     _buffer_modes_from_env,
     _pick_blocks,
     _selected_peers,
@@ -200,11 +200,11 @@ def test_hierarchical_buffer_modes_are_opt_in(
     expected: tuple[bool, bool],
 ) -> None:
     monkeypatch.setenv(
-        "SPARKINFER_PCIE_HIERARCHICAL_DOUBLE_BUFFER",
+        "B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER",
         double_buffered,
     )
     monkeypatch.setenv(
-        "SPARKINFER_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION",
+        "B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION",
         deferred_consumption,
     )
     assert _buffer_modes_from_env() == expected
@@ -213,9 +213,9 @@ def test_hierarchical_buffer_modes_are_opt_in(
 def test_hierarchical_buffer_modes_reject_ambiguous_protocol(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_PCIE_HIERARCHICAL_DOUBLE_BUFFER", "1")
+    monkeypatch.setenv("B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER", "1")
     monkeypatch.setenv(
-        "SPARKINFER_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION",
+        "B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION",
         "1",
     )
     with pytest.raises(ValueError, match="mutually exclusive"):
@@ -228,7 +228,7 @@ def test_hierarchical_wait_nanosleep_cycles(
     value: str,
 ) -> None:
     monkeypatch.setenv(
-        "SPARKINFER_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES",
+        "B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES",
         value,
     )
     assert _wait_nanosleep_cycles_from_env() == int(value)
@@ -240,7 +240,7 @@ def test_hierarchical_wait_nanosleep_cycles_rejects_invalid_values(
     value: str,
 ) -> None:
     monkeypatch.setenv(
-        "SPARKINFER_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES",
+        "B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES",
         value,
     )
     with pytest.raises(ValueError):
@@ -252,7 +252,7 @@ def test_hierarchical_threads(
     monkeypatch: pytest.MonkeyPatch,
     value: str,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_PCIE_HIERARCHICAL_THREADS", value)
+    monkeypatch.setenv("B12X_PCIE_HIERARCHICAL_THREADS", value)
     assert _threads_from_env() == int(value)
 
 
@@ -261,7 +261,7 @@ def test_hierarchical_threads_rejects_invalid_values(
     monkeypatch: pytest.MonkeyPatch,
     value: str,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_PCIE_HIERARCHICAL_THREADS", value)
+    monkeypatch.setenv("B12X_PCIE_HIERARCHICAL_THREADS", value)
     with pytest.raises(ValueError):
         _threads_from_env()
 
@@ -272,14 +272,14 @@ def test_hierarchical_vectorized_bf16x2(
     value: str,
     expected: bool,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_PCIE_HIERARCHICAL_BF16X2", value)
+    monkeypatch.setenv("B12X_PCIE_HIERARCHICAL_BF16X2", value)
     assert _vectorized_bf16x2_from_env() is expected
 
 
 def test_hierarchical_vectorized_bf16x2_rejects_invalid_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_PCIE_HIERARCHICAL_BF16X2", "true")
+    monkeypatch.setenv("B12X_PCIE_HIERARCHICAL_BF16X2", "true")
     with pytest.raises(ValueError):
         _vectorized_bf16x2_from_env()
 
@@ -290,7 +290,7 @@ def test_hierarchical_vectorized_bf16x2_max_elements(
     value: str,
 ) -> None:
     monkeypatch.setenv(
-        "SPARKINFER_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS",
+        "B12X_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS",
         value,
     )
     assert _vectorized_bf16x2_max_elements_from_env() == int(value)
@@ -302,7 +302,7 @@ def test_hierarchical_vectorized_bf16x2_max_elements_rejects_invalid_value(
     value: str,
 ) -> None:
     monkeypatch.setenv(
-        "SPARKINFER_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS",
+        "B12X_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS",
         value,
     )
     with pytest.raises(ValueError):

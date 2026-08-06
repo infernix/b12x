@@ -26,8 +26,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sparkinfer.comm.pcie import AllReduce
-from sparkinfer.comm.pcie.pcie_hierarchical import SUPPORTED_BLOCKS, _pick_blocks
+from b12x.comm.pcie import AllReduce
+from b12x.comm.pcie.pcie_hierarchical import SUPPORTED_BLOCKS, _pick_blocks
 
 
 def _free_port() -> int:

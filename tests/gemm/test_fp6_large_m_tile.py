@@ -12,8 +12,8 @@ cuda_required = pytest.mark.skipif(
 @cuda_required
 @pytest.mark.parametrize("m", [32, 128, 256])
 def test_fp6_large_m_tile_bit_exact(m, monkeypatch):
-    import sparkinfer._lib.dense_gemm as dg
-    import sparkinfer.quantization.mxfp6.fp6_dense_weights as fdw
+    import b12x._lib.dense_gemm as dg
+    import b12x.quantization.mxfp6.fp6_dense_weights as fdw
 
     torch.manual_seed(0)
     n, k = 6144, 512
@@ -33,8 +33,8 @@ def test_fp6_large_m_tile_bit_exact(m, monkeypatch):
 
 
 def test_fp6_tile_regime_selection(monkeypatch):
-    import sparkinfer._lib.dense_gemm as dg
-    from sparkinfer._lib.dense_gemm import _select_default_mma_tiler_mn
+    import b12x._lib.dense_gemm as dg
+    from b12x._lib.dense_gemm import _select_default_mma_tiler_mn
 
     monkeypatch.setattr(dg, "_FP6_PREFILL_TILE", (128, 128))
     monkeypatch.setattr(dg, "_FP6_DECODE_TILE", (16, 64))
@@ -65,8 +65,8 @@ def test_fp6_tile_regime_selection(monkeypatch):
 @pytest.mark.parametrize("m", [1, 2, 8, 16])
 def test_fp6_decode_tile_bit_exact(m, monkeypatch):
     """The default packed decode tile is bit-identical to 16x128."""
-    import sparkinfer._lib.dense_gemm as dg
-    import sparkinfer.quantization.mxfp6.fp6_dense_weights as fdw
+    import b12x._lib.dense_gemm as dg
+    import b12x.quantization.mxfp6.fp6_dense_weights as fdw
 
     torch.manual_seed(1)
     n, k = 6144, 512
@@ -86,7 +86,7 @@ def test_fp6_decode_tile_bit_exact(m, monkeypatch):
 
 def test_choose_epilogue_only_shrinks_to_buy_a_stage():
     """The full epilogue remains unless shrinking adds a mainloop stage."""
-    import sparkinfer._lib.dense_gemm as dg
+    import b12x._lib.dense_gemm as dg
 
     kernel = dg.DenseGemmKernel
 
@@ -132,7 +132,7 @@ def test_choose_epilogue_refuses_sub_atom_tiles():
     it is silently NaN - so the guard is a hard precondition, not a heuristic.
     Decode's (16,64) on a 16x16 atom is the live case.
     """
-    import sparkinfer._lib.dense_gemm as dg
+    import b12x._lib.dense_gemm as dg
 
     def probe_huge_gain(epi_tile, cap):
         return (1, 1) if cap == 0 else (99, 2)
@@ -152,7 +152,7 @@ def test_choose_epilogue_refuses_the_m1_register_store_path():
     case: the narrow-N (n <= 1536) coarse (128,128) tile serving m=1, where the
     atom guard alone would happily allow (64,64).
     """
-    import sparkinfer._lib.dense_gemm as dg
+    import b12x._lib.dense_gemm as dg
 
     def probe_gain(epi_tile, cap):
         return (1, 1) if cap == 0 else (2, 2)

@@ -22,7 +22,7 @@ def _isolate_scratch_registries():
     These tests clear buckets other tests (and any warm serving path in the
     same interpreter) rely on, so the clears must not outlive the module.
     """
-    import sparkinfer.quantization.mxfp6.fp6_dense_weights as fdw
+    import b12x.quantization.mxfp6.fp6_dense_weights as fdw
 
     saved = (
         dict(fdw._QUANT_SCRATCH),
@@ -46,7 +46,7 @@ def _isolate_scratch_registries():
 @cuda_required
 def test_capture_claims_eager_bucket_per_stream(monkeypatch):
     """Fake-capture unit test of the claim logic (no real graph needed)."""
-    import sparkinfer.quantization.mxfp6.fp6_dense_weights as fdw
+    import b12x.quantization.mxfp6.fp6_dense_weights as fdw
 
     device = torch.device("cuda")
     _clear_registries(fdw)
@@ -89,7 +89,7 @@ def test_capture_claims_eager_bucket_per_stream(monkeypatch):
 
 @cuda_required
 def test_capture_refuses_unplanned_quant_scratch(monkeypatch):
-    import sparkinfer.quantization.mxfp6.fp6_dense_weights as fdw
+    import b12x.quantization.mxfp6.fp6_dense_weights as fdw
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="prewarmed scratch bucket"):
@@ -99,7 +99,7 @@ def test_capture_refuses_unplanned_quant_scratch(monkeypatch):
 @cuda_required
 def test_decode_graph_replay_reuses_bucket_and_is_bit_exact():
     """Real capture: no zero-fills recorded for the quant scratch, bit-exact replay."""
-    import sparkinfer.quantization.mxfp6.fp6_dense_weights as fdw
+    import b12x.quantization.mxfp6.fp6_dense_weights as fdw
 
     torch.manual_seed(0)
     _clear_registries(fdw)

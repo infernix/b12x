@@ -6,7 +6,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-PCIE = ROOT / "sparkinfer" / "comm" / "pcie"
+PCIE = ROOT / "b12x" / "comm" / "pcie"
 UINT32_MASK = (1 << 32) - 1
 
 
@@ -95,7 +95,7 @@ def test_fused_rms_residency_is_runtime_derived_and_capture_cached() -> None:
     assert "cudaDevAttrMultiProcessorCount" in source
     assert "fused_resident_capacity_" in source
     assert "cap_fused_ctas_per_row" in source
-    assert "SPARKINFER_PCIE_TEST_RESIDENT_GRID_CAPACITY" in source
+    assert "B12X_PCIE_TEST_RESIDENT_GRID_CAPACITY" in source
     assert "kMaxBlocks <= SM count" not in source
 
     # Model the native clamp for reduced/MIG-like capacities. A capacity below
@@ -228,7 +228,7 @@ def test_dcp_control_selects_one_slot_per_operation_before_workers() -> None:
         "#define LAUNCH(world)"
     )
     assert gather.index(control_launch) < gather.index("#define LAUNCH(world)")
-    assert "SPARKINFER_PCIE_DCP_TEST_POST_BARRIER_DELAY_CYCLES" in source
+    assert "B12X_PCIE_DCP_TEST_POST_BARRIER_DELAY_CYCLES" in source
     assert "test_post_barrier_delay(rank, delayed_rank, delay_cycles);" in source
 
 

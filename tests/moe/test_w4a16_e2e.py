@@ -3,28 +3,28 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer._lib.intrinsics import (
+from b12x._lib.intrinsics import (
     FLOAT4_E2M1_MAX,
     fp4_quantize_values_torch,
     pack_grouped_fp4_values,
     swizzle_block_scale,
 )
-from sparkinfer.moe.fused_moe._impl import (
-    plan_sparkinfer_fp4_moe_weights,
-    prepare_sparkinfer_fp4_moe_weights,
+from b12x.moe.fused_moe._impl import (
+    plan_b12x_fp4_moe_weights,
+    prepare_b12x_fp4_moe_weights,
 )
-from sparkinfer.moe._shared.execution import PreparedWeightLayout
-from sparkinfer.moe._shared.kernels.reference import (
+from b12x.moe._shared.execution import PreparedWeightLayout
+from b12x.moe._shared.kernels.reference import (
     moe_reference_nvfp4,
     moe_reference_w4a16_f32,
     moe_reference_w4a16_fp4_e8m0_k32,
 )
-from sparkinfer.moe._shared.kernels.w4a16.host import (
+from b12x.moe._shared.kernels.w4a16.host import (
     max_packed_route_slots,
     route_pack_capacity,
     select_route_block_size_m,
 )
-from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+from b12x.moe._shared.kernels.w4a16.kernel import (
     _DEFAULT_MAX_SHARED_MEM,
     MoEMicroKernelW4A16SmallMDirect,
     _small_m_direct_host_barrier_reset_enabled,
@@ -34,7 +34,7 @@ from sparkinfer.moe._shared.kernels.w4a16.kernel import (
     compile_w4a16_topk_sum,
     run_w4a16_moe,
 )
-from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+from b12x.moe._shared.kernels.w4a16.prepare import (
     make_w4a16_packed_buffers as make_w4a16_buffers,
     prepare_w4a16_e8m0_native_weights,
     prepare_w4a16_modelopt_native_weights,
@@ -52,9 +52,9 @@ from tests._reference.w4a16_reference import compare_to_reference, moe_reference
 def test_w4a16_small_m_host_barrier_reset_kill_switch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("SPARKINFER_W4A16_SMALL_M_HOST_BARRIER_RESET", raising=False)
+    monkeypatch.delenv("B12X_W4A16_SMALL_M_HOST_BARRIER_RESET", raising=False)
     assert _small_m_direct_host_barrier_reset_enabled()
-    monkeypatch.setenv("SPARKINFER_W4A16_SMALL_M_HOST_BARRIER_RESET", "0")
+    monkeypatch.setenv("B12X_W4A16_SMALL_M_HOST_BARRIER_RESET", "0")
     assert not _small_m_direct_host_barrier_reset_enabled()
 
 
@@ -64,11 +64,11 @@ def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
     host_barrier_reset: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import sparkinfer.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
 
-    monkeypatch.setenv("SPARKINFER_W4A16_SMALL_M_DIRECT", "1")
+    monkeypatch.setenv("B12X_W4A16_SMALL_M_DIRECT", "1")
     monkeypatch.setenv(
-        "SPARKINFER_W4A16_SMALL_M_HOST_BARRIER_RESET",
+        "B12X_W4A16_SMALL_M_HOST_BARRIER_RESET",
         "1" if host_barrier_reset else "0",
     )
     torch.manual_seed(20260805 + int(host_barrier_reset))
@@ -172,7 +172,7 @@ def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
 def test_w4a16_fused_compile_rejects_unresolved_capture_launch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+    from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
 
     monkeypatch.setattr(w4a16_kernel, "_FUSED_CACHE", {})
     monkeypatch.setattr(w4a16_kernel.torch.cuda, "is_available", lambda: False)
@@ -201,7 +201,7 @@ def test_w4a16_fused_compile_rejects_unresolved_capture_launch(
 def test_w4a16_capture_guard_checks_selected_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+    from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
 
     selected_stream = 22
     queried: list[object] = []
@@ -226,7 +226,7 @@ def test_w4a16_capture_guard_checks_selected_stream(
 def test_w4a16_capture_guard_preserves_current_stream_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+    from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
 
     monkeypatch.setattr(
         w4a16_kernel.torch.cuda,
@@ -309,8 +309,8 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
     from contextlib import nullcontext
     from types import SimpleNamespace
 
-    from sparkinfer.moe.fused_moe import _impl as tp_moe_impl
-    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+    from b12x.moe.fused_moe import _impl as tp_moe_impl
+    from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
 
     workspace = SimpleNamespace(
         device=torch.device("cuda"),
@@ -768,7 +768,7 @@ def test_w4a16_packed_runtime_expert_count_reuses_compiled_kernel(
     tc_decode: bool,
 ) -> None:
     """Packed tier size is runtime data, while the launch geometry stays static."""
-    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+    from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
 
     torch.manual_seed(20260730)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -1529,11 +1529,11 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
     intermediate_size: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import sparkinfer.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
 
     experts, hidden_size = 8, 128
     topk = 2
-    monkeypatch.setenv("SPARKINFER_W4A16_SMALL_M_DIRECT", "1")
+    monkeypatch.setenv("B12X_W4A16_SMALL_M_DIRECT", "1")
     torch.manual_seed(
         20260730 + (1000 if activation == "silu" else 0) + m + intermediate_size
     )
@@ -1699,10 +1699,10 @@ def test_w4a16_modelopt_direct_non64_intermediate_is_bounds_safe(
     compute-sanitizer with ``PYTORCH_NO_CUDA_MEMORY_CACHING=1`` to audit
     m==1/m>=2 and ungated/gated direct-FC2 implementations.
     """
-    import sparkinfer.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
 
     experts, hidden_size, topk = 1, 128, 1
-    monkeypatch.setenv("SPARKINFER_W4A16_SMALL_M_DIRECT", "1")
+    monkeypatch.setenv("B12X_W4A16_SMALL_M_DIRECT", "1")
     real_direct_launch = w4a16_kernel._w4a16_small_m_direct_launch_flat
     direct_launches: list[tuple[int, int]] = []
 
@@ -1829,7 +1829,7 @@ def test_w4a16_tc_decode_fused_sum_matches_oracle(
     Validate the epilogue across the whole small-M range, not just powers of
     two, since 3/5/6/7 were never exercised through it before. TC-decode is
     unconditional for packed small-M, so no toggle is needed."""
-    import sparkinfer.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
 
     # Spy on the fused compile so we can assert the fused-sum path actually engaged
     # (a silent fallback to the packed GEMM would also pass the cosine gate).
@@ -2047,7 +2047,7 @@ def test_w4a16_mapped_decode_consumes_global_map_without_route_pack(
     m: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+    from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
 
     torch.manual_seed(20260730 + m)
     global_experts, local_experts = 12, 8
@@ -2162,8 +2162,8 @@ def test_w4a16_mapped_decode_consumes_global_map_without_route_pack(
 def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from sparkinfer.moe import fused_moe
-    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+    from b12x.moe import fused_moe
+    from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
 
     torch.manual_seed(20260731)
     global_experts, local_experts = 12, 8
@@ -2341,7 +2341,7 @@ def test_w4a16_activation_amax_calibration_tracks_routed_inputs_and_fc2_inputs(
         return compile_w4a16_fused_moe(**kwargs)
 
     monkeypatch.setattr(
-        "sparkinfer.moe._shared.kernels.w4a16.kernel.compile_w4a16_fused_moe",
+        "b12x.moe._shared.kernels.w4a16.kernel.compile_w4a16_fused_moe",
         spy_compile_w4a16_fused_moe,
     )
 
@@ -2472,7 +2472,7 @@ def test_w4a16_activation_amax_forces_main_kernel_over_native_small_m_direct(
         return compile_w4a16_fused_moe(**kwargs)
 
     monkeypatch.setattr(
-        "sparkinfer.moe._shared.kernels.w4a16.kernel.compile_w4a16_fused_moe",
+        "b12x.moe._shared.kernels.w4a16.kernel.compile_w4a16_fused_moe",
         spy_compile_w4a16_fused_moe,
     )
 
@@ -2802,7 +2802,7 @@ def test_tp_moe_w4a16_prepared_reuse_path_is_deterministic_under_odd_shape_stres
     reference_weights = tuple(t.clone() for t in weights)
     w13, w13_blockscale, w13_global_scale, w2, w2_blockscale, w2_global_scale = weights
     a_gscale = torch.ones(experts, dtype=torch.float32, device="cuda")
-    weight_plan = plan_sparkinfer_fp4_moe_weights(
+    weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="modelopt_nvfp4",
         activation=activation,
@@ -2812,7 +2812,7 @@ def test_tp_moe_w4a16_prepared_reuse_path_is_deterministic_under_odd_shape_stres
         intermediate_size=intermediate_size,
         w4a16_layout=PreparedWeightLayout.MMA_PACKED,
     )
-    prepared = prepare_sparkinfer_fp4_moe_weights(
+    prepared = prepare_b12x_fp4_moe_weights(
         plan=weight_plan,
         w1_fp4=w13,
         w1_blockscale=w13_blockscale,

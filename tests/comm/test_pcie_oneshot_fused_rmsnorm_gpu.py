@@ -12,18 +12,18 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from cuda.bindings import runtime as cudart
 
-from sparkinfer.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
+from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("SPARKINFER_RUN_PCIE_ONESHOT_RMS_TEST") != "1",
+    os.getenv("B12X_RUN_PCIE_ONESHOT_RMS_TEST") != "1",
     reason=(
-        "set SPARKINFER_RUN_PCIE_ONESHOT_RMS_TEST=1 to run PCIe oneshot fused "
+        "set B12X_RUN_PCIE_ONESHOT_RMS_TEST=1 to run PCIe oneshot fused "
         "RMSNorm GPU tests"
     ),
 )
 TEST_TIMEOUT_SECONDS = float(
-    os.getenv("SPARKINFER_PCIE_ONESHOT_RMS_TIMEOUT_SECONDS", "300")
+    os.getenv("B12X_PCIE_ONESHOT_RMS_TIMEOUT_SECONDS", "300")
 )
 
 
@@ -256,7 +256,7 @@ def _run_graph(
     _cuda_graph_kernel_chain(graph)
     stream = torch.cuda.current_stream(device)
     offset = 0
-    if os.getenv("SPARKINFER_PCIE_ONESHOT_PUSH", "0") not in ("", "0"):
+    if os.getenv("B12X_PCIE_ONESHOT_PUSH", "0") not in ("", "0"):
         remote_source = (rank + 1) % dist.get_world_size()
         offset = remote_source * inp.numel() * inp.element_size()
     snapshots = [_local_eager_words(channel, stream, offset=offset)]
@@ -333,7 +333,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 def test_pcie_oneshot_fused_add_rms_norm_eager_and_graph() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    world_size = int(os.getenv("SPARKINFER_PCIE_ONESHOT_RMS_WORLD_SIZE", "2"))
+    world_size = int(os.getenv("B12X_PCIE_ONESHOT_RMS_WORLD_SIZE", "2"))
     if world_size not in (2, 4, 6, 8, 10):
         pytest.skip("PCIe oneshot only supports world sizes 2, 4, 6, 8, and 10")
     if torch.cuda.device_count() < world_size:

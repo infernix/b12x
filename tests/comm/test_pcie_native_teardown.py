@@ -9,7 +9,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-PCIE_ONESHOT = ROOT / "sparkinfer" / "comm" / "pcie" / "pcie_oneshot.cu"
+PCIE_ONESHOT = ROOT / "b12x" / "comm" / "pcie" / "pcie_oneshot.cu"
 
 
 def test_oneshot_native_dispose_has_strict_and_best_effort_paths() -> None:
@@ -50,7 +50,7 @@ def test_native_ipc_registry_destructor_survives_injected_close_failure(
     source.write_text(
         textwrap.dedent(
             r"""
-            #include "sparkinfer/comm/pcie/ipc_handle_registry.h"
+            #include "b12x/comm/pcie/ipc_handle_registry.h"
 
             #include <cstdlib>
             #include <exception>
@@ -74,7 +74,7 @@ def test_native_ipc_registry_destructor_survives_injected_close_failure(
             }
 
             using Registry =
-                sparkinfer::pcie::IpcHandleRegistry<int, int, int, kSuccess>;
+                b12x::pcie::IpcHandleRegistry<int, int, int, kSuccess>;
 
             struct Owner {
               Registry handles{&injected_close};

@@ -18,7 +18,7 @@ def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
 @cuda_required
 def test_w6a8_dense_linear_numeric():
     """W6A8 dense path produces a non-trivial, high-cosine result vs BF16."""
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         dense_fp6_linear,
         quantize_dense_weight_to_fp6,
     )
@@ -42,7 +42,7 @@ def test_w6a8_dense_linear_numeric():
 @pytest.mark.parametrize("m", [1, 3, 16, 128])
 def test_w6a8_dense_matches_across_m(m):
     """Small-M and large-M W6A8 paths agree on shared rows (amax pinned)."""
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         dense_fp6_linear,
         quantize_dense_weight_to_fp6,
     )
@@ -61,7 +61,7 @@ def test_w6a8_dense_matches_across_m(m):
 
 @cuda_required
 def test_w6a8_source_format_sets_act_fmt():
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import quantize_dense_weight_to_fp6
+    from b12x.quantization.mxfp6.fp6_dense_weights import quantize_dense_weight_to_fp6
 
     w = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
     w6a8 = quantize_dense_weight_to_fp6(w, source_format="mxfp6_w6a8")
@@ -84,9 +84,9 @@ def test_w6a8_source_format_sets_act_fmt():
 )
 def test_fused_quant_matches_unfused(m, n, k, monkeypatch):
     """Fused m=1 quantization is exact; larger M keeps the same kernel."""
-    import sparkinfer._lib.dense_gemm as _dense_mod
-    import sparkinfer.quantization.mxfp6.fp6_dense_weights as _wmod
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    import b12x._lib.dense_gemm as _dense_mod
+    import b12x.quantization.mxfp6.fp6_dense_weights as _wmod
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         dense_fp6_linear,
         quantize_dense_weight_to_fp6,
     )
@@ -159,7 +159,7 @@ def test_dense_fp6_linear_deterministic(m, n, k):
     """dense_fp6_linear must produce bit-identical output on every call
     for the same input.  Covers small-M decode (m=1), mid-M (m=128),
     and large-M prefill/KLD-scoring (m=2048) paths."""
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         dense_fp6_linear,
         quantize_dense_weight_to_fp6,
     )
@@ -184,7 +184,7 @@ class TestPackedGemmTPAware:
     """Packed-weight policy uses full, unsharded N."""
 
     def _make_weight(self, out_f, in_f, *, unsharded=0):
-        from sparkinfer.quantization.mxfp6.fp6_dense_weights import FP6DenseWeight
+        from b12x.quantization.mxfp6.fp6_dense_weights import FP6DenseWeight
 
         return FP6DenseWeight(
             packed=torch.empty(out_f, (3 * in_f) // 4, dtype=torch.uint8),

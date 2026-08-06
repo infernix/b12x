@@ -19,14 +19,14 @@ import sys
 
 import torch
 
-from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
-from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+from b12x.moe._shared.kernels.w4a16.prepare import (
     make_w4a16_packed_buffers,
     prepare_w4a16_e8m0_native_weights,
 )
 
 
-RESET_ENV = "SPARKINFER_W4A16_SMALL_M_HOST_BARRIER_RESET"
+RESET_ENV = "B12X_W4A16_SMALL_M_HOST_BARRIER_RESET"
 
 
 def _parse_args() -> argparse.Namespace:

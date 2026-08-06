@@ -8,10 +8,10 @@ import torch
 
 pytest.importorskip("cutlass")
 
-from sparkinfer.moe import fused_moe
-from sparkinfer.moe.fused_moe import META as FUSED_MOE_META
-from sparkinfer.moe._shared.kernels.w4a16.host import plan_w4a16_buffers
-from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+from b12x.moe import fused_moe
+from b12x.moe.fused_moe import META as FUSED_MOE_META
+from b12x.moe._shared.kernels.w4a16.host import plan_w4a16_buffers
+from b12x.moe._shared.kernels.w4a16.prepare import (
     PreparedW4A16MoeWeights,
     prepare_nf3_moe_weights,
 )
@@ -79,7 +79,7 @@ def test_fused_moe_metadata_advertises_trellis_input_dtypes() -> None:
 def test_rotation_placeholder_must_be_materialized_before_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import sparkinfer.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
 
     device = torch.device("cuda:127")
     w4a16_kernel._ROT_SCALES_DUMMY.pop(device, None)
@@ -92,7 +92,7 @@ def test_rotation_placeholder_must_be_materialized_before_capture(
 def test_dense_scratch_cannot_allocate_during_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import sparkinfer.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
@@ -226,7 +226,7 @@ def test_low_level_buffer_plan_honors_explicit_block_m() -> None:
 
 
 def test_planned_route_block_overrides_live_batch_heuristic() -> None:
-    from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+    from b12x.moe._shared.kernels.w4a16.kernel import (
         _resolve_route_block_size_m,
     )
 
@@ -823,7 +823,7 @@ def test_full_rotation_reuses_compiled_kernels_across_expert_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Compact EXL3 layer sizes are runtime data, including the W13 plane stride."""
-    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+    from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
 
     torch.manual_seed(20260730)
     device = torch.device("cuda", torch.cuda.current_device())

@@ -9,9 +9,9 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-import sparkinfer.comm.pcie.pcie_dcp_a2a as pcie_dcp_a2a
-from sparkinfer.comm.pcie.pcie_oneshot import PCIeOneshotAllReduce
-from sparkinfer.comm.pcie.pcie_dcp_a2a import (
+import b12x.comm.pcie.pcie_dcp_a2a as pcie_dcp_a2a
+from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReduce
+from b12x.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2A,
     PCIeDCPA2APool,
     _load_extension,
@@ -21,8 +21,8 @@ from sparkinfer.comm.pcie.pcie_dcp_a2a import (
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("SPARKINFER_RUN_PCIE_DCP_A2A_TEST") != "1",
-    reason="set SPARKINFER_RUN_PCIE_DCP_A2A_TEST=1 to run PCIe DCP A2A GPU tests",
+    os.getenv("B12X_RUN_PCIE_DCP_A2A_TEST") != "1",
+    reason="set B12X_RUN_PCIE_DCP_A2A_TEST=1 to run PCIe DCP A2A GPU tests",
 )
 
 TOTAL_HEADS = 16
@@ -369,9 +369,9 @@ def _check_graph(
             channel.lse_reduce_scatter(inputs[layer], lses[layer], outputs[layer])
     stream.synchronize()
 
-    replay_count = int(os.getenv("SPARKINFER_PCIE_DCP_GRAPH_REPLAYS", "8"))
+    replay_count = int(os.getenv("B12X_PCIE_DCP_GRAPH_REPLAYS", "8"))
     if replay_count <= 0:
-        raise ValueError("SPARKINFER_PCIE_DCP_GRAPH_REPLAYS must be positive")
+        raise ValueError("B12X_PCIE_DCP_GRAPH_REPLAYS must be positive")
     for replay in range(replay_count):
         expected = []
         expected_queries = []
@@ -624,7 +624,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.barrier()
         _check_graph(pool, rank, world_size, device)
         torch.cuda.synchronize(device)
-        if os.getenv("SPARKINFER_PCIE_DCP_TEST_TEARDOWN_RETRY", "0") == "1":
+        if os.getenv("B12X_PCIE_DCP_TEST_TEARDOWN_RETRY", "0") == "1":
             _check_teardown_retry(pool, rank, device)
             closed = True
     finally:
@@ -637,7 +637,7 @@ def _residency_rejection_worker(rank: int, world_size: int, port: int) -> None:
     if rank != 0:
         # Simulate one constrained/MIG-like rank in an otherwise full device
         # group; every peer must reject before any IPC allocation.
-        os.environ.pop("SPARKINFER_PCIE_TEST_VISIBLE_SM_COUNT", None)
+        os.environ.pop("B12X_PCIE_TEST_VISIBLE_SM_COUNT", None)
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     dist.init_process_group(
@@ -718,13 +718,13 @@ def _preflight_rejection_worker(rank: int, world_size: int, port: int) -> None:
 
 def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
     if (
-        os.getenv("SPARKINFER_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") == "1"
-        or os.getenv("SPARKINFER_PCIE_DCP_TEST_EXPECT_PREFLIGHT_REJECTION") == "1"
+        os.getenv("B12X_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") == "1"
+        or os.getenv("B12X_PCIE_DCP_TEST_EXPECT_PREFLIGHT_REJECTION") == "1"
     ):
         pytest.skip("running the reduced-SM residency rejection gate")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
-    world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "2"))
+    world_size = int(os.getenv("B12X_PCIE_DCP_A2A_WORLD_SIZE", "2"))
     if world_size not in (2, 4, 8, 16):
         pytest.skip("PCIe DCP A2A supports world sizes 2, 4, 8, and 16")
     if torch.cuda.device_count() < world_size:
@@ -736,16 +736,16 @@ def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
 
 
 def test_pcie_dcp_a2a_rejects_reduced_sm_slice_before_ipc_allocation():
-    if os.getenv("SPARKINFER_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") != "1":
+    if os.getenv("B12X_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") != "1":
         pytest.skip("set the reduced-SM residency rejection gate to run this test")
-    visible_sms = int(os.getenv("SPARKINFER_PCIE_TEST_VISIBLE_SM_COUNT", "0") or "0")
+    visible_sms = int(os.getenv("B12X_PCIE_TEST_VISIBLE_SM_COUNT", "0") or "0")
     assert 0 < visible_sms < pcie_dcp_a2a.DCP_A2A_REQUIRED_SMS, (
-        "set SPARKINFER_PCIE_TEST_VISIBLE_SM_COUNT below "
+        "set B12X_PCIE_TEST_VISIBLE_SM_COUNT below "
         f"{pcie_dcp_a2a.DCP_A2A_REQUIRED_SMS} to exercise the residency gate"
     )
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
-    world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "2"))
+    world_size = int(os.getenv("B12X_PCIE_DCP_A2A_WORLD_SIZE", "2"))
     if world_size not in (2, 4, 8, 16):
         pytest.skip("PCIe DCP A2A supports world sizes 2, 4, 8, and 16")
     if torch.cuda.device_count() < world_size:
@@ -761,11 +761,11 @@ def test_pcie_dcp_a2a_rejects_reduced_sm_slice_before_ipc_allocation():
 
 
 def test_pcie_dcp_a2a_coordinates_one_rank_preflight_failure_before_ipc():
-    if os.getenv("SPARKINFER_PCIE_DCP_TEST_EXPECT_PREFLIGHT_REJECTION") != "1":
+    if os.getenv("B12X_PCIE_DCP_TEST_EXPECT_PREFLIGHT_REJECTION") != "1":
         pytest.skip("set the one-rank preflight rejection gate to run this test")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
-    world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "2"))
+    world_size = int(os.getenv("B12X_PCIE_DCP_A2A_WORLD_SIZE", "2"))
     if world_size not in (2, 4, 8):
         pytest.skip("PCIe DCP A2A supports world sizes 2, 4, and 8")
     if torch.cuda.device_count() < world_size:

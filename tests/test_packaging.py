@@ -10,8 +10,8 @@ except ModuleNotFoundError:  # Python 3.10
 
 
 ROOT = Path(__file__).parents[1]
-PCIE_PACKAGE = "sparkinfer.comm.pcie"
-PCIE_SOURCE_DIR = ROOT / "sparkinfer" / "comm" / "pcie"
+PCIE_PACKAGE = "b12x.comm.pcie"
+PCIE_SOURCE_DIR = ROOT / "b12x" / "comm" / "pcie"
 PCIE_PACKAGE_PATTERNS = {"*.cu", "*.h"}
 RUNTIME_CUDA_SOURCES = {
     "pcie_dcp_a2a.cu",

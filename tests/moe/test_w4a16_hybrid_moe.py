@@ -14,19 +14,19 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer._lib.intrinsics import swizzle_block_scale
-from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+from b12x._lib.intrinsics import swizzle_block_scale
+from b12x.moe._shared.kernels.w4a16.kernel import (
     build_w4a16_tier_local_map,
     compile_w4a16_fused_moe,
     compile_w4a16_fused_moe_hybrid,
     run_w4a16_moe,
     run_w4a16_moe_hybrid,
 )
-from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+from b12x.moe._shared.kernels.w4a16.prepare import (
     prepare_nf3_moe_weights,
     prepare_w4a16_modelopt_nvfp4_weights,
 )
-from sparkinfer.moe._shared.kernels.w4a16.host import (
+from b12x.moe._shared.kernels.w4a16.host import (
     make_w4a16_packed_buffers,
 )
 from .test_w4a16_nf3 import _round_to_e4m3_scale

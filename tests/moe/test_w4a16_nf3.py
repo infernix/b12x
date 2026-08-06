@@ -19,15 +19,15 @@ from dataclasses import replace
 import pytest
 import torch
 
-from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+from b12x.moe._shared.kernels.w4a16.kernel import (
     compile_w4a16_fused_moe,
     run_w4a16_moe,
 )
-from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+from b12x.moe._shared.kernels.w4a16.prepare import (
     _NF3_CODEBOOK,
     prepare_nf3_moe_weights,
 )
-from sparkinfer.moe._shared.kernels.w4a16.host import (
+from b12x.moe._shared.kernels.w4a16.host import (
     make_w4a16_packed_buffers,
     max_packed_route_slots,
     select_route_block_size_m,

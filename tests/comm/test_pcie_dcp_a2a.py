@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.comm.pcie.pcie_dcp_a2a import (
+from b12x.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2A,
     PCIeDCPA2APool,
     _SINGLE_CHANNEL_ID,
@@ -427,13 +427,13 @@ def test_pool_uses_distinct_channels_for_target_and_draft_captures(monkeypatch):
         channel_factory=make_channel,
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        "b12x.comm.pcie.pcie_dcp_a2a._current_stream_key",
         lambda device, stream=None: (
             current_stream[0] if stream is None else int(stream)
         ),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
         lambda device: capturing[0],
     )
 
@@ -482,11 +482,11 @@ def test_pool_collectively_prepares_logical_channels_in_canonical_order(
         lambda stream_key: created.append(stream_key) or object(),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_dcp_a2a._broadcast_gather_object",
         lambda local_state, group: [local_state, local_state],
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_status, group: [local_status, local_status],
     )
 
@@ -522,10 +522,10 @@ def test_pool_rejects_logical_channel_set_mismatch_before_allocation(monkeypatch
         return [(("other",), existing), local_state]
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._broadcast_gather_object", gather
+        "b12x.comm.pcie.pcie_dcp_a2a._broadcast_gather_object", gather
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
     )
 
     with pytest.raises(RuntimeError, match="differs across ranks"):
@@ -550,7 +550,7 @@ def test_pool_invalid_logical_id_is_rejected_collectively(monkeypatch):
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_status, group: [local_status, ()],
     )
 
@@ -575,7 +575,7 @@ def test_pool_eager_channel_requires_id_and_rejects_duplicate_stream_owner(
     pool.exchange_group = object()
     pool._logical_channels["eager:dcp"] = eager
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        "b12x.comm.pcie.pcie_dcp_a2a._current_stream_key",
         lambda device, stream=None: int(stream),
     )
 
@@ -625,7 +625,7 @@ def test_pool_capture_requires_stable_semantic_id(monkeypatch):
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_status, group: [local_status, ()],
     )
 
@@ -657,7 +657,7 @@ def test_pool_capture_allows_opposite_order_from_agreed_catalog(monkeypatch):
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        "b12x.comm.pcie.pcie_dcp_a2a._current_stream_key",
         lambda device, stream=None: int(stream),
     )
 
@@ -669,7 +669,7 @@ def test_pool_capture_allows_opposite_order_from_agreed_catalog(monkeypatch):
         return [local_state, ("graph:draft", catalog)]
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
     )
 
     with pool.capture(7, channel_id="graph:target") as channel:
@@ -704,7 +704,7 @@ def test_pool_capture_rejects_divergent_catalog_before_allocation(monkeypatch):
         return [local_state, ("graph:target", ())]
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
     )
 
     with (
@@ -741,7 +741,7 @@ def test_pool_capture_rejects_differing_unprepared_ids(monkeypatch):
         return [local_state, ("graph:unknown", catalog)]
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
     )
 
     with (
@@ -771,15 +771,15 @@ def test_pool_capture_preserves_same_id_convenience_allocation(monkeypatch):
         lambda stream_key: created.append(stream_key) or channel,
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        "b12x.comm.pcie.pcie_dcp_a2a._current_stream_key",
         lambda device, stream=None: int(stream),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_state, group: [local_state, local_state],
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_dcp_a2a._broadcast_gather_object",
         lambda local_state, group: [local_state, local_state],
     )
 
@@ -811,11 +811,11 @@ def test_pool_capture_routes_eager_warmup_to_graph_channel(monkeypatch):
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        "b12x.comm.pcie.pcie_dcp_a2a._current_stream_key",
         lambda device, stream=None: 7 if stream is None else int(stream),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_state, group: [local_state, local_state],
     )
 
@@ -848,13 +848,13 @@ def test_pool_isolates_reused_capture_stream_keys(monkeypatch):
         channel_factory=make_channel,
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        "b12x.comm.pcie.pcie_dcp_a2a._current_stream_key",
         lambda device, stream=None: (
             current_stream[0] if stream is None else int(stream)
         ),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
         lambda device: capturing[0],
     )
 
@@ -894,13 +894,13 @@ def test_pool_restores_eager_mapping_after_capture(monkeypatch):
         channel_factory=lambda stream_key: _make_runtime(),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        "b12x.comm.pcie.pcie_dcp_a2a._current_stream_key",
         lambda device, stream=None: (
             current_stream[0] if stream is None else int(stream)
         ),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
         lambda device: capturing[0],
     )
 
@@ -929,13 +929,13 @@ def test_pool_restores_nested_capture_mappings(monkeypatch):
         channel_factory=lambda stream_key: _make_runtime(),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        "b12x.comm.pcie.pcie_dcp_a2a._current_stream_key",
         lambda device, stream=None: (
             current_stream[0] if stream is None else int(stream)
         ),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
         lambda device: capturing[0],
     )
 
@@ -985,7 +985,7 @@ def test_pool_rolls_back_throwaway_capture_channels(monkeypatch):
         channel_factory=make_channel,
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        "b12x.comm.pcie.pcie_dcp_a2a._current_stream_key",
         lambda device, stream=None: 3 if stream is None else int(stream),
     )
 
@@ -1031,7 +1031,7 @@ def test_pool_coordinates_ipc_teardown_across_ranks(monkeypatch):
     pool._all_channels.append(transient)
     pool._channels[7] = transient
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_dcp_a2a.dist.barrier",
+        "b12x.comm.pcie.pcie_dcp_a2a.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
 

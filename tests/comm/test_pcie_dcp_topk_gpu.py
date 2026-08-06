@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sparkinfer.comm.pcie.pcie_dcp_topk import (
+from b12x.comm.pcie.pcie_dcp_topk import (
     PCIeDCPTopKOwnerExchange,
     _load_extension,
     owner_stage_reference,
@@ -16,8 +16,8 @@ from sparkinfer.comm.pcie.pcie_dcp_topk import (
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("SPARKINFER_RUN_PCIE_DCP_TOPK_TEST") != "1",
-    reason="set SPARKINFER_RUN_PCIE_DCP_TOPK_TEST=1 to run GPU tests",
+    os.getenv("B12X_RUN_PCIE_DCP_TOPK_TEST") != "1",
+    reason="set B12X_RUN_PCIE_DCP_TOPK_TEST=1 to run GPU tests",
 )
 
 MAX_ROWS = 64
@@ -203,8 +203,8 @@ def _worker(
 def test_pcie_dcp_topk_exact_owner_exchange():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
-    tp_world_size = int(os.getenv("SPARKINFER_PCIE_DCP_TOPK_TP", "8"))
-    dcp_world_size = int(os.getenv("SPARKINFER_PCIE_DCP_TOPK_DCP", "4"))
+    tp_world_size = int(os.getenv("B12X_PCIE_DCP_TOPK_TP", "8"))
+    dcp_world_size = int(os.getenv("B12X_PCIE_DCP_TOPK_DCP", "4"))
     if (
         tp_world_size not in (2, 3, 4, 6, 8)
         or dcp_world_size not in (2, 3, 4, 6, 8)

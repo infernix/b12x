@@ -28,10 +28,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.utils.cpp_extension import load
 
-from sparkinfer.comm.pcie import AllReduce
-from sparkinfer.comm.pcie._cuda_ipc import CudaRTLibrary
-from sparkinfer.comm.pcie.pcie_dcp_a2a import PCIeDCPA2APool
-from sparkinfer.comm.pcie.pcie_oneshot import _broadcast_gather_object
+from b12x.comm.pcie import AllReduce
+from b12x.comm.pcie._cuda_ipc import CudaRTLibrary
+from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2APool
+from b12x.comm.pcie.pcie_oneshot import _broadcast_gather_object
 
 
 DEFAULT_SHAPES = (7168, 3584, 7168)
@@ -59,11 +59,11 @@ def _lane_peers(rank: int, world_size: int) -> tuple[int, ...]:
 def _load_lane_extension():
     source = Path(__file__).with_name("kimi_k3_lane_allreduce_poc.cu")
     return load(
-        name="sparkinfer_kimi_k3_lane_allreduce_poc_ext",
+        name="b12x_kimi_k3_lane_allreduce_poc_ext",
         sources=[str(source)],
         extra_cuda_cflags=["-O3"],
         extra_ldflags=["-lcuda"],
-        verbose=os.getenv("SPARKINFER_K3_LANE_POC_VERBOSE_BUILD", "0") == "1",
+        verbose=os.getenv("B12X_K3_LANE_POC_VERBOSE_BUILD", "0") == "1",
     )
 
 
@@ -401,25 +401,25 @@ def _worker(
             else:
                 wait_nanosleep_cycles = int(
                     os.getenv(
-                        "SPARKINFER_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES",
+                        "B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES",
                         "24",
                     )
                 )
                 vectorized_bf16x2 = (
                     os.getenv(
-                        "SPARKINFER_PCIE_HIERARCHICAL_BF16X2",
+                        "B12X_PCIE_HIERARCHICAL_BF16X2",
                         "1",
                     )
                     == "1"
                 )
                 vectorized_bf16x2_max_elements = int(
                     os.getenv(
-                        "SPARKINFER_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS",
+                        "B12X_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS",
                         "7168",
                     )
                 )
                 configured_scalar_threads = int(
-                    os.getenv("SPARKINFER_PCIE_HIERARCHICAL_THREADS", "224")
+                    os.getenv("B12X_PCIE_HIERARCHICAL_THREADS", "224")
                 )
                 effective_threads = [
                     (
@@ -521,10 +521,10 @@ def main() -> None:
             f"devices, found {torch.cuda.device_count()}"
         )
 
-    os.environ["SPARKINFER_PCIE_HIERARCHICAL_DOUBLE_BUFFER"] = (
+    os.environ["B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER"] = (
         "1" if args.mode == "double" else "0"
     )
-    os.environ["SPARKINFER_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION"] = (
+    os.environ["B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION"] = (
         "1" if args.mode == "deferred" else "0"
     )
     mp.spawn(

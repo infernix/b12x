@@ -7,16 +7,16 @@ import pytest
 import torch
 import cutlass
 
-import sparkinfer._lib.dense_gemm as dense_module
-from sparkinfer._lib.intrinsics import quantize_grouped_nvfp4_torch
-from sparkinfer._lib.utils import convert_sf_from_mma_layout, get_num_sm
-from sparkinfer._lib.dense_gemm import (
+import b12x._lib.dense_gemm as dense_module
+from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
+from b12x._lib.utils import convert_sf_from_mma_layout, get_num_sm
+from b12x._lib.dense_gemm import (
     DenseGemmKernel,
     _select_default_dense_gemm_plan,
     _select_default_mma_tiler_mn,
     dense_gemm,
 )
-from sparkinfer.gemm._shared.wo_mxfp8 import (
+from b12x.gemm._shared.wo_mxfp8 import (
     dequantize_mxfp8_rows_torch,
     pack_fp8_block_scaled_weight_mxfp8,
     quantize_mxfp8_rows_torch,
@@ -26,7 +26,7 @@ _FLASHINFER_ROOT = pathlib.Path(__file__).resolve().parents[2] / "flashinfer"
 if _FLASHINFER_ROOT.exists():
     sys.path.insert(0, str(_FLASHINFER_ROOT))
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
 def _import_flashinfer_gemm():
@@ -110,7 +110,7 @@ def _run_dense_gemm(
 def test_dense_gemm_matches_flashinfer_cudnn(
     M: int, N: int, K: int, c_dtype_str: str,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     mm_fp4 = _require_cudnn_fp4()
     torch.manual_seed(42)
 
@@ -160,7 +160,7 @@ def test_dense_gemm_fp4_swap_ab_small_tilen_matches_flashinfer_cudnn(
     mma_tiler_mn: tuple[int, int],
     load_path: str,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     mm_fp4 = _require_cudnn_fp4()
     torch.manual_seed(7)
 
@@ -279,7 +279,7 @@ def test_dense_gemm_fp8_small_tile_and_swap_support_matrix() -> None:
 def test_dense_gemm_mxfp8_bk64_grouped_batches_use_their_own_scales(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(29)
 
     # Use the real grouped WO-A geometry. The manual BK64 path is deliberately
@@ -345,7 +345,7 @@ def test_dense_gemm_shared_expert_pair_replays_under_cuda_graph(
     gate_shape: tuple[int, int, int],
     down_shape: tuple[int, int, int],
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(1234)
 
     gate_m, gate_n, gate_k = gate_shape

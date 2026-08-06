@@ -14,12 +14,12 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from sparkinfer.comm.pcie.pcie_oneshot import (
+from b12x.comm.pcie.pcie_oneshot import (
     PCIeOneshotAllReduce,
     _OwnedSharedBuffer,
     _RETAINED_FAILED_IPC_EXPORTS,
 )
-from sparkinfer.comm.pcie.pcie_twoshot import (
+from b12x.comm.pcie.pcie_twoshot import (
     PCIeTwoShotSP,
     quantize_per_row,
 )
@@ -81,15 +81,15 @@ def test_factory_retains_twoshot_native_and_ipc_ownership_when_verdict_fails(
     monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
     monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_twoshot._run_collective_preallocation_setup",
+        "b12x.comm.pcie.pcie_twoshot._run_collective_preallocation_setup",
         fake_preallocation,
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_twoshot._require_full_grid_residency",
+        "b12x.comm.pcie.pcie_twoshot._require_full_grid_residency",
         lambda **kwargs: None,
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_twoshot._require_collective_contract",
+        "b12x.comm.pcie.pcie_twoshot._require_collective_contract",
         lambda **kwargs: None,
     )
     monkeypatch.setattr(
@@ -98,7 +98,7 @@ def test_factory_retains_twoshot_native_and_ipc_ownership_when_verdict_fails(
         classmethod(lambda cls, *args, **kwargs: shared),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         exchange,
     )
 
@@ -364,8 +364,8 @@ def _bench(pool: PCIeTwoShotSP, rank: int, world: int) -> None:
         return (time.perf_counter() - start) / iters * 1e6
 
     results = {
-        "sparkinfer rs_fp8": timeit(lambda: pool.reduce_scatter_fp8(q, s, rs_out)),
-        "sparkinfer ag_fp8": timeit(lambda: pool.all_gather_fp8(qs, ss, ag_out)),
+        "b12x rs_fp8": timeit(lambda: pool.reduce_scatter_fp8(q, s, rs_out)),
+        "b12x ag_fp8": timeit(lambda: pool.all_gather_fp8(qs, ss, ag_out)),
         "nccl rs bf16": timeit(lambda: dist.reduce_scatter_tensor(nccl_rs_out, x)),
         "nccl ag bf16": timeit(
             lambda: dist.all_gather_into_tensor(nccl_ag_out, shard_bf16)

@@ -1,5 +1,5 @@
 [project]
-name = "sparkinfer"
+name = "b12x"
 version = "1.0.1"
 description = "DGX Spark and RTX 6000-focused inference kernel library."
 readme = "README.md"
@@ -32,14 +32,14 @@ requires = ["setuptools>=77", "packaging>=24"]
 build-backend = "setuptools.build_meta"
 
 [project.entry-points."vllm.general_plugins"]
-sparkinfer_fp6 = "sparkinfer.integration.vllm.plugin:register_sparkinfer_fp6"
+b12x_fp6 = "b12x.integration.vllm.plugin:register_b12x_fp6"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["sparkinfer*"]
+include = ["b12x*"]
 
 [tool.setuptools.package-data]
-"sparkinfer.comm.pcie" = ["*.cu", "*.h"]
+"b12x.comm.pcie" = ["*.cu", "*.h"]
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "SIM"]

@@ -14,19 +14,19 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sparkinfer.comm.pcie.pcie_dcp_a2a import (
+from b12x.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2APool,
     lse_reduce_scatter_reference,
 )
 
 
-TOTAL_HEADS = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_TOTAL_HEADS", "32"))
-HEAD_DIM = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_HEAD_DIM", "512"))
-QUERY_HEAD_DIM = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_QUERY_HEAD_DIM", "576"))
-MAX_BATCH = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_MAX_BATCH", "8"))
+TOTAL_HEADS = int(os.getenv("B12X_PCIE_DCP_A2A_TOTAL_HEADS", "32"))
+HEAD_DIM = int(os.getenv("B12X_PCIE_DCP_A2A_HEAD_DIM", "512"))
+QUERY_HEAD_DIM = int(os.getenv("B12X_PCIE_DCP_A2A_QUERY_HEAD_DIM", "576"))
+MAX_BATCH = int(os.getenv("B12X_PCIE_DCP_A2A_MAX_BATCH", "8"))
 GEOMETRY_OVERRIDE_ENVS = (
-    "SPARKINFER_PCIE_DCP_THREADS",
-    "SPARKINFER_PCIE_DCP_BLOCK_LIMIT",
+    "B12X_PCIE_DCP_THREADS",
+    "B12X_PCIE_DCP_BLOCK_LIMIT",
 )
 
 
@@ -36,14 +36,14 @@ def _csv_ints(name: str, default: str) -> tuple[int, ...]:
 
 def _launches(world_size: int) -> tuple[tuple[int, int], ...]:
     values: list[tuple[int, int]] = []
-    for raw in os.getenv("SPARKINFER_PCIE_DCP_A2A_LAUNCHES", "256x16").split(","):
+    for raw in os.getenv("B12X_PCIE_DCP_A2A_LAUNCHES", "256x16").split(","):
         try:
             raw_threads, raw_blocks = raw.lower().split("x", 1)
             threads = int(raw_threads)
             blocks = int(raw_blocks)
         except ValueError as exc:
             raise ValueError(
-                "SPARKINFER_PCIE_DCP_A2A_LAUNCHES must contain "
+                "B12X_PCIE_DCP_A2A_LAUNCHES must contain "
                 "comma-separated THREADSxBLOCKS tuples"
             ) from exc
         if not world_size <= threads <= 1024 or threads % 32 != 0:
@@ -69,11 +69,11 @@ def _reject_production_geometry_overrides() -> None:
 
 
 def _batches() -> tuple[int, ...]:
-    batches = _csv_ints("SPARKINFER_PCIE_DCP_A2A_BATCHES", "1,2,4,8")
+    batches = _csv_ints("B12X_PCIE_DCP_A2A_BATCHES", "1,2,4,8")
     invalid = tuple(batch for batch in batches if not 1 <= batch <= MAX_BATCH)
     if invalid:
         raise ValueError(
-            "SPARKINFER_PCIE_DCP_A2A_BATCHES values must be in "
+            "B12X_PCIE_DCP_A2A_BATCHES values must be in "
             f"[1, {MAX_BATCH}], got {invalid}"
         )
     return batches
@@ -233,7 +233,7 @@ def _metadata(world_size: int, query_dtype_name: str) -> dict[str, object]:
     props = torch.cuda.get_device_properties(device_index)
     status = _git_value("status", "--short")
     return {
-        "schema": "sparkinfer.pcie_dcp_a2a.graph_benchmark.v1",
+        "schema": "b12x.pcie_dcp_a2a.graph_benchmark.v1",
         "command": [sys.executable, *sys.argv],
         "cwd": os.getcwd(),
         "git_commit": _git_value("rev-parse", "HEAD"),
@@ -266,7 +266,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     try:
         dtype = torch.bfloat16
         query_dtype_name = (
-            os.getenv("SPARKINFER_PCIE_DCP_A2A_QUERY_DTYPE", "bf16").strip().lower()
+            os.getenv("B12X_PCIE_DCP_A2A_QUERY_DTYPE", "bf16").strip().lower()
         )
         query_dtypes = {
             "bf16": torch.bfloat16,
@@ -276,7 +276,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             query_dtype = query_dtypes[query_dtype_name]
         except KeyError:
             raise ValueError(
-                "SPARKINFER_PCIE_DCP_A2A_QUERY_DTYPE must be 'bf16' or 'fp8'"
+                "B12X_PCIE_DCP_A2A_QUERY_DTYPE must be 'bf16' or 'fp8'"
             ) from None
         batches = _batches()
         launches = _launches(world_size)
@@ -409,7 +409,7 @@ def main() -> None:
     _reject_production_geometry_overrides()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
-    world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "8"))
+    world_size = int(os.getenv("B12X_PCIE_DCP_A2A_WORLD_SIZE", "8"))
     if torch.cuda.device_count() < world_size:
         raise SystemExit(f"need {world_size} GPUs, found {torch.cuda.device_count()}")
     mp.spawn(

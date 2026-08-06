@@ -5,11 +5,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sparkinfer.gemm import trellis_linear
-from sparkinfer.gemm.trellis_linear import api
-from sparkinfer.gemm.trellis_linear import _small_m
-from sparkinfer.gemm.trellis_linear._small_m import _default_num_sms
-from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+from b12x.gemm import trellis_linear
+from b12x.gemm.trellis_linear import api
+from b12x.gemm.trellis_linear import _small_m
+from b12x.gemm.trellis_linear._small_m import _default_num_sms
+from b12x.moe._shared.kernels.w4a16.kernel import (
     _run_trellis_dense_hadamard128,
     _trellis256_dense_launch_geometry,
 )

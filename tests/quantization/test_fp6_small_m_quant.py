@@ -1,7 +1,7 @@
 """Tests for the small-M BF16->MX-FP6 activation quantizer.
 
 The decode path quantizes only the real activation rows
-(:mod:`sparkinfer.quantization.mxfp6.bf16_to_fp6_small_m`) instead of a full 128-row TMA
+(:mod:`b12x.quantization.mxfp6.bf16_to_fp6_small_m`) instead of a full 128-row TMA
 tile. Codes and swizzled SFA scale bytes for those rows must be BIT-IDENTICAL
 to the validated TMA quantizer — same per-block math, only the padding work is
 skipped — so the GEMM result is unchanged.
@@ -36,12 +36,12 @@ def _sf_offsets(m: int, k: int) -> torch.Tensor:
 @pytest.mark.parametrize("fmt", ["e2m3", "e3m2", "e4m3"])
 @pytest.mark.parametrize("m", [1, 3, 5, 16])
 def test_small_m_matches_tma_quantizer(m, fmt):
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         _quantize_matrix_fp6_bytes,
         _quantize_matrix_fp6_bytes_small_m,
     )
 
-    from sparkinfer._lib.fp6 import mx_gs_numerator
+    from b12x._lib.fp6 import mx_gs_numerator
 
     torch.manual_seed(0)
     k = 512
@@ -89,7 +89,7 @@ def test_small_m_linear_end_to_end_bit_exact():
     are independent, so with the amax pinned to row 0 every slice quantizes
     with the same global scale and y(x[:m])[i] must equal y(x)[i] bit-for-bit.
     """
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         dense_fp6_linear,
         quantize_dense_weight_to_fp6,
     )
@@ -108,7 +108,7 @@ def test_small_m_linear_end_to_end_bit_exact():
 
 @cuda_required
 def test_small_m_compile_guards():
-    from sparkinfer.quantization.mxfp6.bf16_to_fp6_small_m import compile_bf16_to_fp6_small_m
+    from b12x.quantization.mxfp6.bf16_to_fp6_small_m import compile_bf16_to_fp6_small_m
 
     with pytest.raises(AssertionError, match="m<=16"):
         compile_bf16_to_fp6_small_m(17, 512)
@@ -128,10 +128,10 @@ def test_small_m_per_row_matches_host_chain(m, fmt):
     launch; codes, scale bytes, alpha AND the per-row output correction must
     match exactly.
     """
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         _quantize_matrix_fp6_bytes_small_m,
     )
-    from sparkinfer._lib.fp6 import mx_gs_numerator
+    from b12x._lib.fp6 import mx_gs_numerator
 
     torch.manual_seed(1)
     k = 512
@@ -172,7 +172,7 @@ def test_small_m_per_row_matches_host_chain(m, fmt):
 @pytest.mark.parametrize("m", [1, 5, 16])
 def test_small_m_per_row_linear_ab_bit_exact(m, monkeypatch):
     """dense_fp6_linear: fused in-kernel per-row path == host-chain path, bitwise."""
-    from sparkinfer.quantization.mxfp6 import fp6_dense_weights as fdw
+    from b12x.quantization.mxfp6 import fp6_dense_weights as fdw
 
     torch.manual_seed(2)
     w = fdw.quantize_dense_weight_to_fp6(
@@ -198,7 +198,7 @@ def test_row_scale_epilogue_bit_exact(m, monkeypatch):
     less than exact equality means the epilogue is not reproducing the second
     bf16 rounding that the eager multiply performs.
     """
-    from sparkinfer.quantization.mxfp6 import fp6_dense_weights as fdw
+    from b12x.quantization.mxfp6 import fp6_dense_weights as fdw
 
     torch.manual_seed(3)
     w = fdw.quantize_dense_weight_to_fp6(
@@ -230,8 +230,8 @@ def test_fused_quant_preserves_per_row_scaling(monkeypatch):
     covered by test_small_m_linear_end_to_end_bit_exact; this test owns the
     m>1 inertness contract.
     """
-    import sparkinfer._lib.dense_gemm as _dense_mod
-    from sparkinfer.quantization.mxfp6 import fp6_dense_weights as fdw
+    import b12x._lib.dense_gemm as _dense_mod
+    from b12x.quantization.mxfp6 import fp6_dense_weights as fdw
 
     # BOTH globals. The kernel reads the dense_gemm one; patching only the
     # weights module leaves the prologue off and the test passes vacuously.
