@@ -57,10 +57,10 @@ def _gemm_operands(m: int, n: int, k: int, source_format: str):
 @pytest.mark.parametrize(
     "m,n,k,source_format",
     [
-        (1, 6144, 512, "e2m3"),  # (16,128) decode tile, 4 K-tiles
+        (1, 6144, 512, "e2m3"),  # decode tile (heuristic (16,64)), 4 K-tiles
         (1, 6144, 512, "e3m2"),  # same tile, other FP6 sub-format
         (3, 6144, 512, "e2m3"),  # MTP verify shape, same tile
-        (5, 6144, 512, "e2m3"),  # (64,128) small-M coarse tile
+        (5, 6144, 512, "e2m3"),  # small-M shape, same decode tile
         (128, 256, 256, "e2m3"),  # small square, 2 K-tiles
         (128, 6144, 512, "e2m3"),  # prefill-ish wide-N tile
     ],
@@ -115,6 +115,47 @@ def test_b_packed_rejects_bad_shapes():
         )
 
 
+@cuda_required
+def test_dense_gemm_rejects_misaligned_row_scale():
+    from sparkinfer._lib.dense_gemm import dense_gemm
+
+    fp6w, a_operand, b_sf, common = _gemm_operands(1, 256, 256, "e2m3")
+    out = torch.empty((1, 256, 1), device="cuda", dtype=torch.bfloat16)
+    storage = torch.ones(2, device="cuda", dtype=torch.bfloat16)
+    row_scale = storage[1:]
+    assert row_scale.is_contiguous() and row_scale.data_ptr() % 16 != 0
+
+    with pytest.raises(ValueError, match="row_scale"):
+        dense_gemm(
+            a_operand,
+            (fp6w.expanded_weight(), b_sf),
+            out=out,
+            b_preexpanded=True,
+            row_scale=row_scale,
+            **common,
+        )
+
+
+@cuda_required
+@pytest.mark.parametrize("missing", ["x", "scale"])
+def test_dense_gemm_requires_fused_inputs_as_a_pair(missing):
+    from sparkinfer._lib.dense_gemm import dense_gemm
+
+    fp6w, a_operand, b_sf, common = _gemm_operands(1, 256, 256, "e2m3")
+    out = torch.empty((1, 256, 1), device="cuda", dtype=torch.bfloat16)
+    x = torch.zeros((1, 256), device="cuda", dtype=torch.bfloat16)
+    scale = torch.ones(1, device="cuda", dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="provided together"):
+        dense_gemm(
+            a_operand,
+            (fp6w.expanded_weight(), b_sf),
+            out=out,
+            b_preexpanded=True,
+            x_bf16=None if missing == "x" else x,
+            w_gscale=None if missing == "scale" else scale,
+            **common,
+        )
 @cuda_required
 @pytest.mark.parametrize("m", [1, 3, 128])
 def test_linear_autodetects_packed_weight(m):

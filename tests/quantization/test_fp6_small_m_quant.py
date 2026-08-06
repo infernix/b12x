@@ -122,7 +122,7 @@ def test_small_m_compile_guards():
 def test_small_m_per_row_matches_host_chain(m, fmt):
     """The fused per-row kernel must reproduce the host pre-scale chain bit-for-bit.
 
-    Host reference (the serving decode recipe before fusion): per-row bf16
+    The host reference applies per-row BF16
     amax -> f32 clamp/div -> bf16 pre-scale -> quantize with the kernel's
     re-derived (unit) gs. The per_row=True kernel does all of it in one
     launch; codes, scale bytes, alpha AND the per-row output correction must
@@ -185,3 +185,69 @@ def test_small_m_per_row_linear_ab_bit_exact(m, monkeypatch):
     monkeypatch.setattr(fdw, "_PER_ROW_IN_KERNEL", True)
     y_fused = fdw.dense_fp6_linear(x, w)
     torch.testing.assert_close(y_fused, y_host, rtol=0.0, atol=0.0)
+
+
+@cuda_required
+@pytest.mark.parametrize("m", [1, 2, 5, 16, 129, 256])
+def test_row_scale_epilogue_bit_exact(m, monkeypatch):
+    """The epilogue row scale equals the trailing ``result.mul_(inv_gs)``, bitwise.
+
+    Covers both per-row regimes: the small-M quant kernel (m <= 16) and the
+    RowGsKernel + TMA quantizer pair (m > 16, including a non-tile-multiple m
+    so the padded rows' sliced-away inv_gs entries are exercised). Anything
+    less than exact equality means the epilogue is not reproducing the second
+    bf16 rounding that the eager multiply performs.
+    """
+    from sparkinfer.quantization.mxfp6 import fp6_dense_weights as fdw
+
+    torch.manual_seed(3)
+    w = fdw.quantize_dense_weight_to_fp6(
+        torch.randn(512, 256, dtype=torch.bfloat16, device="cuda")
+    )
+    x = torch.randn(m, w.in_features, dtype=torch.bfloat16, device="cuda")
+
+    monkeypatch.setattr(fdw, "_ROW_SCALE_EPILOGUE", False)
+    y_eager = fdw.dense_fp6_linear(x, w).clone()
+    monkeypatch.setattr(fdw, "_ROW_SCALE_EPILOGUE", True)
+    y_epilogue = fdw.dense_fp6_linear(x, w)
+    torch.testing.assert_close(y_epilogue, y_eager, rtol=0.0, atol=0.0)
+
+
+@cuda_required
+def test_fused_quant_preserves_per_row_scaling(monkeypatch):
+    """The fused prologue preserves row-independent activation scaling.
+
+    The fused prologue derives one per-tensor global scale, so it is equivalent
+    to the per-row recipe only for a single activation row. For 2 <= m <= 16,
+    the same row must produce identical logits regardless of which other rows
+    share its launch: y(x[:m])[i] must equal y(x)[i] bit-for-bit.
+
+    m=1 is deliberately excluded. There the prologue legitimately DOES engage,
+    and its exactness against the m=128 rows rests on the bf16 pre-scale
+    landing the row amax exactly on mx_gs_numerator so the in-kernel gs
+    collapses to exactly 1.0. That holds for some inputs and not others, so
+    asserting it here would make this guard seed-dependent. m=1 exactness is
+    covered by test_small_m_linear_end_to_end_bit_exact; this test owns the
+    m>1 inertness contract.
+    """
+    import sparkinfer._lib.dense_gemm as _dense_mod
+    from sparkinfer.quantization.mxfp6 import fp6_dense_weights as fdw
+
+    # BOTH globals. The kernel reads the dense_gemm one; patching only the
+    # weights module leaves the prologue off and the test passes vacuously.
+    monkeypatch.setattr(fdw, "_DENSE_FUSED_QUANT", True)
+    monkeypatch.setattr(_dense_mod, "_DENSE_FUSED_QUANT", True)
+
+    torch.manual_seed(7)
+    w = fdw.quantize_dense_weight_to_fp6(
+        torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    )
+    x = torch.randn(128, w.in_features, dtype=torch.bfloat16, device="cuda")
+    x[0, 0] = 8.0  # amax in row 0, as the sibling row-independence tests do
+
+    y_full = fdw.dense_fp6_linear(x, w).clone()
+    for m in (2, 4, 5, 16):
+        y_small = fdw.dense_fp6_linear(x[:m], w)
+        torch.testing.assert_close(
+            y_small, y_full[:m], rtol=0.0, atol=0.0, msg=f"m={m} diverged"
+        )

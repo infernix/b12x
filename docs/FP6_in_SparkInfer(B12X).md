@@ -147,7 +147,9 @@ doesn't that eat the FP6 win?" It does not, for four reasons:
    the post-rebase performance regression: the same recipe as ~12 eager
    torch launches per linear cost ~1.7 ms/token at 27B decode scale
    (TPOT 11.47 → 9.79 ms/token once fused). Zero host-side launches
-   remain on the hot path.
+   remain on the hot path. Large-M activations use a row-scale pass followed
+   by the per-row TMA quantizer; both paths implement the same scaling
+   contract.
 3. **Quantized operands *reduce* memory traffic.** The A operand leaves
    the quantizer at 1 byte/value instead of 2 (BF16); the B operand
    streams from HBM in its 3:4-packed 6-bit form and expands to

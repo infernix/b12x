@@ -46,18 +46,9 @@ _TILE = 128  # MX-FP6 GPU quantizer tile (M and K must be multiples of this)
 _SMALL_M_QUANT_MAX = 16
 
 
-# Phase 2.2: persistent per-(device, m_pad, K) scratch for the small-M decode
-# quantizer (codes + swizzled scales + alpha). These tensors never escape the
-# linear call — the GEMM consumes them before return — so cross-layer reuse is
-# stream-ordered-safe on the single compute stream decode runs on. Removes 3
-# ``torch.empty`` calls per linear per step (hundreds/step at 27B scale). The
-# GEMM *output* is deliberately NOT pooled: it escapes to the framework
-# (q/k/v views, residual chains), and during CUDA-graph capture a fresh
-# allocation lands in the graph's private pool — exactly where per-graph
-# output buffers belong. Kill-switch for A/B runs: SPARKINFER_DENSE_PERSISTENT_SCRATCH=0.
-# SPARKINFER_DENSE_PER_ROW_GS=0 disables per-row activation global scale
-# (all unfused paths plus the fused m=1 prologue) for A/B against the legacy
-# per-tensor path. Default on.
+# Persistent stream-local decode-quantization workspaces. The quantizer writes
+# them before the GEMM consumes them on the same stream; GEMM outputs are not
+# pooled because they escape the linear call.
 _DENSE_PER_ROW_GS = os.getenv("SPARKINFER_DENSE_PER_ROW_GS", "1").lower() not in (
     "0",
     "false",
@@ -65,42 +56,59 @@ _DENSE_PER_ROW_GS = os.getenv("SPARKINFER_DENSE_PER_ROW_GS", "1").lower() not in
 _PERSISTENT_SCRATCH = os.getenv(
     "SPARKINFER_DENSE_PERSISTENT_SCRATCH", "1"
 ).lower() not in ("0", "false")
-# SPARKINFER_DENSE_PER_ROW_IN_KERNEL=0 falls back to the host-side per-row
-# pre-scale chain (~12 eager launches per linear) instead of the fused
-# small-M kernel path. Both paths are bit-identical; the switch exists for
-# A/B validation only. Default on.
+# The fallback host chain and in-kernel per-row scaling are bit-identical.
 _PER_ROW_IN_KERNEL = os.getenv(
     "SPARKINFER_DENSE_PER_ROW_IN_KERNEL", "1"
 ).lower() not in ("0", "false")
+# Applies the per-row output correction inside the GEMM epilogue instead of as
+# a trailing ``result.mul_(inv_gs)``. Bit-identical by construction: the
+# epilogue reproduces both roundings to bf16 that the eager multiply performs
+# (see the row_scale application site in _lib/dense_gemm.py).
+_ROW_SCALE_EPILOGUE = True
 _QUANT_SCRATCH: dict[tuple, tuple] = {}
+# Captures claim prewarmed buckets with stable addresses. Claimed entries stay
+# reserved for graph replay and are not returned to subsequent eager calls.
+_CAPTURE_ASSIGNED: dict[tuple, tuple] = {}
+_CAPTURE_CLAIMED: dict[tuple, list[int]] = {}
 
 
 def _small_m_quant_scratch(m_pad: int, k: int, device: torch.device) -> tuple:
-    """Persistent ``(BF16ToFP6TMAOutputs, alpha)`` for a decode quant bucket.
+    """Return stream-local decode scratch with capture-stable ownership.
 
-    Buckets are per-stream, so they are created by the first eager pass on
-    each stream (the plugin's load-time warm-run, then vLLM's pre-capture
-    eager warm-runs on the serving stream) — graph capture normally finds
-    them in place. If a bucket is first seen DURING capture, allocate fresh
-    without retaining it: the memory belongs to the graph's pool and must
-    not outlive it in a global cache.
+    Capture claims a prewarmed eager bucket and fails if none is available;
+    allocation and zero-initialization never occur inside capture.
     """
     from sparkinfer.quantization.mxfp6 import allocate_bf16_to_fp6_tma_outputs
 
     capturing = device.type == "cuda" and torch.cuda.is_current_stream_capturing()
-    # Keyed by stream too: vLLM's MoE runner may execute the shared-expert
-    # MLP (which binds through this dense path) on a side stream overlapped
-    # with the routed experts — per-stream buckets make reuse race-free.
+    # Stream ownership permits independent main and side-stream execution.
     stream = (
         torch.cuda.current_stream(device).cuda_stream
         if device.type == "cuda"
         else 0
     )
     key = (device.type, device.index or 0, stream, m_pad, k)
+    bucket_key = (device.type, device.index or 0, m_pad, k)
     if _PERSISTENT_SCRATCH and not capturing:
         entry = _QUANT_SCRATCH.get(key)
-        if entry is not None:
+        claimed = _CAPTURE_CLAIMED.get(bucket_key, ())
+        if entry is not None and id(entry) not in claimed:
             return entry
+    if capturing:
+        assigned = _CAPTURE_ASSIGNED.get(key)
+        if assigned is not None:
+            return assigned
+        claimed = _CAPTURE_CLAIMED.setdefault(bucket_key, [])
+        for (dt, di, _s, mp, kk), entry in _QUANT_SCRATCH.items():
+            if (dt, di, mp, kk) == bucket_key and id(entry) not in claimed:
+                _CAPTURE_ASSIGNED[key] = entry
+                claimed.append(id(entry))
+                return entry
+        raise RuntimeError(
+            "decode quantization requires a prewarmed scratch bucket during "
+            "CUDA graph capture. Run an eager forward on each capture stream "
+            "at the required shape before capture."
+        )
     out = allocate_bf16_to_fp6_tma_outputs(m_pad, k, device=device, emit="bytes")
     alpha = torch.zeros(1, dtype=torch.float32, device=device)
     # Per-row output-correction buffer for the in-kernel per-row path: sized
@@ -113,10 +121,7 @@ def _small_m_quant_scratch(m_pad: int, k: int, device: torch.device) -> tuple:
 
 # Minimum out_features for which the GEMM streams the 3:4-packed weight
 # directly (``b_packed=True``) instead of a cached 1-byte/code expansion.
-# Packed streaming wins only when N launches enough CTAs to saturate HBM
-# (measured on RTX PRO 6000: N=13824 -> 108 CTAs -> 0.82x of expanded;
-# N<=6144 -> <=48 CTAs -> latency-bound, the in-smem expansion chain loses).
-# Default 12288 (>=96 N-tiles) only enables shapes near the measured win.
+# Default 12288 enables shapes with enough N tiles for the packed path.
 PACKED_GEMM_MIN_N = int(os.getenv("SPARKINFER_PACKED_B_MIN_N", "12288"))
 
 
@@ -198,9 +203,65 @@ def _quantize_matrix_fp6_bytes(
     )
 
     launch = compile_bf16_to_fp6_tma(m, k, fmt=fmt, emit="bytes")
-    out = allocate_bf16_to_fp6_tma_outputs(m, k, device=mat_bf16.device, emit="bytes")
+    # m and k are 128-aligned by the guard above, so the buffers have no padding
+    # row or column and the quantizer writes every byte: the zero-fill would be
+    # pure extra HBM traffic on the prefill path (see allocate_...'s zero_init).
+    out = allocate_bf16_to_fp6_tma_outputs(
+        m, k, device=mat_bf16.device, emit="bytes", zero_init=False
+    )
     launch(mat_bf16.contiguous(), global_scale, out.packed_a_flat, out.scale_flat)
     return out.packed_a_storage.view(m, k), out.scale_storage
+
+
+def _quantize_matrix_fp6_bytes_per_row(
+    mat_bf16: torch.Tensor,
+    fmt: str,
+    w_global_scale: torch.Tensor,
+):
+    """Quantize a padded ``(m, K)`` bf16 activation with FUSED per-row GS.
+
+    Large-M counterpart of the ``per_row=True`` small-M path. The per-row
+    global-scale recipe runs in two kernels:
+
+    1. :func:`~sparkinfer.quantization.mxfp6.fp6_row_gs.compile_fp6_row_gs`
+       computes ``gs_r``/``inv_gs_r``/``alpha`` in one bandwidth-bound pass;
+    2. the TMA quantizer (``per_row=True``) pre-scales each element through
+       bf16 in-registers and quantizes with a unit gs.
+
+    The result matches the host formulation bit-for-bit (same amax semantics,
+    div.rn.f32 divisions, cvt.rn.bf16.f32 pre-scale — see the kernel
+    docstrings). ``m`` must be 128-padded (TMA contract); zero padding rows
+    quantize to the same bytes as the host chain's zero-padded input.
+
+    Returns ``(codes (m, K) uint8, scale_storage flat uint8, alpha (1,) f32,
+    inv_gs (m,) bf16)``; callers slice ``inv_gs`` to the true row count.
+    """
+    m, k = mat_bf16.shape
+    if m % _TILE != 0 or k % _TILE != 0:
+        raise ValueError(
+            f"GPU FP6 quantizer requires M%{_TILE}==0 and K%{_TILE}==0, got M={m} K={k}"
+        )
+    from sparkinfer.quantization.mxfp6 import (
+        allocate_bf16_to_fp6_tma_outputs,
+        compile_bf16_to_fp6_tma,
+    )
+    from sparkinfer.quantization.mxfp6.fp6_row_gs import compile_fp6_row_gs
+
+    device = mat_bf16.device
+    x = mat_bf16.contiguous()
+    gs_launch = compile_fp6_row_gs(m, k, fmt=fmt)
+    gs_pr = torch.empty(m, dtype=torch.float32, device=device)
+    inv_gs = torch.empty(m, dtype=torch.bfloat16, device=device)
+    alpha = torch.empty(1, dtype=torch.float32, device=device)
+    gs_launch(x, w_global_scale, gs_pr, inv_gs, alpha)
+    launch = compile_bf16_to_fp6_tma(m, k, fmt=fmt, emit="bytes", per_row=True)
+    # Padding-aligned inputs leave no unwritten rows or scale columns, so the
+    # output workspace does not need initialization.
+    out = allocate_bf16_to_fp6_tma_outputs(
+        m, k, device=device, emit="bytes", zero_init=False
+    )
+    launch(x, gs_pr, out.packed_a_flat, out.scale_flat)
+    return out.packed_a_storage.view(m, k), out.scale_storage, alpha, inv_gs
 
 
 def _quantize_matrix_fp6_bytes_small_m(
@@ -238,7 +299,7 @@ def _quantize_matrix_fp6_bytes_small_m(
 
     m, k = mat_bf16.shape
     launch = compile_bf16_to_fp6_small_m(m, k, fmt=fmt, per_row=per_row)
-    # Persistent per-(m_pad, K) scratch (Phase 2.2): the kernel overwrites
+    # The persistent stream-local scratch is safe because the kernel overwrites
     # every real row and the GEMM consumes the result before return, so the
     # buffers are safely reused across layers/steps on the compute stream.
     out, alpha, inv_gs = _small_m_quant_scratch(m_pad, k, mat_bf16.device)
@@ -276,11 +337,8 @@ class FP6DenseWeight:
     in_features: int
     fmt: str
     act_fmt: str = ""
-    # Full (unsharded) out_features for the packed-B decision. Under TP>1
-    # the per-GPU out_features is N/tp, but the GEMM CTA count at N/tp may
-    # still saturate (the kernel was measured at TP=1 where per-GPU = full).
-    # When set, use_packed_gemm compares this against PACKED_GEMM_MIN_N;
-    # when 0 (default / non-TP), it falls back to self.out_features.
+    # Full, unsharded output width used to keep packed-B routing consistent
+    # across tensor-parallel shard counts. Zero uses the local output width.
     out_features_unsharded: int = 0
 
     def __post_init__(self) -> None:
@@ -299,9 +357,8 @@ class FP6DenseWeight:
         """Weight unpacked once into FP8-container bytes for ``dense_gemm``.
 
         The static weight never changes, so the packed FP6 -> FP8-byte expansion
-        (otherwise ~90% of per-token GEMM time) is hoisted here and cached. The
-        result is the ``(N, K, 1)`` K-major view that ``dense_gemm`` consumes
-        directly when ``b_preexpanded=True``.
+        is cached. The result is the ``(N, K, 1)`` K-major view that
+        ``dense_gemm`` consumes directly when ``b_preexpanded=True``.
         """
         if self._packed_expanded is None:
             # Lazy import: avoids any import cycle with ``sparkinfer._lib.dense_gemm``.
@@ -316,17 +373,9 @@ class FP6DenseWeight:
     def use_packed_gemm(self) -> bool:
         """Whether the GEMM should stream the packed codes directly.
 
-        True for wide-N weights (>= ``PACKED_GEMM_MIN_N``), where packed
-        streaming beats the expanded path AND the 1-byte/code copy never needs
-        to be materialized (25% weight-VRAM saving for those layers).
-
-        Under TP>1 the per-GPU ``out_features`` is ``N/tp``, but the threshold
-        must compare against the full (unsharded) N: the performance crossover
-        was measured at TP=1 and the kernel's CTA count at ``N/tp`` still
-        saturates on the smaller per-GPU workload. Without this, a fused
-        gate_up_proj (N=13824 → 6912/GPU at TP=2) flips from the faster
-        packed path to the 33%-heavier expanded path, which is the primary
-        cause of the TP=2 < TP=1 regression.
+        Wide logical matrices use packed storage once their unsharded output
+        width reaches ``PACKED_GEMM_MIN_N``. Using the logical width keeps the
+        route stable when tensor parallelism changes the local shard width.
         """
         n = self.out_features_unsharded or self.out_features
         return n >= PACKED_GEMM_MIN_N
@@ -450,7 +499,9 @@ def dense_fp6_linear_expanded(
     a_fmt = act_fmt if act_fmt is not None else fmt
 
     m_pad = ((m + _TILE - 1) // _TILE) * _TILE
-    _fused_quant = _DENSE_FUSED_QUANT and m <= _SMALL_M_QUANT_MAX
+    # The fused prologue derives one global scale and is therefore valid only
+    # for a single activation row.
+    _fused_quant = _DENSE_FUSED_QUANT and m == 1
     device = x.device
 
     # ---- Per-row activation global scale (unfused paths) ----
@@ -465,46 +516,16 @@ def dense_fp6_linear_expanded(
     # 4. GEMM (alpha accounts only for the quantizer's internal gs and w_gs)
     # 5. Post-multiply by per-row correction to undo the pre-scaling
     #
-    # m == 1 MUST take this path too (for one row per-row == per-tensor in
-    # scope, but NOT in rounding): the pre-scale rounds ``x * gs`` through
-    # BF16 and undoes it with a BF16 post-multiply, while the small-M
-    # kernel's fused per-tensor gs is applied directly in FP32. The two
-    # rounding chains are not bit-equivalent, so an exempted m=1 breaks the
-    # bit-exact row-independence contract vs the m=128 rows
-    # (test_small_m_linear_end_to_end_bit_exact / test_small_m_matches_
-    # padded_rows). With the pre-scale, the row amax becomes exactly
-    # mx_gs_numerator (a BF16-representable value), the small-M kernel's
-    # in-kernel gs collapses to exactly 1.0, and its alpha equals the
-    # unfused torch.reciprocal(1 * w_gs) — bit-identical end to end.
-    # The fused m=1 prologue quantizes the (pre-scaled) x_bf16 with the
-    # same in-kernel per-tensor gs (== 1.0), so it stays bit-identical to
-    # the unfused small-M path as well.
-    #
-    # On the small-M decode path the whole recipe runs INSIDE the quant
-    # kernel (per_row=True below): the host-side chain here costs ~12 eager
-    # launches per linear (~8 ms/step at 27B serving scale) while the fused
-    # kernel costs zero extra launches and writes identical bits. The host
-    # chain remains for the large-M path (amortized over >=128 rows), the
-    # fused-prologue m=1 path, and as the SPARKINFER_DENSE_PER_ROW_IN_KERNEL=0
-    # A/B fallback.
-    _per_row = _DENSE_PER_ROW_GS and m > 0 and (not _fused_quant or m == 1)
-    _per_row_in_kernel = (
-        _per_row
-        and not _fused_quant
-        and m <= _SMALL_M_QUANT_MAX
-        and _PER_ROW_IN_KERNEL
-    )
+    # The BF16 pre-scale and output correction deliberately preserve both
+    # rounding points. Small-M performs the recipe in one quantizer; large-M
+    # uses RowGsKernel followed by the per-row TMA quantizer.
+    _per_row = _DENSE_PER_ROW_GS and m > 0
+    _per_row_in_kernel = _per_row and not _fused_quant and _PER_ROW_IN_KERNEL
     if _per_row and not _per_row_in_kernel:
         _num = mx_gs_numerator(a_fmt)
         a_amax_pr = x.abs().amax(dim=1, keepdim=True).float()      # (m, 1)
-        # f64 divide + cast: bit-identical to a correctly-rounded f32
-        # division (f64's 53-bit quotient always re-rounds exactly; the
-        # 2p+2 double-rounding rule). torch's CUDA f32 scalar/tensor
-        # division is NOT always correctly rounded (e.g. 200704/2.625
-        # lands 1 ulp high), while the fused small-M kernel uses
-        # div.rn.f32 — a raw torch divide here flips borderline bf16
-        # pre-scales vs the in-kernel per-row path (single-code
-        # mismatches seen in test_small_m_linear_end_to_end_bit_exact).
+        # f64 division followed by an f32 cast matches div.rn.f32 in the GPU
+        # kernels and keeps the BF16 pre-scale bit-identical.
         a_gs_pr = (
             _num / a_amax_pr.clamp_min_(1e-6).double()
         ).float()                                                  # (m, 1)
@@ -515,12 +536,11 @@ def dense_fp6_linear_expanded(
     inv_gs_pr = None
 
     if _fused_quant:
-        # Phase 4.1 fused path — the producer warp quantises directly in
-        # smem with an in-kernel per-tensor gs. At m=1 with per-row GS the
+        # The producer warp quantizes directly in shared memory with an
+        # in-kernel per-tensor scale. At m=1 with per-row scaling the
         # host pre-scale above already ran, so the kernel's amax scan sees
         # exactly mx_gs_numerator and its gs/alpha collapse to 1.0 / 1/w_gs
-        # — same math as the unfused per-row m=1 path. For m>1 fused stays
-        # per-tensor (per-row would require a kernel change).
+        # — the same arithmetic as the unfused per-row m=1 path.
         a_amax = x.float().abs().amax().reshape(1)
         a_gs = mx_gs_numerator(a_fmt) / a_amax.clamp_min_(1e-6)
         w_gs = global_scale.to(torch.float32).reshape(1)
@@ -538,10 +558,8 @@ def dense_fp6_linear_expanded(
             )
     elif m <= _SMALL_M_QUANT_MAX:
         if _per_row_in_kernel:
-            # Fused per-row path: the kernel computes row amax, applies the
-            # bf16 pre-scale, quantizes with a unit gs and emits the per-row
-            # output correction — bit-identical to the host chain above but
-            # with zero extra launches on the decode hot path.
+            # The kernel computes row amax, applies the BF16 pre-scale,
+            # quantizes with a unit scale, and emits the output correction.
             a_codes, a_scale, alpha, inv_gs_pr = _quantize_matrix_fp6_bytes_small_m(
                 x, a_fmt, global_scale, m_pad, per_row=True
             )
@@ -550,8 +568,8 @@ def dense_fp6_linear_expanded(
             # in-kernel gs is exactly 1.0 (the pre-scaled row amax is exactly
             # mx_gs_numerator) and its alpha = 1/(1 * w_gs) matches the padded
             # TMA branch's torch.reciprocal(gs_unit * global_scale) bit-for-bit.
-            # Passing global_scale keeps alpha = 1/(gs * w_gs) correct on the
-            # per-row-disabled A/B path as well.
+            # Passing global_scale also keeps alpha correct when per-row
+            # scaling is disabled.
             a_codes, a_scale, alpha = _quantize_matrix_fp6_bytes_small_m(
                 x, a_fmt, global_scale, m_pad
             )
@@ -560,7 +578,17 @@ def dense_fp6_linear_expanded(
             x_pad = torch.zeros(m_pad, k, dtype=torch.bfloat16, device=device)
             x_pad[:m].copy_(x)
             x = x_pad
-        if _per_row:
+        if _per_row_in_kernel:
+            # Large-M per-row scaling uses RowGsKernel followed by the TMA
+            # quantizer's per-row mode.
+            # Zero padding rows get a finite gs (amax clamped to 1e-6) and
+            # pre-scale to exactly 0.0, matching the host chain's padded
+            # zeros; their inv_gs entries are sliced away below.
+            a_codes, a_scale, alpha, inv_gs_pr = _quantize_matrix_fp6_bytes_per_row(
+                x, a_fmt, global_scale
+            )
+            inv_gs_pr = inv_gs_pr[:m].view(m, 1)
+        elif _per_row:
             # x is already pre-scaled; pass unit activation global scale.
             a_codes, a_scale = _quantize_matrix_fp6_bytes(x, a_fmt, _gs_unit)
             alpha = torch.reciprocal(_gs_unit * global_scale)
@@ -569,7 +597,7 @@ def dense_fp6_linear_expanded(
                 x, ord=float("inf")
             ).reshape(1)
             # f64 divide + cast = correctly-rounded f32 division; keeps this
-            # per-tensor A/B path bit-consistent with the small-M kernel's
+            # per-tensor fallback bit-consistent with the small-M kernel's
             # in-kernel div.rn gs (see the per-row comment above).
             a_gs = (
                 mx_gs_numerator(a_fmt)
@@ -588,6 +616,13 @@ def dense_fp6_linear_expanded(
     # a byte-container (the quantizer emits it directly); the weight is either
     # pre-expanded at load or 3:4-packed and expanded in smem by the kernel.
     y = torch.empty((m, n, 1), device=x.device, dtype=torch.bfloat16)
+    # ``inv_gs_pr`` is a contiguous bf16 (m,) buffer that both per-row quant
+    # kernels write; the (m, 1) view exists only for the broadcast multiply.
+    _row_scale = (
+        inv_gs_pr.view(m)
+        if _ROW_SCALE_EPILOGUE and inv_gs_pr is not None
+        else None
+    )
     dense_gemm(
         (a_codes[:m].unsqueeze(-1), a_sf),
         (weight, b_sf),
@@ -608,12 +643,12 @@ def dense_fp6_linear_expanded(
             if _fused_quant
             else None
         ),
+        row_scale=_row_scale,
     )
     result = y[:, :, 0]
-    if inv_gs_pr is not None:
-        # Undo per-row pre-scaling (fused path): the quant kernel already
-        # emitted bf16(1/a_gs_per_row) — bit-identical to the host chain's
-        # (1.0 / a_gs_pr).to(torch.bfloat16) below.
+    if inv_gs_pr is not None and _row_scale is None:
+        # The quantizer emitted BF16(1/a_gs_per_row). The epilogue applies the
+        # same multiply when ``_row_scale`` is present.
         result.mul_(inv_gs_pr)
     elif a_gs_pr is not None:
         # Undo per-row pre-scaling: multiply by 1 / a_gs_per_row.

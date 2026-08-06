@@ -53,6 +53,7 @@ def allocate_bf16_to_fp6_tma_outputs(
     *,
     device: torch.device = torch.device("cuda"),
     emit: str = "packed",
+    zero_init: bool = True,
 ) -> BF16ToFP6TMAOutputs:
     """Allocate uint8 FP6 activations and swizzled UE8M0 scales.
 
@@ -62,12 +63,27 @@ def allocate_bf16_to_fp6_tma_outputs(
     but padding rows (M..rows_pad-1) stay untouched and the GEMM's TMA tile may
     read them for m in 2..15. Zeroed padding guarantees cross-process
     reproducibility (torch.empty contents vary per CUDA context).
+
+    ``zero_init=False`` skips both fills, and is ONLY valid when the caller
+    guarantees ``M % 128 == 0`` and ``K % 128 == 0``: then ``rows_pad == M`` and
+    ``cols_pad_sf == K // 32`` exactly, so there is no padding row or column for
+    a reader to reach and the quantizer overwrites every allocated byte.
+    Reproducibility is preserved for the same reason - nothing uninitialized
+    survives the kernel. The fill is not free at prefill scale: ~96 MB per
+    linear per call on a Behemoth shard, against the HBM traffic the FP6 path
+    exists to reduce.
     """
     rows_pad = align_up(M, _TILE_M)
     cols_pad_sf = align_up(K // _SF_VEC_SIZE_FP6, 4)
     packed_k_bytes = K if emit == "bytes" else mxfp6_packed_k_bytes(K)
-    packed_a_storage = torch.zeros(1, M, packed_k_bytes, dtype=torch.uint8, device=device)
-    scale_storage = torch.zeros(rows_pad * cols_pad_sf, dtype=torch.uint8, device=device)
+    if not zero_init and (rows_pad != M or cols_pad_sf * _SF_VEC_SIZE_FP6 != K):
+        raise ValueError(
+            "zero_init=False requires M and K to be padding-aligned "
+            f"(M % {_TILE_M} == 0, K % 128 == 0); got M={M}, K={K}"
+        )
+    alloc = torch.empty if not zero_init else torch.zeros
+    packed_a_storage = alloc(1, M, packed_k_bytes, dtype=torch.uint8, device=device)
+    scale_storage = alloc(rows_pad * cols_pad_sf, dtype=torch.uint8, device=device)
     packed_a_view = packed_a_storage.permute(1, 2, 0)
     sfa_ptr = make_ptr(
         cutlass.Float8E8M0FNU,
@@ -83,12 +99,21 @@ def allocate_bf16_to_fp6_tma_outputs(
     )
 
 
-def compile_bf16_to_fp6_tma(M: int, K: int, fmt: str = "e3m2", emit: str = "packed"):
+def compile_bf16_to_fp6_tma(
+    M: int, K: int, fmt: str = "e3m2", emit: str = "packed", per_row: bool = False
+):
     """Compile the BF16→MX-FP6 TMA kernel for (M, K) in ``fmt`` (``e3m2``/``e2m3``).
 
     ``emit`` selects the code layout written: ``"packed"`` (3:4 wire format,
     ``3K/4`` bytes/row) or ``"bytes"`` (one code per byte, ``K`` bytes/row -
     directly consumable by the ``mxf8f6f4`` GEMM, no expansion step).
+
+    ``per_row=True`` (activations, ``emit="bytes"`` only) is the large-M half
+    of the fused per-row global-scale recipe: ``global_scale`` becomes the
+    ``(M,)`` f32 per-row scales from :func:`~sparkinfer.quantization.mxfp6.
+    fp6_row_gs.compile_fp6_row_gs`; the kernel pre-scales each element through
+    bf16 in-registers and quantizes with a unit gs, bit-identical to the host
+    per-row chain in ``fp6_dense_weights``.
 
     The callable signature is: ``launch(bf16_input, global_scale, packed_a_flat, scale_flat)``
     where packed_a_flat and scale_flat come from ``BF16ToFP6TMAOutputs``.
@@ -98,7 +123,9 @@ def compile_bf16_to_fp6_tma(M: int, K: int, fmt: str = "e3m2", emit: str = "pack
     if fmt == "e4m3" and emit != "bytes":
         raise ValueError("e4m3 activations require emit='bytes'")
     assert emit in ("packed", "bytes"), f"unsupported FP6 emit: {emit}"
-    cache_key = (M, K, fmt, emit)
+    if per_row and emit != "bytes":
+        raise ValueError("per_row quantization requires emit='bytes'")
+    cache_key = (M, K, fmt, emit, per_row)
     cached = _KERNEL_CACHE_FP6.get(cache_key)
     if cached is not None:
         return cached
@@ -110,14 +137,14 @@ def compile_bf16_to_fp6_tma(M: int, K: int, fmt: str = "e3m2", emit: str = "pack
         bf, (M, K), stride_order=(1, 0), assumed_align=16
     )
     gs_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (1,), assumed_align=4
+        cutlass.Float32, (M,) if per_row else (1,), assumed_align=4
     )
     pa_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (M, packed_k_bytes, 1), stride_order=(1, 0, 2), assumed_align=16
     )
     sfa_fake = make_ptr(sf, 16, AddressSpace.gmem, assumed_align=16)
     mac = min(get_max_active_clusters(1), get_num_sm(torch.device("cuda")))
-    kernel = FP6TestKernel(fmt, emit=emit)
+    kernel = FP6TestKernel(fmt, emit=emit, per_row=per_row)
     raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=cache_key)
     raw = sparkinfer_compile(
         kernel,
@@ -129,12 +156,54 @@ def compile_bf16_to_fp6_tma(M: int, K: int, fmt: str = "e3m2", emit: str = "pack
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "quantization.bf16_to_fp6_tma",
-            1,
+            2,
             cache_key,
         ),
     )
 
     def launch(bf16_input, global_scale, packed_a_flat, scale_flat):
+        expected_scale_shape = (M,) if per_row else (1,)
+        expected = (
+            ("bf16_input", bf16_input, (M, K), torch.bfloat16, 16),
+            (
+                "global_scale",
+                global_scale,
+                expected_scale_shape,
+                torch.float32,
+                4,
+            ),
+            (
+                "packed_a_flat",
+                packed_a_flat,
+                (M * packed_k_bytes,),
+                torch.uint8,
+                16,
+            ),
+            (
+                "scale_flat",
+                scale_flat,
+                (M * K // _SF_VEC_SIZE_FP6,),
+                torch.uint8,
+                16,
+            ),
+        )
+        for name, tensor, shape, dtype, alignment in expected:
+            if (
+                tensor.shape != shape
+                or tensor.dtype != dtype
+                or tensor.device.type != "cuda"
+                or not tensor.is_contiguous()
+                or tensor.data_ptr() % alignment != 0
+            ):
+                raise ValueError(
+                    f"{name} must be a contiguous CUDA {dtype} tensor with "
+                    f"shape {shape} and {alignment}-byte alignment; got shape "
+                    f"{tuple(tensor.shape)}, dtype {tensor.dtype}, device "
+                    f"{tensor.device}, contiguous {tensor.is_contiguous()}, "
+                    f"data_ptr % {alignment} = {tensor.data_ptr() % alignment}"
+                )
+        if any(tensor.device != bf16_input.device for _, tensor, *_ in expected[1:]):
+            raise ValueError("all BF16-to-FP6 tensors must be on one device")
         pa_storage = packed_a_flat.view(1, M, packed_k_bytes).permute(1, 2, 0)
         sfa_p = make_ptr(
             sf, scale_flat.data_ptr(), AddressSpace.gmem, assumed_align=16
