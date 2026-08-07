@@ -5,15 +5,11 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import lru_cache
-from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from torch.utils.cpp_extension import load
-
 from ._cuda_ipc import CudaRTLibrary
 from .pcie_oneshot import (
     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
@@ -28,6 +24,7 @@ from .pcie_oneshot import (
     _coordinated_close_channels,
     _current_stream_key,
     _cuda_device_index,
+    _device_guard,
     _is_current_stream_capturing,
     _normalize_device,
     _normalize_logical_channel_id,
@@ -42,7 +39,25 @@ from .pcie_oneshot import (
 SUPPORTED_WORLD_SIZES = (2, 4, 8, 16)
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 SUPPORTED_GATHER_DTYPES = (*SUPPORTED_DTYPES, torch.float8_e4m3fn)
+SUPPORTED_PAIR_DTYPES = (*SUPPORTED_GATHER_DTYPES, torch.float32)
 DCP_A2A_REQUIRED_SMS = 64
+_MAX_BLOCKS = 64
+_MAX_RANKS = 16
+_FLAG_STRIDE = 32
+_SIGNAL_BYTES = (
+    _MAX_BLOCKS * _MAX_RANKS
+    + 2 * _MAX_BLOCKS * _MAX_RANKS * _FLAG_STRIDE
+) * 4
+
+
+def _env_int(name: str, fallback: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return int(fallback)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(fallback)
 
 
 def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
@@ -117,19 +132,6 @@ def _staging_layout(
         lse_capacity=lse_capacity,
         slot_bytes=slot_bytes,
         slab_bytes=staging1_offset + slot_bytes,
-    )
-
-
-@lru_cache(maxsize=1)
-def _load_extension():
-    source = Path(__file__).with_name("pcie_dcp_a2a.cu")
-    verbose = os.getenv("B12X_PCIE_DCP_A2A_VERBOSE_BUILD", "0") == "1"
-    return load(
-        name="b12x_pcie_dcp_a2a_ext",
-        sources=[str(source)],
-        extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
-        extra_ldflags=["-lcuda"],
-        verbose=verbose,
     )
 
 
@@ -346,20 +348,6 @@ class PCIeDCPA2A:
                 exchange_group=self.exchange_group,
             )
 
-            def prepare():
-                return ext_module or _load_extension()
-
-            if self.exchange_group is None:
-                self._ext = prepare()
-            else:
-                self._ext = _run_collective_preallocation_setup(
-                    owner="PCIe DCP A2A direct constructor",
-                    exchange_group=self.exchange_group,
-                    setup=prepare,
-                )
-        else:
-            self._ext = self._ext or _load_extension()
-
         if self.device.type == "cuda" and self.exchange_group is not None:
             _require_collective_contract(
                 owner="PCIe DCP A2A direct constructor",
@@ -376,12 +364,13 @@ class PCIeDCPA2A:
                 ),
             )
 
-        init_error = self._initialize_native_runtime()
+        init_error = self._initialize_backend_runtime()
         if self.device.type == "cuda" and self.exchange_group is not None:
 
             def abort_native_runtime() -> None:
                 if self._ptr:
-                    self._ext.dispose(self._ptr)
+                    assert self._legacy_ext_module is not None
+                    self._legacy_ext_module.dispose(self._ptr)
                     self._ptr = 0
 
             _finish_collective_unowned_runtime_setup(
@@ -432,7 +421,30 @@ class PCIeDCPA2A:
         self._staging1_ptrs = tuple(int(ptr) for ptr in staging1_ptrs)
         self._ipc = ipc
         self._owned_buffers = list(owned_buffers or ())
-        self._ext = ext_module
+        self._legacy_ext_module = ext_module
+        self._staging_ptrs = (
+            tuple(int(ptr) for ptr in staging0_ptrs),
+            tuple(int(ptr) for ptr in staging1_ptrs),
+        )
+        slot_deltas = {
+            int(slot1) - int(slot0)
+            for slot0, slot1 in zip(staging0_ptrs, staging1_ptrs, strict=True)
+        }
+        if len(slot_deltas) != 1 or next(iter(slot_deltas)) <= 0:
+            raise ValueError(
+                "staging slot pointers must have one shared positive stride"
+            )
+        self._slot_bytes = next(iter(slot_deltas))
+        self._output_capacity_elems = int(output_capacity_elems)
+        self._lse_offset = int(lse_offset)
+        self._lse_capacity = int(lse_capacity)
+        self._next_slot = 0
+        self._device_slot_selection = False
+        self._graph_base_slot = 0
+        self._threads_override = _env_int("B12X_PCIE_DCP_THREADS", 0)
+        self._block_limit_override = _env_int(
+            "B12X_PCIE_DCP_BLOCK_LIMIT", 0
+        )
         self._stream_affine = bool(stream_affine)
         self._owner_stream_key: Optional[int] = None
         self._closed = False
@@ -442,10 +454,12 @@ class PCIeDCPA2A:
         self._closed_ipc_import_indices: set[tuple[int, int]] = set()
         self._ptr = 0
 
-    def _initialize_native_runtime(self) -> BaseException | None:
+    def _initialize_backend_runtime(self) -> BaseException | None:
+        if self._legacy_ext_module is None:
+            return None
         init_error: BaseException | None = None
         try:
-            self._ptr = self._ext.init_dcp_a2a(
+            self._ptr = self._legacy_ext_module.init_dcp_a2a(
                 list(self._signal_ptrs),
                 list(self._staging0_ptrs),
                 list(self._staging1_ptrs),
@@ -464,7 +478,7 @@ class PCIeDCPA2A:
     ) -> tuple["PCIeDCPA2A", BaseException | None]:
         runtime = object.__new__(cls)
         runtime._initialize_prepared_state(**kwargs)
-        return runtime, runtime._initialize_native_runtime()
+        return runtime, runtime._initialize_backend_runtime()
 
     @classmethod
     def from_exchange_group(
@@ -481,7 +495,6 @@ class PCIeDCPA2A:
     ) -> "PCIeDCPA2A":
         rank = dist.get_rank(group=exchange_group)
         world_size = dist.get_world_size(group=exchange_group)
-
         def validate_factory_arguments():
             device_obj = _normalize_device(device)
             normalized_max_batch = int(max_batch_size)
@@ -532,18 +545,21 @@ class PCIeDCPA2A:
         def prepare():
             prepared_ipc = CudaRTLibrary()
             prepared_ipc.cudaSetDevice(_cuda_device_index(device_obj))
-            prepared_ext = ext_module or _load_extension()
             layout = _staging_layout(
-                signal_bytes=int(prepared_ext.meta_size()),
+                signal_bytes=(
+                    int(ext_module.meta_size())
+                    if ext_module is not None
+                    else _SIGNAL_BYTES
+                ),
                 world_size=world_size,
                 max_batch_size=max_batch_size,
                 total_heads=total_heads,
                 head_dim=head_dim,
                 query_head_dim=query_head_dim,
             )
-            return prepared_ipc, prepared_ext, layout
+            return prepared_ipc, layout
 
-        ipc, ext, layout = _run_collective_preallocation_setup(
+        ipc, layout = _run_collective_preallocation_setup(
             owner="PCIe DCP A2A",
             exchange_group=exchange_group,
             setup=prepare,
@@ -582,14 +598,15 @@ class PCIeDCPA2A:
             exchange_group=exchange_group,
             ipc=ipc,
             owned_buffers=[slab],
-            ext_module=ext,
+            ext_module=ext_module,
             stream_affine=stream_affine,
         )
 
         def abort_native_runtime() -> None:
             pointer = getattr(runtime, "_ptr", 0)
             if pointer:
-                ext.dispose(pointer)
+                assert runtime._legacy_ext_module is not None
+                runtime._legacy_ext_module.dispose(pointer)
                 runtime._ptr = 0
 
         def detach_shared_ownership() -> None:
@@ -649,6 +666,106 @@ class PCIeDCPA2A:
             return
         self._bind_stream_key(_current_stream_key(self.device, stream))
 
+    def _resolve_launch_config(
+        self,
+        *,
+        threads: int,
+        block_limit: int,
+    ) -> tuple[int, int]:
+        threads = int(threads)
+        block_limit = int(block_limit)
+        if self._threads_override > 0:
+            threads = min(512, max(64, (self._threads_override // 32) * 32))
+        if self._block_limit_override > 0:
+            block_limit = min(self._block_limit_override, _MAX_BLOCKS)
+        if (
+            threads < self.world_size
+            or threads > 512
+            or threads % 32 != 0
+        ):
+            raise ValueError("threads must be a multiple of 32 in [32, 512]")
+        if block_limit <= 0 or block_limit > _MAX_BLOCKS:
+            raise ValueError(f"block_limit must be in [1, {_MAX_BLOCKS}]")
+        return threads, block_limit
+
+    def prepare_graph_lse_reduce_scatter(
+        self,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        threads: int = 256,
+    ) -> None:
+        """Compile/load the LSE graph launcher before CUDA graph capture."""
+
+        if _is_current_stream_capturing(self.device):
+            raise RuntimeError(
+                "prepare_graph_lse_reduce_scatter() must run before capture"
+            )
+        if dtype not in SUPPORTED_DTYPES:
+            raise ValueError(f"unsupported output dtype {dtype}")
+        threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
+        dtype_name = "fp16" if dtype == torch.float16 else "bf16"
+        from ._dcp_a2a_cute import _get_compiled_lse_reduce_scatter
+
+        with torch.cuda.device(self.device):
+            _get_compiled_lse_reduce_scatter(
+                self.world_size,
+                self.rank,
+                dtype_name,
+                threads,
+                True,
+            )
+
+    def prepare_graph_all_gather_heads(self, *, threads: int = 256) -> None:
+        """Compile/load the gather graph launcher before CUDA graph capture."""
+
+        if _is_current_stream_capturing(self.device):
+            raise RuntimeError(
+                "prepare_graph_all_gather_heads() must run before capture"
+            )
+        threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
+        from ._dcp_a2a_cute import _get_compiled_all_gather_heads
+
+        with torch.cuda.device(self.device):
+            _get_compiled_all_gather_heads(
+                self.world_size,
+                self.rank,
+                threads,
+                True,
+            )
+
+    def prepare_graph_all_gather_pair(self, *, threads: int = 512) -> None:
+        """Compile/load the paired gather launcher before graph capture."""
+
+        if _is_current_stream_capturing(self.device):
+            raise RuntimeError(
+                "prepare_graph_all_gather_pair() must run before capture"
+            )
+        threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
+        from ._dcp_a2a_cute import _get_compiled_all_gather_pair
+
+        with torch.cuda.device(self.device):
+            _get_compiled_all_gather_pair(
+                self.world_size,
+                self.rank,
+                threads,
+                True,
+                False,
+            )
+
+    def prepare_graph_all_gather_pair_kimi_topk(self) -> None:
+        """Compile/load the TP16 Kimi fused launcher before graph capture."""
+
+        if self.world_size != 16:
+            raise ValueError("Kimi paired gather+top-k requires TP16")
+        if _is_current_stream_capturing(self.device):
+            raise RuntimeError(
+                "prepare_graph_all_gather_pair_kimi_topk() must run before capture"
+            )
+        from ._dcp_a2a_cute import _get_compiled_all_gather_pair
+
+        with torch.cuda.device(self.device):
+            _get_compiled_all_gather_pair(16, self.rank, 512, True, True)
+
     def _validate(
         self,
         partial_output: torch.Tensor,
@@ -681,6 +798,10 @@ class PCIeDCPA2A:
             )
         if partial_lse.shape != (batch, heads):
             raise ValueError("partial_lse must have shape [batch, heads]")
+        if batch * heads * head_dim > self._output_capacity_elems:
+            raise ValueError("PCIe DCP A2A staging capacity exceeded")
+        if batch * heads > self._lse_capacity:
+            raise ValueError("PCIe DCP A2A LSE staging capacity exceeded")
         expected_out = (batch, self.heads_per_rank, self.head_dim)
         if out.shape != expected_out:
             raise ValueError(
@@ -704,6 +825,26 @@ class PCIeDCPA2A:
         block_limit: int = 16,
     ) -> torch.Tensor:
         """Exchange rank contributions and return this rank's reduced heads."""
+        with _device_guard(self.device):
+            return self._lse_reduce_scatter_on_device(
+                partial_output,
+                partial_lse,
+                out,
+                is_lse_base_on_e=is_lse_base_on_e,
+                threads=threads,
+                block_limit=block_limit,
+            )
+
+    def _lse_reduce_scatter_on_device(
+        self,
+        partial_output: torch.Tensor,
+        partial_lse: torch.Tensor,
+        out: Optional[torch.Tensor],
+        *,
+        is_lse_base_on_e: bool,
+        threads: int,
+        block_limit: int,
+    ) -> torch.Tensor:
         self._check_stream()
         if out is None:
             out = torch.empty(
@@ -714,16 +855,93 @@ class PCIeDCPA2A:
                 dtype=partial_output.dtype,
             )
         self._validate(partial_output, partial_lse, out)
-        self._ext.lse_reduce_scatter(
-            self._ptr,
+        threads, block_limit = self._resolve_launch_config(
+            threads=threads,
+            block_limit=block_limit,
+        )
+        rows = int(partial_output.shape[0]) * self.heads_per_rank
+        warps_per_block = threads // 32
+        blocks = max(
+            1,
+            min(block_limit, (rows + warps_per_block - 1) // warps_per_block),
+        )
+        capturing = _is_current_stream_capturing(self.device)
+        dtype_name = "fp16" if partial_output.dtype == torch.float16 else "bf16"
+        if capturing:
+            from ._dcp_a2a_cute import is_lse_reduce_scatter_prepared
+
+            if not is_lse_reduce_scatter_prepared(
+                self.world_size,
+                self.rank,
+                dtype_name,
+                threads,
+                True,
+            ):
+                raise RuntimeError(
+                    "cold PCIe DCP LSE CUDA graph capture is not allowed; "
+                    "call prepare_graph_lse_reduce_scatter() before capture"
+                )
+        if capturing and not self._device_slot_selection:
+            self._graph_base_slot = self._next_slot & 1
+            self._device_slot_selection = True
+        if self._device_slot_selection:
+            slot = self._graph_base_slot
+        else:
+            slot = self._next_slot
+            self._next_slot ^= 1
+        self._launch_lse_reduce_scatter(
             partial_output,
             partial_lse,
             out,
-            bool(is_lse_base_on_e),
-            int(threads),
-            int(block_limit),
+            slot=slot,
+            natural_log=bool(is_lse_base_on_e),
+            threads=threads,
+            blocks=blocks,
+            device_slot_selection=self._device_slot_selection,
         )
         return out
+
+    def _launch_lse_reduce_scatter(
+        self,
+        partial_output: torch.Tensor,
+        partial_lse: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        slot: int,
+        natural_log: bool,
+        threads: int,
+        blocks: int,
+        device_slot_selection: bool,
+    ) -> None:
+        from ._dcp_a2a_cute import lse_reduce_scatter
+
+        dtype_name = "fp16" if partial_output.dtype == torch.float16 else "bf16"
+        with torch.cuda.device(self.device):
+            lse_reduce_scatter(
+                world_size=self.world_size,
+                rank=self.rank,
+                dtype_name=dtype_name,
+                threads=threads,
+                local_output_ptr=partial_output.data_ptr(),
+                local_lse_ptr=partial_lse.data_ptr(),
+                output_ptr=out.data_ptr(),
+                staging_ptrs=self._staging_ptrs[slot],
+                signal_ptrs=self._signal_ptrs,
+                lse_offset=self._lse_offset,
+                batch=int(partial_output.shape[0]),
+                total_heads=self.total_heads,
+                head_dim=self.head_dim,
+                input_stride_batch=int(partial_output.stride(0)) // 8,
+                input_stride_head=int(partial_output.stride(1)) // 8,
+                output_stride_batch=int(out.stride(0)) // 8,
+                output_stride_head=int(out.stride(1)) // 8,
+                natural_log=natural_log,
+                device_slot_selection=device_slot_selection,
+                slot_delta_bytes=(
+                    self._slot_bytes if slot == 0 else -self._slot_bytes
+                ),
+                blocks=blocks,
+            )
 
     def all_gather_heads(
         self,
@@ -734,6 +952,22 @@ class PCIeDCPA2A:
         block_limit: int = 16,
     ) -> torch.Tensor:
         """Gather rank-local heads into a rank-major head dimension."""
+        with _device_guard(self.device):
+            return self._all_gather_heads_on_device(
+                local_input,
+                out,
+                threads=threads,
+                block_limit=block_limit,
+            )
+
+    def _all_gather_heads_on_device(
+        self,
+        local_input: torch.Tensor,
+        out: Optional[torch.Tensor],
+        *,
+        threads: int,
+        block_limit: int,
+    ) -> torch.Tensor:
         self._check_stream()
         if self._closed:
             raise RuntimeError("PCIeDCPA2A is closed")
@@ -770,16 +1004,101 @@ class PCIeDCPA2A:
             )
         if not out.is_contiguous():
             raise ValueError("output must be contiguous")
-        self._ext.all_gather_heads(
-            self._ptr,
+        if batch * self.total_heads * self.query_head_dim > self._output_capacity_elems:
+            raise ValueError("PCIe DCP all-gather staging capacity exceeded")
+        threads, block_limit = self._resolve_launch_config(
+            threads=threads,
+            block_limit=block_limit,
+        )
+        rows = int(batch) * self.total_heads
+        warps_per_block = threads // 32
+        blocks = max(
+            1,
+            min(block_limit, (rows + warps_per_block - 1) // warps_per_block),
+        )
+        capturing = _is_current_stream_capturing(self.device)
+        if capturing:
+            from ._dcp_a2a_cute import is_all_gather_heads_prepared
+
+            if not is_all_gather_heads_prepared(
+                self.world_size,
+                self.rank,
+                threads,
+                True,
+            ):
+                raise RuntimeError(
+                    "cold PCIe DCP gather CUDA graph capture is not allowed; "
+                    "call prepare_graph_all_gather_heads() before capture"
+                )
+        if capturing and not self._device_slot_selection:
+            self._graph_base_slot = self._next_slot & 1
+            self._device_slot_selection = True
+        if self._device_slot_selection:
+            slot = self._graph_base_slot
+        else:
+            slot = self._next_slot
+            self._next_slot ^= 1
+        self._launch_all_gather_heads(
             local_input,
             out,
-            int(threads),
-            int(block_limit),
+            slot=slot,
+            threads=threads,
+            blocks=blocks,
+            device_slot_selection=self._device_slot_selection,
         )
         return out
 
+    def _launch_all_gather_heads(
+        self,
+        local_input: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        slot: int,
+        threads: int,
+        blocks: int,
+        device_slot_selection: bool,
+    ) -> None:
+        from ._dcp_a2a_cute import all_gather_heads
+
+        with torch.cuda.device(self.device):
+            all_gather_heads(
+                world_size=self.world_size,
+                rank=self.rank,
+                threads=threads,
+                local_input_ptr=local_input.data_ptr(),
+                output_ptr=out.data_ptr(),
+                staging_ptrs=self._staging_ptrs[slot],
+                signal_ptrs=self._signal_ptrs,
+                batch=int(local_input.shape[0]),
+                local_heads=self.heads_per_rank,
+                head_dim=self.query_head_dim,
+                element_size=local_input.element_size(),
+                device_slot_selection=device_slot_selection,
+                slot_delta_bytes=(
+                    self._slot_bytes if slot == 0 else -self._slot_bytes
+                ),
+                blocks=blocks,
+            )
+
     def all_gather_pair(
+        self,
+        local_first: torch.Tensor,
+        local_second: torch.Tensor,
+        out_first: Optional[torch.Tensor] = None,
+        out_second: Optional[torch.Tensor] = None,
+        *,
+        threads: int = 512,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with _device_guard(self.device):
+            return self._all_gather_pair_on_device(
+                local_first,
+                local_second,
+                out_first,
+                out_second,
+                threads=threads,
+            )
+
+    def _all_gather_pair_on_device(
         self,
         local_first: torch.Tensor,
         local_second: torch.Tensor,
@@ -799,6 +1118,11 @@ class PCIeDCPA2A:
         inputs = (local_first, local_second)
         if any(value.device != self.device for value in inputs):
             raise ValueError("paired inputs must be on the runtime device")
+        if any(value.dtype not in SUPPORTED_PAIR_DTYPES for value in inputs):
+            raise ValueError(
+                "paired inputs must be float16, bfloat16, float32, or "
+                "float8_e4m3fn"
+            )
         if any(value.ndim != 2 for value in inputs):
             raise ValueError("paired inputs must have shape [batch, width]")
         if any(not value.is_contiguous() for value in inputs):
@@ -810,9 +1134,12 @@ class PCIeDCPA2A:
             )
         if int(local_second.shape[0]) != batch:
             raise ValueError("paired inputs must have the same batch size")
-        combined_row_bytes = sum(
+        row_bytes = tuple(
             int(value.shape[1]) * value.element_size() for value in inputs
         )
+        if any(value % 16 for value in row_bytes):
+            raise ValueError("paired row widths must be multiples of 16 bytes")
+        combined_row_bytes = sum(row_bytes)
         if combined_row_bytes != self.query_head_dim:
             raise ValueError(
                 "paired row bytes must match the runtime query dimension: "
@@ -845,17 +1172,96 @@ class PCIeDCPA2A:
                 )
             if not output.is_contiguous():
                 raise ValueError(f"{name} output must be contiguous")
-        self._ext.all_gather_pair(
-            self._ptr,
+        threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
+        capturing = _is_current_stream_capturing(self.device)
+        if capturing:
+            from ._dcp_a2a_cute import is_all_gather_pair_prepared
+
+            if not is_all_gather_pair_prepared(
+                self.world_size,
+                self.rank,
+                threads,
+                True,
+                False,
+            ):
+                raise RuntimeError(
+                    "cold PCIe DCP paired gather CUDA graph capture is not "
+                    "allowed; call prepare_graph_all_gather_pair() before capture"
+                )
+        if capturing and not self._device_slot_selection:
+            self._graph_base_slot = self._next_slot & 1
+            self._device_slot_selection = True
+        if self._device_slot_selection:
+            slot = self._graph_base_slot
+        else:
+            slot = self._next_slot
+            self._next_slot ^= 1
+        self._launch_all_gather_pair(
             local_first,
             local_second,
             out_first,
             out_second,
-            int(threads),
+            slot=slot,
+            threads=threads,
+            device_slot_selection=self._device_slot_selection,
         )
         return out_first, out_second
 
+    def _launch_all_gather_pair(
+        self,
+        local_first: torch.Tensor,
+        local_second: torch.Tensor,
+        out_first: torch.Tensor,
+        out_second: torch.Tensor,
+        *,
+        slot: int,
+        threads: int,
+        device_slot_selection: bool,
+    ) -> None:
+        from ._dcp_a2a_cute import all_gather_pair
+
+        with torch.cuda.device(self.device):
+            all_gather_pair(
+                world_size=self.world_size,
+                rank=self.rank,
+                threads=threads,
+                local_first_ptr=local_first.data_ptr(),
+                local_second_ptr=local_second.data_ptr(),
+                output_first_ptr=out_first.data_ptr(),
+                output_second_ptr=out_second.data_ptr(),
+                staging_ptrs=self._staging_ptrs[slot],
+                signal_ptrs=self._signal_ptrs,
+                batch=int(local_first.shape[0]),
+                first_row_bytes=int(local_first.shape[1])
+                * local_first.element_size(),
+                second_row_bytes=int(local_second.shape[1])
+                * local_second.element_size(),
+                device_slot_selection=device_slot_selection,
+                slot_delta_bytes=(
+                    self._slot_bytes if slot == 0 else -self._slot_bytes
+                ),
+            )
+
     def all_gather_pair_kimi_topk(
+        self,
+        local_down: torch.Tensor,
+        local_router: torch.Tensor,
+        correction_bias: torch.Tensor,
+        out_down: Optional[torch.Tensor] = None,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        with _device_guard(self.device):
+            return self._all_gather_pair_kimi_topk_on_device(
+                local_down,
+                local_router,
+                correction_bias,
+                out_down,
+                topk_weights,
+                topk_ids,
+            )
+
+    def _all_gather_pair_kimi_topk_on_device(
         self,
         local_down: torch.Tensor,
         local_router: torch.Tensor,
@@ -906,16 +1312,71 @@ class PCIeDCPA2A:
                 raise ValueError(
                     f"{name} must be contiguous {shape} {dtype} on {self.device}"
                 )
-        self._ext.all_gather_pair_kimi_topk(
-            self._ptr,
+        capturing = _is_current_stream_capturing(self.device)
+        if capturing:
+            from ._dcp_a2a_cute import is_all_gather_pair_prepared
+
+            if not is_all_gather_pair_prepared(
+                16,
+                self.rank,
+                512,
+                True,
+                True,
+            ):
+                raise RuntimeError(
+                    "cold PCIe DCP Kimi CUDA graph capture is not allowed; "
+                    "call prepare_graph_all_gather_pair_kimi_topk() before capture"
+                )
+        if capturing and not self._device_slot_selection:
+            self._graph_base_slot = self._next_slot & 1
+            self._device_slot_selection = True
+        if self._device_slot_selection:
+            slot = self._graph_base_slot
+        else:
+            slot = self._next_slot
+            self._next_slot ^= 1
+        self._launch_all_gather_pair_kimi_topk(
             local_down,
             local_router,
             correction_bias,
             out_down,
             topk_weights,
             topk_ids,
+            slot=slot,
+            device_slot_selection=self._device_slot_selection,
         )
         return out_down, topk_weights, topk_ids
+
+    def _launch_all_gather_pair_kimi_topk(
+        self,
+        local_down: torch.Tensor,
+        local_router: torch.Tensor,
+        correction_bias: torch.Tensor,
+        out_down: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        slot: int,
+        device_slot_selection: bool,
+    ) -> None:
+        from ._dcp_a2a_cute import all_gather_pair_kimi_topk
+
+        with torch.cuda.device(self.device):
+            all_gather_pair_kimi_topk(
+                rank=self.rank,
+                local_down_ptr=local_down.data_ptr(),
+                local_router_ptr=local_router.data_ptr(),
+                correction_bias_ptr=correction_bias.data_ptr(),
+                output_down_ptr=out_down.data_ptr(),
+                topk_weights_ptr=topk_weights.data_ptr(),
+                topk_ids_ptr=topk_ids.data_ptr(),
+                staging_ptrs=self._staging_ptrs[slot],
+                signal_ptrs=self._signal_ptrs,
+                device_slot_selection=device_slot_selection,
+                slot_delta_bytes=(
+                    self._slot_bytes if slot == 0 else -self._slot_bytes
+                ),
+            )
 
     def _closed_import_indices(self) -> set[tuple[int, int]]:
         closed = getattr(self, "_closed_ipc_import_indices", None)
@@ -940,12 +1401,12 @@ class PCIeDCPA2A:
         failures: list[tuple[str, Exception]] = []
         if getattr(self, "_ptr", 0):
             try:
-                self._ext.dispose(self._ptr)
+                assert self._legacy_ext_module is not None
+                self._legacy_ext_module.dispose(self._ptr)
             except Exception as exc:
                 failures.append(("native runtime", exc))
             else:
                 self._ptr = 0
-
         closed = self._closed_import_indices()
         if self._ipc is not None:
             for buffer_index, shared in enumerate(self._owned_buffers):
@@ -1127,7 +1588,8 @@ class PCIeDCPA2APool:
             self.max_concurrent_channels,
         ) = normalized
         self.exchange_group = exchange_group
-        self._ext = ext_module
+        self._legacy_ext_module = ext_module
+        self.single_channel = bool(single_channel)
         self._channel_factory = channel_factory
         self._channels: dict[int, PCIeDCPA2A] = {}
         self._logical_channels: dict[str, PCIeDCPA2A] = {}
@@ -1217,7 +1679,7 @@ class PCIeDCPA2APool:
                 total_heads=self.total_heads,
                 head_dim=self.head_dim,
                 query_head_dim=self.query_head_dim,
-                ext_module=self._ext,
+                ext_module=self._legacy_ext_module,
                 stream_affine=not self.single_channel,
             )
         channel._bind_stream_key(stream_key)
@@ -1344,6 +1806,19 @@ class PCIeDCPA2APool:
     ) -> PCIeDCPA2A:
         if self._closed:
             raise RuntimeError("PCIeDCPA2APool is closed")
+        capturing = _is_current_stream_capturing(self.device)
+        if capturing:
+            if not self._capture_channel_stack:
+                raise RuntimeError(
+                    "PCIe DCP A2A CUDA graph capture requires an active "
+                    "pool.capture() graph-owned channel context"
+                )
+            channel = self._capture_channel_stack[-1]
+            if not self.single_channel:
+                stream_key = _current_stream_key(self.device, stream)
+                key = 0 if stream_key is None else int(stream_key)
+                self._channels[key] = channel
+            return channel
         if self.single_channel:
             key = 0
             stream_key = None
@@ -1387,25 +1862,65 @@ class PCIeDCPA2APool:
         channel = self._channels.get(key)
         if channel is not None:
             return channel
-        if _is_current_stream_capturing(self.device):
-            # Nested piecewise captures use a torch-owned stream key that is
-            # unavailable before capture begins. Reuse the channel selected by
-            # the enclosing graph manager, never one owned by another graph.
-            if self._capture_channel_stack:
-                channel = self._capture_channel_stack[-1]
-                self._channels[key] = channel
-                return channel
-            if self._channels:
-                channel = next(iter(self._channels.values()))
-                self._channels[key] = channel
-                return channel
-            raise RuntimeError(
-                "PCIe DCP A2A pool has no channel during CUDA graph capture; "
-                "create or warm a channel before capture"
-            )
         channel = self._new_channel(stream_key)
         self._channels[key] = channel
         return channel
+
+    def prepare_graph_lse_reduce_scatter(
+        self,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        threads: int = 256,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> None:
+        """Prepare LSE graph code on an eager channel before capture."""
+
+        with _device_guard(self.device):
+            self.for_stream(stream, channel_id=channel_id).prepare_graph_lse_reduce_scatter(
+                dtype=dtype, threads=threads
+            )
+
+    def prepare_graph_all_gather_heads(
+        self,
+        *,
+        threads: int = 256,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> None:
+        """Prepare gather graph code on an eager channel before capture."""
+
+        with _device_guard(self.device):
+            self.for_stream(
+                stream, channel_id=channel_id
+            ).prepare_graph_all_gather_heads(threads=threads)
+
+    def prepare_graph_all_gather_pair(
+        self,
+        *,
+        threads: int = 512,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> None:
+        """Prepare paired-gather graph code on an eager channel before capture."""
+
+        with _device_guard(self.device):
+            self.for_stream(
+                stream, channel_id=channel_id
+            ).prepare_graph_all_gather_pair(threads=threads)
+
+    def prepare_graph_all_gather_pair_kimi_topk(
+        self,
+        *,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> None:
+        """Prepare TP16 Kimi paired-gather graph code before capture."""
+
+        with _device_guard(self.device):
+            self.for_stream(
+                stream, channel_id=channel_id
+            ).prepare_graph_all_gather_pair_kimi_topk()
 
     def lse_reduce_scatter(
         self,
@@ -1418,6 +1933,30 @@ class PCIeDCPA2APool:
         block_limit: int = 16,
         stream: object = None,
         channel_id: Optional[str] = None,
+    ) -> torch.Tensor:
+        with _device_guard(self.device):
+            return self._lse_reduce_scatter_on_device(
+                partial_output,
+                partial_lse,
+                out,
+                is_lse_base_on_e=is_lse_base_on_e,
+                threads=threads,
+                block_limit=block_limit,
+                stream=stream,
+                channel_id=channel_id,
+            )
+
+    def _lse_reduce_scatter_on_device(
+        self,
+        partial_output: torch.Tensor,
+        partial_lse: torch.Tensor,
+        out: Optional[torch.Tensor],
+        *,
+        is_lse_base_on_e: bool,
+        threads: int,
+        block_limit: int,
+        stream: object,
+        channel_id: Optional[str],
     ) -> torch.Tensor:
         channel = self.for_stream(stream, channel_id=channel_id)
         if stream is not None and self.device.type == "cuda":
@@ -1448,6 +1987,26 @@ class PCIeDCPA2APool:
         block_limit: int = 16,
         stream: object = None,
         channel_id: Optional[str] = None,
+    ) -> torch.Tensor:
+        with _device_guard(self.device):
+            return self._all_gather_heads_on_device(
+                local_input,
+                out,
+                threads=threads,
+                block_limit=block_limit,
+                stream=stream,
+                channel_id=channel_id,
+            )
+
+    def _all_gather_heads_on_device(
+        self,
+        local_input: torch.Tensor,
+        out: Optional[torch.Tensor],
+        *,
+        threads: int,
+        block_limit: int,
+        stream: object,
+        channel_id: Optional[str],
     ) -> torch.Tensor:
         channel = self.for_stream(stream, channel_id=channel_id)
         if stream is not None and self.device.type == "cuda":

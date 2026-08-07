@@ -478,7 +478,6 @@ def test_dcp_direct_cuda_constructor_executes_all_collective_gates(
     assert events == [
         "preflight",
         "residency",
-        "preflight",
         "contract",
         "native-init",
         "native-verdict",

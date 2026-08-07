@@ -16,17 +16,15 @@ import os
 import time
 from contextlib import suppress
 from functools import lru_cache
-from pathlib import Path
 from statistics import median
 from typing import Optional
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from torch.utils.cpp_extension import load
 
 from ._cuda_ipc import CudaRTLibrary
-from .pcie_oneshot import PCIeOneshotAllReduce
+from .pcie_oneshot import PCIeOneshotAllReduce, _normalize_device
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +33,7 @@ SUPPORTED_DTYPES = {
     torch.float16: 1,
     torch.float32: 2,
 }
+SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 10)
 FLAG_STRIDE = 128
 FLAG_SLOTS = 256
 MAX_PIECES = 8
@@ -125,16 +124,16 @@ def _normalize_fp8_mode(value: str | None) -> str:
 
 
 @lru_cache(maxsize=1)
-def _load_extension():
-    source = Path(__file__).with_name("pcie_dma.cu")
-    verbose = os.getenv("B12X_PCIE_DMA_VERBOSE_BUILD", "0") == "1"
-    return load(
-        name="b12x_pcie_dma_ext",
-        sources=[str(source)],
-        extra_cuda_cflags=["-O2"],
-        extra_ldflags=["-lcuda"],
-        verbose=verbose,
-    )
+def _load_kernels():
+    """Return the CuTe/Python transport primitives.
+
+    Importing the CuTe module stays lazy so the public comm package remains
+    importable in CPU-only tooling.
+    """
+
+    from ._dma_kernels import DmaKernels
+
+    return DmaKernels(CudaRTLibrary())
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -158,20 +157,22 @@ class PCIeDmaAllReduce:
         ext_module=None,
         fp8: Optional[str] = None,
     ) -> None:
+        # Kept only as a source-compatible keyword for callers that used to
+        # inject the removed C++ extension.  Device work is always CuTe DSL.
+        del ext_module
         self.group = exchange_group
         self.rank = dist.get_rank(group=exchange_group)
         self.world_size = dist.get_world_size(group=exchange_group)
-        self.device = (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(f"cuda:{device}" if isinstance(device, int) else device)
-        )
+        self.device = _normalize_device(device)
+        if self.world_size not in SUPPORTED_WORLD_SIZES:
+            raise ValueError(
+                "PCIe DMA all-reduce supports only the reviewed world sizes "
+                f"{SUPPORTED_WORLD_SIZES}, got {self.world_size}"
+            )
         if self.device.type != "cuda":
             raise ValueError("PCIe ring allreduce requires a CUDA device")
-        if self.world_size < 2:
-            raise ValueError("ring allreduce needs at least 2 ranks")
         self.max_bytes = int(max_bytes)
-        self._ext = ext_module or _load_extension()
+        self._kernels = _load_kernels()
         self._ipc = CudaRTLibrary()
         self._ipc.cudaSetDevice(self.device.index or 0)
         self._closed = False
@@ -240,6 +241,9 @@ class PCIeDmaAllReduce:
             self._fp8, f"fp8-{self._fp8}" if self._fp8 else "bf16"
         )
         logger.debug("[PCIe DMA allreduce] wire mode: %s", self.wire_mode)
+        prepare = getattr(self._kernels, "prepare", None)
+        if prepare is not None:
+            prepare(world_size=self.world_size, wire_mode=self._fp8)
         if logger.isEnabledFor(logging.DEBUG):
             self._log_peer_copy_bandwidth()
 
@@ -271,7 +275,7 @@ class PCIeDmaAllReduce:
         dist.barrier(group=self.group, device_ids=[device_index])
         with torch.cuda.stream(stream):
             for _ in range(3):
-                self._ext.dma_copy(
+                self._kernels.dma_copy(
                     self._scratch_ptr(nxt, 1),
                     self._scratch_ptr(self.rank, 0),
                     probe_bytes,
@@ -280,7 +284,7 @@ class PCIeDmaAllReduce:
             end = torch.cuda.Event(enable_timing=True)
             start.record(stream)
             for _ in range(iters):
-                self._ext.dma_copy(
+                self._kernels.dma_copy(
                     self._scratch_ptr(nxt, 1),
                     self._scratch_ptr(self.rank, 0),
                     probe_bytes,
@@ -335,6 +339,12 @@ class PCIeDmaAllReduce:
     def all_reduce(
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        with torch.cuda.device(self.device):
+            return self._all_reduce_on_device(inp, out=out)
+
+    def _all_reduce_on_device(
+        self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         if not self.should_allreduce(inp):
             raise ValueError(
                 "input does not satisfy ring allreduce requirements "
@@ -345,10 +355,15 @@ class PCIeDmaAllReduce:
             # retain this result while a later collective is in flight.
             out = torch.empty_like(inp)
         elif (
-            out.shape != inp.shape or out.dtype != inp.dtype or not out.is_contiguous()
+            out.shape != inp.shape
+            or out.dtype != inp.dtype
+            or out.device != self.device
+            or not out.is_contiguous()
         ):
-            raise ValueError("output must match input shape/dtype and be contiguous")
-        ext = self._ext
+            raise ValueError(
+                "output must match input shape/dtype/device and be contiguous"
+            )
+        kernels = self._kernels
         world = self.world_size
         rank = self.rank
         nxt = (rank + 1) % world
@@ -382,17 +397,17 @@ class PCIeDmaAllReduce:
             "mx_ring",
         )
         if wire_codec == "i8":
-            quantize = ext.dma_quant_i8
-            dequantize_store = ext.dma_dequant_store_i8
-            dequantize_add_quant = ext.dma_dequant_add_quant_i8
+            quantize = kernels.dma_quant_i8
+            dequantize_store = kernels.dma_dequant_store_i8
+            dequantize_add_quant = kernels.dma_dequant_add_quant_i8
         elif wire_codec == "mx":
-            quantize = ext.dma_quant_mx
-            dequantize_store = ext.dma_dequant_store_mx
-            dequantize_add_quant = ext.dma_dequant_add_quant_mx
+            quantize = kernels.dma_quant_mx
+            dequantize_store = kernels.dma_dequant_store_mx
+            dequantize_add_quant = kernels.dma_dequant_add_quant_mx
         else:
-            quantize = ext.dma_quant
-            dequantize_store = ext.dma_dequant_store
-            dequantize_add_quant = ext.dma_dequant_add_quant
+            quantize = kernels.dma_quant
+            dequantize_store = kernels.dma_dequant_store
+            dequantize_add_quant = kernels.dma_dequant_add_quant
 
         base = out.data_ptr()
 
@@ -531,15 +546,15 @@ class PCIeDmaAllReduce:
                         copy_stream.wait_event(self._ag_ready)
                     elif k > 0:
                         copy_stream.wait_event(add_done[p])
-                    ext.dma_copy(send_dst, send_src, send_bytes)
+                    kernels.dma_copy(send_dst, send_src, send_bytes)
                     copied[slot(k, p)].record(copy_stream)
                 with torch.cuda.stream(flag_stream):
                     flag_stream.wait_event(copied[slot(k, p)])
-                    ext.dma_set_flag(
+                    kernels.dma_set_flag(
                         self._flag_ptr(nxt, slot(k, p)),
                         self._counter_ptr(self._send_counters, slot(k, p)),
                     )
-                ext.dma_wait_flag(
+                kernels.dma_wait_flag(
                     self._flag_ptr(rank, slot(k, p)),
                     self._counter_ptr(self._wait_counters, slot(k, p)),
                 )
@@ -558,7 +573,7 @@ class PCIeDmaAllReduce:
                             k == world - 2,
                         )
                     else:
-                        ext.dma_add(
+                        kernels.dma_add(
                             piece_ptr(recv_chunk, p),
                             in_piece_ptr(recv_chunk, p),
                             scratch_piece(rank, k, p),
@@ -580,7 +595,7 @@ class PCIeDmaAllReduce:
                         piece_elems,
                     )
                 else:
-                    ext.dma_copy(
+                    kernels.dma_copy(
                         piece_ptr(recv_chunk, p),
                         scratch_piece(rank, k, p),
                         piece_bytes,
@@ -594,10 +609,10 @@ class PCIeDmaAllReduce:
         main.wait_stream(copy_stream)
         main.wait_stream(flag_stream)
         done = steps * pieces
-        ext.dma_set_flag(
+        kernels.dma_set_flag(
             self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
         )
-        ext.dma_wait_flag(
+        kernels.dma_wait_flag(
             self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
         )
         return out
@@ -634,19 +649,19 @@ class PCIeDmaAllReduce:
         next-call writes are stream-ordered after that.
         """
 
-        ext = self._ext
+        kernels = self._kernels
         if wire_codec == "i8":
-            quantize = ext.dma_quant_i8
-            dequantize_accum = ext.dma_dequant_accum_i8
-            dequantize_store = ext.dma_dequant_store_i8
+            quantize = kernels.dma_quant_i8
+            dequantize_accum = kernels.dma_dequant_accum_i8
+            dequantize_store = kernels.dma_dequant_store_i8
         elif wire_codec == "mx":
-            quantize = ext.dma_quant_mx
-            dequantize_accum = ext.dma_dequant_accum_mx
-            dequantize_store = ext.dma_dequant_store_mx
+            quantize = kernels.dma_quant_mx
+            dequantize_accum = kernels.dma_dequant_accum_mx
+            dequantize_store = kernels.dma_dequant_store_mx
         else:
-            quantize = ext.dma_quant
-            dequantize_accum = ext.dma_dequant_accum
-            dequantize_store = ext.dma_dequant_store
+            quantize = kernels.dma_quant
+            dequantize_accum = kernels.dma_dequant_accum
+            dequantize_store = kernels.dma_dequant_store
         world = self.world_size
         rank = self.rank
         shard_bytes = shard_elems * 2
@@ -703,7 +718,7 @@ class PCIeDmaAllReduce:
             with torch.cuda.stream(copy_stream):
                 copy_stream.wait_event(self._a2a_qdone[c])
                 for i, j in enumerate(peers):
-                    ext.dma_copy(
+                    kernels.dma_copy(
                         rs_chunk(j, pos_at[i], c), stage_chunk(j, c), chunk_slice
                     )
                     copied[i * chunks + c].record(copy_stream)
@@ -711,7 +726,7 @@ class PCIeDmaAllReduce:
                 for i, j in enumerate(peers):
                     flag_stream.wait_event(copied[i * chunks + c])
                     slot = rs_slot(pos_at[i], c)
-                    ext.dma_set_flag(
+                    kernels.dma_set_flag(
                         self._flag_ptr(j, slot),
                         self._counter_ptr(self._send_counters, slot),
                     )
@@ -721,7 +736,7 @@ class PCIeDmaAllReduce:
         for c in range(chunks):
             for i in range(world - 1):
                 slot = rs_slot(i, c)
-                ext.dma_wait_flag(
+                kernels.dma_wait_flag(
                     self._flag_ptr(rank, slot),
                     self._counter_ptr(self._wait_counters, slot),
                 )
@@ -752,7 +767,7 @@ class PCIeDmaAllReduce:
             with torch.cuda.stream(ag_copy):
                 ag_copy.wait_event(self._a2a_ownq[c])
                 for i, j in enumerate(peers):
-                    ext.dma_copy(
+                    kernels.dma_copy(
                         ag_chunk(j, pos_at[i], c), stage_chunk(rank, c), chunk_slice
                     )
                     copied[half + i * chunks + c].record(ag_copy)
@@ -760,7 +775,7 @@ class PCIeDmaAllReduce:
                 for i, j in enumerate(peers):
                     ag_flag.wait_event(copied[half + i * chunks + c])
                     slot = ag_slot(pos_at[i], c)
-                    ext.dma_set_flag(
+                    kernels.dma_set_flag(
                         self._flag_ptr(j, slot),
                         self._counter_ptr(self._send_counters, slot),
                     )
@@ -770,7 +785,7 @@ class PCIeDmaAllReduce:
             for i in range(world - 1):
                 src = peers[i]
                 slot = ag_slot(i, c)
-                ext.dma_wait_flag(
+                kernels.dma_wait_flag(
                     self._flag_ptr(rank, slot),
                     self._counter_ptr(self._wait_counters, slot),
                 )
@@ -791,15 +806,29 @@ class PCIeDmaAllReduce:
         if self._closed:
             return
         self._closed = True
+        # Drain the main and four auxiliary streams before any rank unmaps a
+        # peer allocation.  Every importer must unmap before its owner frees
+        # the exported slab.
+        torch.cuda.synchronize(self.device)
+        dist.barrier(group=self.group)
         for ptr in self._slab.remote_ptrs:
             with suppress(Exception):
                 self._ipc.cudaIpcCloseMemHandle(ptr)
+        dist.barrier(group=self.group)
         with suppress(Exception):
             self._ipc.cudaFree(self._slab.local_ptr)
+        dist.barrier(group=self.group)
+
+    def __enter__(self) -> "PCIeDmaAllReduce":
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.close()
 
     def __del__(self) -> None:
-        with suppress(Exception):
-            self.close()
+        # Distributed barriers are unsafe during asymmetric interpreter
+        # teardown. Explicit/context-manager close owns coordinated release.
+        return None
 
 
 def autotune_crossovers(

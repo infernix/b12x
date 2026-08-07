@@ -1,7 +1,7 @@
 """PCIe collectives for SM12x multi-GPU boxes (no NVLink).
 
 Stateful class API (collectives own CUDA-IPC handles, mapped peer buffers,
-and their JIT-built extension): kwargs-only constructors with the shared
+and stable CuTe launch plans): kwargs-only constructors with the shared
 vocabulary (rank / world_size / device / ...), CUDA-graph-capturable methods,
 pools via ``<Class>Pool``.
 
@@ -16,8 +16,9 @@ pools via ``<Class>Pool``.
 - ``DcpAllToAll``: DCP attention exchange with fused LSE reduce-scatter.
 - ``DcpTopKOwnerExchange``: exact DCP candidate owner staging.
 
-Raw CUDA (not CuTe): each class JIT-builds its colocated ``.cu`` via
-torch.utils.cpp_extension, so nvcc must be available at runtime.
+Every device kernel is authored in Python with CuTe DSL.  Host-side CUDA
+Runtime/Driver calls are also made from Python; this package contains no
+repo-authored C++ or CUDA source and never invokes a native extension build.
 """
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ META = OpMeta(
     ),
     test_path="tests/comm/test_pcie.py",
     since="0.7.0",
-    notes="Raw CUDA JIT-built via torch cpp_extension; needs nvcc at runtime.",
+    notes="Python/CuTe DSL collectives with Python CUDA Runtime/Driver control.",
 )
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy

@@ -5,17 +5,16 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from functools import lru_cache
 from itertools import count
-from pathlib import Path
+from threading import RLock
 from typing import Callable, Iterable, Optional, Sequence, TypeVar
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from torch.utils.cpp_extension import load
 
 from ._cuda_ipc import CudaRTLibrary
 
@@ -66,11 +65,24 @@ def parse_pcie_oneshot_max_size(value: str | int | None) -> Optional[int]:
 
 
 def _normalize_device(device: torch.device | int | str) -> torch.device:
-    if isinstance(device, torch.device):
-        return device
     if isinstance(device, int):
-        return torch.device(f"cuda:{device}")
-    return torch.device(device)
+        device_obj = torch.device(f"cuda:{device}")
+    elif isinstance(device, torch.device):
+        device_obj = device
+    else:
+        device_obj = torch.device(device)
+    if device_obj.type == "cuda" and device_obj.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device_obj
+
+
+def _device_guard(device: torch.device | int | str):
+    """Match the native entry points' OptionalCUDAGuard semantics."""
+
+    device_obj = _normalize_device(device)
+    if device_obj.type != "cuda":
+        return nullcontext()
+    return torch.cuda.device(device_obj)
 
 
 def _cuda_device_index(device: torch.device) -> int:
@@ -1154,15 +1166,511 @@ class _BenchmarkResult:
 
 @lru_cache(maxsize=1)
 def _load_extension():
-    source = Path(__file__).with_name("pcie_oneshot.cu")
-    verbose = os.getenv("B12X_PCIE_ONESHOT_VERBOSE_BUILD", "0") == "1"
-    return load(
-        name="b12x_pcie_oneshot_ext",
-        sources=[str(source)],
-        extra_cuda_cflags=["-O2", "--expt-relaxed-constexpr"],
-        extra_ldflags=["-lcuda"],
-        verbose=verbose,
-    )
+    """Return the pure-Python CuTe backend used by the compatibility runtime."""
+
+    return _CuTeOneshotBackend()
+
+
+_SIGNAL_BYTES = 150_528
+_POINTER_TABLE_BYTES = 16 * 8
+_MAX_BLOCKS = 36
+_MAX_RANKS = 16
+_REG_PACKS = 3
+
+
+def _pointer_as_i64(value: int) -> int:
+    value = int(value)
+    return value if value < (1 << 63) else value - (1 << 64)
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    names = {
+        torch.float32: "float32",
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+    }
+    try:
+        return names[dtype]
+    except KeyError as exc:
+        raise TypeError(f"unsupported oneshot dtype {dtype}") from exc
+
+
+@dataclass
+class _CuTeOneshotState:
+    rank: int
+    world_size: int
+    signal_ptrs: tuple[int, ...]
+    rank_data: torch.Tensor
+    signal_table_address: int
+    next_table_offset: int
+    registered_tables: dict[int, int]
+    eager_tables: Optional[tuple[int, int]] = None
+    eager_ptrs: Optional[tuple[tuple[int, ...], tuple[int, ...]]] = None
+    eager_slot: int = 0
+    device_slot_selection: bool = False
+    slot_bias: int = 0
+
+
+def _enable_device_slot_selection(
+    state: _CuTeOneshotState,
+    *,
+    capturing: bool,
+) -> None:
+    """Freeze the host-to-device double-buffer phase at first capture."""
+    if capturing and state.eager_tables is not None and not state.device_slot_selection:
+        state.slot_bias = state.eager_slot & 1
+        state.device_slot_selection = True
+
+
+class _CuTeOneshotBackend:
+    """Extension-shaped adapter implemented wholly in Python and CuTe DSL.
+
+    The adapter intentionally mirrors the old pybind entry points so the
+    public runtime, pooling, autotune, and test injection APIs do not need a
+    second control path.  Integer handles index Python state only; no native
+    object is allocated.
+    """
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._next_handle = 1
+        self._states: dict[int, _CuTeOneshotState] = {}
+
+    @staticmethod
+    def meta_size() -> int:
+        return _SIGNAL_BYTES
+
+    def _state(self, handle: int) -> _CuTeOneshotState:
+        with self._lock:
+            try:
+                return self._states[int(handle)]
+            except KeyError as exc:
+                raise RuntimeError("oneshot runtime is closed") from exc
+
+    @staticmethod
+    def _write_table(
+        state: _CuTeOneshotState,
+        pointers: Sequence[int],
+        *,
+        offset: Optional[int] = None,
+    ) -> int:
+        if len(pointers) != state.world_size:
+            raise ValueError("pointer table must match world size")
+        if offset is None:
+            offset = _align_up(state.next_table_offset, _POINTER_TABLE_BYTES)
+            state.next_table_offset = offset + _POINTER_TABLE_BYTES
+        end = offset + _POINTER_TABLE_BYTES
+        if end > state.rank_data.numel():
+            raise RuntimeError("rank data buffer overflow")
+        values = [_pointer_as_i64(pointer) for pointer in pointers]
+        values.extend([0] * (_MAX_RANKS - len(values)))
+        destination = state.rank_data[offset:end].view(torch.int64)
+        source = torch.tensor(values, dtype=torch.int64, device=state.rank_data.device)
+        destination.copy_(source)
+        return int(state.rank_data.data_ptr()) + offset
+
+    def init_custom_ar(
+        self,
+        signal_ptrs: Sequence[int],
+        rank_data: torch.Tensor,
+        rank: int,
+    ) -> int:
+        world_size = len(signal_ptrs)
+        if world_size not in SUPPORTED_WORLD_SIZES:
+            raise ValueError(f"unsupported world size {world_size}")
+        if rank < 0 or rank >= world_size:
+            raise ValueError(f"invalid rank {rank} for world size {world_size}")
+        if rank_data.device.type != "cuda" or rank_data.dtype != torch.uint8:
+            raise ValueError("rank_data must be a CUDA uint8 tensor")
+        if rank_data.numel() < 2 * _POINTER_TABLE_BYTES:
+            raise ValueError("rank_data is too small for CuTe pointer tables")
+
+        state = _CuTeOneshotState(
+            rank=int(rank),
+            world_size=world_size,
+            signal_ptrs=tuple(int(pointer) for pointer in signal_ptrs),
+            rank_data=rank_data,
+            signal_table_address=int(rank_data.data_ptr()),
+            next_table_offset=_POINTER_TABLE_BYTES,
+            registered_tables={},
+        )
+        self._write_table(state, state.signal_ptrs, offset=0)
+        with self._lock:
+            handle = self._next_handle
+            self._next_handle += 1
+            self._states[handle] = state
+        return handle
+
+    def register_buffer(self, handle: int, pointers: Sequence[int]) -> None:
+        state = self._state(handle)
+        ptrs = tuple(int(pointer) for pointer in pointers)
+        local_pointer = ptrs[state.rank]
+        existing = state.registered_tables.get(local_pointer)
+        if existing is not None:
+            return
+        state.registered_tables[local_pointer] = self._write_table(state, ptrs)
+
+    def register_pcie_buffers(
+        self,
+        handle: int,
+        pointers0: Sequence[int],
+        pointers1: Sequence[int],
+    ) -> None:
+        state = self._state(handle)
+        ptrs0 = tuple(int(pointer) for pointer in pointers0)
+        ptrs1 = tuple(int(pointer) for pointer in pointers1)
+        table0 = self._write_table(state, ptrs0)
+        table1 = self._write_table(state, ptrs1)
+        state.eager_tables = (table0, table1)
+        state.eager_ptrs = (ptrs0, ptrs1)
+        state.registered_tables[ptrs0[state.rank]] = table0
+        state.registered_tables[ptrs1[state.rank]] = table1
+        state.eager_slot = 0
+
+    @staticmethod
+    def _launch_geometry(size_packs: int) -> tuple[int, int]:
+        threads = int(os.getenv("B12X_PCIE_ONESHOT_THREADS", "256"))
+        threads = min(512, max(64, (threads // 32) * 32))
+        block_limit = int(
+            os.getenv("B12X_PCIE_ONESHOT_BLOCK_LIMIT", "8")
+        )
+        if block_limit <= 0 or block_limit > _MAX_BLOCKS:
+            raise ValueError(
+                f"B12X_PCIE_ONESHOT_BLOCK_LIMIT must be in [1, {_MAX_BLOCKS}]"
+            )
+        blocks = max(1, min(block_limit, (size_packs + threads - 1) // threads))
+        return threads, blocks
+
+    @staticmethod
+    def _fused_threads() -> int:
+        threads = int(os.getenv("B12X_PCIE_FUSED_THREADS", "256"))
+        return min(512, max(64, (threads // 32) * 32))
+
+    @classmethod
+    def _fused_launch_config(
+        cls,
+        state: _CuTeOneshotState,
+        inp: torch.Tensor,
+    ) -> tuple[str, bool, bool, int]:
+        pack_elems = 16 // inp.element_size()
+        hidden_packs = int(inp.shape[-1]) // pack_elems
+        rows = inp.numel() // int(inp.shape[-1])
+        threads = cls._fused_threads()
+        override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
+        if override > 0:
+            ctas_per_row = override
+        else:
+            min_ctas = (
+                hidden_packs + threads * _REG_PACKS - 1
+            ) // (threads * _REG_PACKS)
+            ctas_per_row = max(max(1, 3 // rows), min_ctas)
+        ctas_per_row = max(1, min(ctas_per_row, _MAX_BLOCKS // rows))
+        register_normalize = (
+            hidden_packs + ctas_per_row * threads - 1
+        ) // (ctas_per_row * threads) <= _REG_PACKS
+        if state.eager_tables is None:
+            mode = "registered"
+        elif _push_mode_enabled():
+            mode = "stage_push"
+        else:
+            mode = "stage_pull"
+        return mode, ctas_per_row == 1, register_normalize, threads
+
+    @staticmethod
+    def _device_index(device: torch.device) -> int:
+        return (
+            device.index
+            if device.index is not None
+            else torch.cuda.current_device()
+        )
+
+    def prepare_all_reduce(self, handle: int, inp: torch.Tensor) -> None:
+        """Compile/load every graph slot variant without launching a kernel."""
+
+        state = self._state(handle)
+        stage_input = state.eager_tables is not None
+        if not stage_input and int(inp.data_ptr()) not in state.registered_tables:
+            raise RuntimeError("input buffer is not registered")
+        threads, _ = self._launch_geometry(inp.numel() * inp.element_size() // 16)
+        from ._oneshot_cute import get_oneshot_launcher
+
+        device_index = self._device_index(inp.device)
+        variants = ((True, 0), (True, 1)) if stage_input else ((False, 0),)
+        for device_slot_selection, slot_bias in variants:
+            get_oneshot_launcher(
+                _dtype_name(inp.dtype),
+                state.world_size,
+                state.rank,
+                stage_input,
+                device_slot_selection,
+                slot_bias,
+                threads,
+                device_index,
+            )
+
+    def prepare_fused_all_reduce(self, handle: int, inp: torch.Tensor) -> None:
+        """Compile/load fused graph variants without launching a kernel."""
+
+        state = self._state(handle)
+        if state.eager_tables is None and int(inp.data_ptr()) not in state.registered_tables:
+            raise RuntimeError("input buffer is not registered")
+        mode, single_cta, register_normalize, threads = self._fused_launch_config(
+            state, inp
+        )
+        from ._oneshot_cute import get_fused_oneshot_launcher
+
+        device_index = self._device_index(inp.device)
+        variants = (
+            ((True, 0), (True, 1))
+            if state.eager_tables is not None
+            else ((False, 0),)
+        )
+        for device_slot_selection, slot_bias in variants:
+            get_fused_oneshot_launcher(
+                _dtype_name(inp.dtype),
+                state.world_size,
+                state.rank,
+                mode,
+                single_cta,
+                register_normalize,
+                device_slot_selection,
+                slot_bias,
+                threads,
+                device_index,
+            )
+
+    @staticmethod
+    def _select_table(
+        state: _CuTeOneshotState, input_pointer: int
+    ) -> tuple[int, bool]:
+        if state.eager_tables is not None:
+            if state.device_slot_selection:
+                # The two 16-entry tables are adjacent in rank_data.  A
+                # graph-safe kernel selects between them from channel-local
+                # device state without another peer barrier.
+                return state.eager_tables[0], True
+            slot = state.eager_slot % 2
+            state.eager_slot += 1
+            return state.eager_tables[slot], True
+        try:
+            return state.registered_tables[int(input_pointer)], False
+        except KeyError as exc:
+            raise RuntimeError(
+                f"buffer address {int(input_pointer)} is not registered"
+            ) from exc
+
+    def all_reduce(
+        self,
+        handle: int,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        _reg_buffer: int,
+        _reg_buffer_sz_bytes: int,
+    ) -> None:
+        del _reg_buffer, _reg_buffer_sz_bytes
+        state = self._state(handle)
+        capturing = _is_current_stream_capturing(inp.device)
+        size_packs = inp.numel() * inp.element_size() // 16
+        threads, blocks = self._launch_geometry(size_packs)
+        device_index = self._device_index(inp.device)
+        prospective_device_selection = state.device_slot_selection or (
+            capturing and state.eager_tables is not None
+        )
+        prospective_slot_bias = (
+            state.slot_bias
+            if state.device_slot_selection
+            else state.eager_slot & 1
+        )
+        if capturing:
+            from ._oneshot_cute import is_oneshot_launcher_prepared
+
+            if not is_oneshot_launcher_prepared(
+                _dtype_name(inp.dtype),
+                state.world_size,
+                state.rank,
+                state.eager_tables is not None,
+                prospective_device_selection,
+                prospective_slot_bias,
+                threads,
+                device_index,
+            ):
+                raise RuntimeError(
+                    "cold PCIe oneshot CUDA graph capture is not allowed; "
+                    "call prepare_graph_all_reduce() before capture"
+                )
+        if capturing and state.eager_tables is not None and not state.device_slot_selection:
+            # The graph epoch begins at zero.  Bias it to the host slot that
+            # would have been selected for this invocation, then keep both
+            # values fixed in the captured specialization.
+            _enable_device_slot_selection(state, capturing=True)
+        table_address, stage_input = self._select_table(state, inp.data_ptr())
+        from ._oneshot_cute import get_oneshot_launcher
+
+        with torch.cuda.device(inp.device):
+            launcher = get_oneshot_launcher(
+                _dtype_name(inp.dtype),
+                state.world_size,
+                state.rank,
+                stage_input,
+                state.device_slot_selection,
+                state.slot_bias,
+                threads,
+                device_index,
+            )
+            if not state.device_slot_selection and stage_input:
+                # Warm the graph specialization outside capture so replay
+                # never triggers compiler work or allocation.
+                for slot_bias in (0, 1):
+                    get_oneshot_launcher(
+                        _dtype_name(inp.dtype),
+                        state.world_size,
+                        state.rank,
+                        stage_input,
+                        True,
+                        slot_bias,
+                        threads,
+                        device_index,
+                    )
+            launcher(
+                table_address,
+                state.signal_table_address,
+                inp.data_ptr(),
+                out.data_ptr(),
+                size_packs,
+                blocks,
+            )
+
+    def all_reduce_fused_add_rms_norm(
+        self,
+        handle: int,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        residual_out: torch.Tensor,
+        epsilon: float,
+        _reg_buffer: int,
+        _reg_buffer_sz_bytes: int,
+    ) -> None:
+        del _reg_buffer, _reg_buffer_sz_bytes
+        state = self._state(handle)
+        capturing = _is_current_stream_capturing(inp.device)
+        mode, single_cta, register_normalize, threads = self._fused_launch_config(
+            state, inp
+        )
+        device_index = self._device_index(inp.device)
+        prospective_device_selection = state.device_slot_selection or (
+            capturing and state.eager_tables is not None
+        )
+        prospective_slot_bias = (
+            state.slot_bias
+            if state.device_slot_selection
+            else state.eager_slot & 1
+        )
+        if capturing:
+            from ._oneshot_cute import is_fused_oneshot_launcher_prepared
+
+            if not is_fused_oneshot_launcher_prepared(
+                _dtype_name(inp.dtype),
+                state.world_size,
+                state.rank,
+                mode,
+                single_cta,
+                register_normalize,
+                prospective_device_selection,
+                prospective_slot_bias,
+                threads,
+                device_index,
+            ):
+                raise RuntimeError(
+                    "cold fused PCIe oneshot CUDA graph capture is not allowed; "
+                    "call prepare_graph_fused_add_rms_norm() before capture"
+                )
+        _enable_device_slot_selection(state, capturing=capturing)
+        table_address, staged = self._select_table(state, inp.data_ptr())
+        pack_elems = 16 // inp.element_size()
+        hidden_packs = int(inp.shape[-1]) // pack_elems
+        rows = inp.numel() // int(inp.shape[-1])
+        if rows > _MAX_BLOCKS:
+            raise ValueError(
+                f"fused allreduce RMSNorm supports at most {_MAX_BLOCKS} rows"
+            )
+        _, single_cta_check, _, _ = self._fused_launch_config(state, inp)
+        # Recover the CTA count from the already-derived single-CTA/config
+        # formula without changing the launch contract.
+        override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
+        if override > 0:
+            ctas_per_row = override
+        else:
+            min_ctas = (
+                hidden_packs + threads * _REG_PACKS - 1
+            ) // (threads * _REG_PACKS)
+            ctas_per_row = max(max(1, 3 // rows), min_ctas)
+        ctas_per_row = max(1, min(ctas_per_row, _MAX_BLOCKS // rows))
+        assert single_cta_check == (ctas_per_row == 1)
+        blocks = rows * ctas_per_row
+
+        from ._oneshot_cute import get_fused_oneshot_launcher
+
+        with torch.cuda.device(inp.device):
+            launcher = get_fused_oneshot_launcher(
+                _dtype_name(inp.dtype),
+                state.world_size,
+                state.rank,
+                mode,
+                single_cta,
+                register_normalize,
+                state.device_slot_selection,
+                state.slot_bias,
+                threads,
+                device_index,
+            )
+            if not state.device_slot_selection and staged:
+                for slot_bias in (0, 1):
+                    get_fused_oneshot_launcher(
+                        _dtype_name(inp.dtype),
+                        state.world_size,
+                        state.rank,
+                        mode,
+                        single_cta,
+                        register_normalize,
+                        True,
+                        slot_bias,
+                        threads,
+                        device_index,
+                    )
+            launcher(
+                table_address,
+                state.signal_table_address,
+                inp.data_ptr(),
+                residual.data_ptr(),
+                weight.data_ptr(),
+                out.data_ptr(),
+                residual_out.data_ptr(),
+                hidden_packs,
+                rows,
+                ctas_per_row,
+                inp.numel() // pack_elems,
+                float(epsilon),
+                blocks,
+            )
+
+    def get_graph_buffer_ipc_meta(self, handle: int):
+        self._state(handle)
+        # The native implementation never populated its graph-unregistered
+        # list. Eager IPC buffers are the supported graph path in both runtimes.
+        return [], []
+
+    def register_graph_buffers(self, handle: int, handles, offsets) -> None:
+        self._state(handle)
+        if any(handles) or any(offsets):
+            raise RuntimeError(
+                "CuTe oneshot graph capture requires eager IPC buffers"
+            )
+
+    def dispose(self, handle: int) -> None:
+        with self._lock:
+            self._states.pop(int(handle), None)
 
 
 def _compute_crossover_size(
@@ -1982,6 +2490,44 @@ class PCIeOneshotAllReduce:
         self._ext.register_buffer(self._ptr, list(ptrs))
         self._registered_input_ptrs[local_ptr] = ptrs
 
+    def prepare_graph_all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        peer_input_ptrs: Optional[Sequence[int]] = None,
+    ) -> None:
+        """Compile and load plain all-reduce graph variants before capture."""
+
+        if _is_current_stream_capturing(self.device):
+            raise RuntimeError(
+                "prepare_graph_all_reduce() must be called before CUDA graph capture"
+            )
+        if not self.should_allreduce(inp):
+            raise ValueError("input does not satisfy PCIe oneshot requirements")
+        self._check_stream()
+        self._prepare_input(inp, peer_input_ptrs)
+        self._ext.prepare_all_reduce(self._ptr, inp)
+
+    def prepare_graph_fused_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+        *,
+        peer_input_ptrs: Optional[Sequence[int]] = None,
+    ) -> None:
+        """Compile and load fused graph variants before capture."""
+
+        if _is_current_stream_capturing(self.device):
+            raise RuntimeError(
+                "prepare_graph_fused_add_rms_norm() must be called before CUDA graph capture"
+            )
+        if not self.should_allreduce(inp) or inp.ndim == 0:
+            raise ValueError("input does not satisfy fused PCIe oneshot requirements")
+        if inp.shape[-1] * inp.element_size() % 16 != 0:
+            raise ValueError("the last input dimension must occupy a multiple of 16 bytes")
+        self._check_stream()
+        self._prepare_input(inp, peer_input_ptrs)
+        self._ext.prepare_fused_all_reduce(self._ptr, inp)
+
     def _prepare_input(
         self,
         inp: torch.Tensor,
@@ -2031,6 +2577,20 @@ class PCIeOneshotAllReduce:
         out: Optional[torch.Tensor] = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
+        with _device_guard(self.device):
+            return self._all_reduce_on_device(
+                inp,
+                out=out,
+                peer_input_ptrs=peer_input_ptrs,
+            )
+
+    def _all_reduce_on_device(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        peer_input_ptrs: Optional[Sequence[int]] = None,
+    ) -> torch.Tensor:
         if self._closed:
             raise RuntimeError("runtime is closed")
         if inp.device != self.device:
@@ -2070,6 +2630,30 @@ class PCIeOneshotAllReduce:
         peer_input_ptrs: Optional[Sequence[int]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """All-reduce ``inp``, add ``residual``, and apply RMSNorm."""
+
+        with _device_guard(self.device):
+            return self._all_reduce_fused_on_device(
+                inp,
+                residual,
+                weight,
+                epsilon,
+                out=out,
+                residual_out=residual_out,
+                peer_input_ptrs=peer_input_ptrs,
+            )
+
+    def _all_reduce_fused_on_device(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+        *,
+        out: Optional[torch.Tensor] = None,
+        residual_out: Optional[torch.Tensor] = None,
+        peer_input_ptrs: Optional[Sequence[int]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Guarded implementation for the fused public entry point."""
 
         if self._closed:
             raise RuntimeError("runtime is closed")
@@ -2809,6 +3393,19 @@ class PCIeOneshotAllReducePool:
     ) -> PCIeOneshotAllReduce:
         if self._closed:
             raise RuntimeError("pool is closed")
+        capturing = _is_current_stream_capturing(self.device)
+        if capturing:
+            if not self._capture_channel_stack:
+                raise RuntimeError(
+                    "PCIe oneshot CUDA graph capture requires an active "
+                    "pool.capture() graph-owned channel context"
+                )
+            channel = self._capture_channel_stack[-1]
+            if not self.single_channel:
+                stream_key = _current_stream_key(self.device, stream)
+                channel_key = 0 if stream_key is None else int(stream_key)
+                self._channels[channel_key] = channel
+            return channel
         if self.single_channel:
             channel = self._channels.get(0)
             if channel is not None:
@@ -2868,35 +3465,71 @@ class PCIeOneshotAllReducePool:
         channel = self._channels.get(channel_key)
         if channel is not None:
             return channel
-        if _is_current_stream_capturing(self.device):
-            # Piecewise / inductor CUDA graphs (MTP, spec-decode) capture on a
-            # torch-owned stream that we cannot pre-register before capture
-            # starts. Reuse the channel selected by the enclosing vLLM graph
-            # capture, not an arbitrary channel from another graph manager.
-            # Target and draft graph managers can replay independently; if
-            # their nested captures share signal/staging buffers, they race.
-            if self._capture_channel_stack:
-                channel = self._capture_channel_stack[-1]
-                self._channels[channel_key] = channel
-                return channel
-            # Preserve compatibility for callers that enter CUDA capture
-            # without the pool.capture() context. They must already have a
-            # channel because allocating CUDA IPC storage mid-capture is
-            # illegal.
-            if self._channels:
-                channel = next(iter(self._channels.values()))
-                self._channels[channel_key] = channel
-                return channel
-            raise RuntimeError(
-                "PCIe oneshot pool has no channel to reuse during CUDA graph "
-                "capture; perform an eager all-reduce (or call for_stream) "
-                "before capture starts"
-            )
         channel = self._new_channel(stream_key)
         self._channels[channel_key] = channel
         return channel
 
+    def prepare_graph_all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        peer_input_ptrs: Optional[Sequence[int]] = None,
+        stream: object = None,
+    ) -> None:
+        """Prepare the plain graph specialization on an eager channel."""
+
+        with _device_guard(self.device):
+            channel = self.for_stream(stream)
+            if stream is not None and self.device.type == "cuda":
+                with torch.cuda.stream(stream):
+                    channel.prepare_graph_all_reduce(
+                        inp, peer_input_ptrs=peer_input_ptrs
+                    )
+            else:
+                channel.prepare_graph_all_reduce(
+                    inp, peer_input_ptrs=peer_input_ptrs
+                )
+
+    def prepare_graph_fused_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+        *,
+        peer_input_ptrs: Optional[Sequence[int]] = None,
+        stream: object = None,
+    ) -> None:
+        """Prepare the fused graph specialization on an eager channel."""
+
+        with _device_guard(self.device):
+            channel = self.for_stream(stream)
+            if stream is not None and self.device.type == "cuda":
+                with torch.cuda.stream(stream):
+                    channel.prepare_graph_fused_add_rms_norm(
+                        inp, peer_input_ptrs=peer_input_ptrs
+                    )
+            else:
+                channel.prepare_graph_fused_add_rms_norm(
+                    inp, peer_input_ptrs=peer_input_ptrs
+                )
+
     def all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        peer_input_ptrs: Optional[Sequence[int]] = None,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> torch.Tensor:
+        with _device_guard(self.device):
+            return self._all_reduce_on_device(
+                inp,
+                out=out,
+                peer_input_ptrs=peer_input_ptrs,
+                stream=stream,
+                channel_id=channel_id,
+            )
+
+    def _all_reduce_on_device(
         self,
         inp: torch.Tensor,
         *,
@@ -2912,6 +3545,32 @@ class PCIeOneshotAllReducePool:
         return channel.all_reduce(inp, out=out, peer_input_ptrs=peer_input_ptrs)
 
     def all_reduce_fused_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+        *,
+        out: Optional[torch.Tensor] = None,
+        residual_out: Optional[torch.Tensor] = None,
+        peer_input_ptrs: Optional[Sequence[int]] = None,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with _device_guard(self.device):
+            return self._all_reduce_fused_on_device(
+                inp,
+                residual,
+                weight,
+                epsilon,
+                out=out,
+                residual_out=residual_out,
+                peer_input_ptrs=peer_input_ptrs,
+                stream=stream,
+                channel_id=channel_id,
+            )
+
+    def _all_reduce_fused_on_device(
         self,
         inp: torch.Tensor,
         residual: torch.Tensor,

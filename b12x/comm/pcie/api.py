@@ -42,8 +42,8 @@ from .pcie_twoshot import (
 def is_supported(device=None) -> bool:
     """True on SM120/SM121 with >= 2 visible CUDA devices.
 
-    Raw CUDA op: unlike the CuTe-DSL ops, this does not require
-    nvidia-cutlass-dsl (it needs nvcc at runtime instead; see META.notes).
+    Device kernels are compiled from the Python CuTe DSL sources on first use;
+    no repo-authored C++/CUDA extension or runtime nvcc build is involved.
     """
     import torch
 

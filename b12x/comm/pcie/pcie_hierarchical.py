@@ -12,22 +12,23 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager, suppress
-from functools import lru_cache
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from torch.utils.cpp_extension import load
 
 from ._cuda_ipc import CudaRTLibrary
-from .pcie_oneshot import _broadcast_gather_object
+from ._hierarchical_cute import get_hierarchical_launcher
+from .pcie_oneshot import _broadcast_gather_object, _normalize_device
 
 
 ISLAND_SIZE = 4
 SUPPORTED_WORLD_SIZES = (12, 16)
 SUPPORTED_BLOCKS = (1, 2, 4, 8, 16, 32)
+_ALIGNMENT = 256
+_HEADER_BYTES = 69_888
 
 
 def _wait_nanosleep_cycles_from_env() -> int:
@@ -86,30 +87,37 @@ def _vectorized_bf16x2_max_elements_from_env() -> int:
     return max_elements
 
 
-@lru_cache(maxsize=1)
-def _load_extension():
-    source = Path(__file__).with_name("pcie_hierarchical.cu")
-    verbose = os.getenv("B12X_PCIE_HIERARCHICAL_VERBOSE_BUILD", "0") == "1"
-    wait_cycles = _wait_nanosleep_cycles_from_env()
-    threads = _threads_from_env()
-    vectorized_bf16x2 = _vectorized_bf16x2_from_env()
-    vectorized_bf16x2_max_elements = _vectorized_bf16x2_max_elements_from_env()
-    return load(
-        name=(
-            f"b12x_pcie_hierarchical_ext_t{threads}_ns{wait_cycles}_"
-            f"v{int(vectorized_bf16x2)}_vm{vectorized_bf16x2_max_elements}"
-        ),
-        sources=[str(source)],
-        extra_cuda_cflags=[
-            "-O3",
-            f"-DB12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES={wait_cycles}",
-            f"-DB12X_PCIE_HIERARCHICAL_THREADS={threads}",
-            f"-DB12X_PCIE_HIERARCHICAL_BF16X2={int(vectorized_bf16x2)}",
-            "-DB12X_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS="
-            f"{vectorized_bf16x2_max_elements}",
-        ],
-        extra_ldflags=["-lcuda"],
-        verbose=verbose,
+def _align_up(value: int, alignment: int = _ALIGNMENT) -> int:
+    return (int(value) + alignment - 1) // alignment * alignment
+
+
+@dataclass(frozen=True)
+class _SlabLayout:
+    stage: tuple[int, int]
+    partial: tuple[int, int]
+    final: tuple[int, int]
+    bytes: int
+
+
+def _make_layout(max_elements: int) -> _SlabLayout:
+    """Mirror the native header/stage/partial/final layout exactly."""
+
+    if max_elements <= 0:
+        raise ValueError("max_elements must be positive")
+    stages: list[int] = []
+    partials: list[int] = []
+    finals: list[int] = []
+    offset = _align_up(_HEADER_BYTES)
+    for _ in range(2):
+        stages.append(offset)
+        partials.append(_align_up(stages[-1] + int(max_elements) * 2))
+        finals.append(_align_up(partials[-1] + int(max_elements) * 4))
+        offset = _align_up(finals[-1] + int(max_elements) * 2)
+    return _SlabLayout(
+        stage=(stages[0], stages[1]),
+        partial=(partials[0], partials[1]),
+        final=(finals[0], finals[1]),
+        bytes=offset,
     )
 
 
@@ -173,14 +181,11 @@ class PCIeHierarchicalAllReduce:
         blocks: Optional[int] = None,
         ext_module=None,
     ) -> None:
+        del ext_module  # native-extension injection is obsolete
         self.group = exchange_group
         self.rank = dist.get_rank(group=exchange_group)
         self.world_size = dist.get_world_size(group=exchange_group)
-        self.device = (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(f"cuda:{device}" if isinstance(device, int) else device)
-        )
+        self.device = _normalize_device(device)
         if self.world_size not in SUPPORTED_WORLD_SIZES:
             raise ValueError(
                 "hierarchical all-reduce requires "
@@ -199,15 +204,22 @@ class PCIeHierarchicalAllReduce:
             self.double_buffered,
             self.deferred_consumption,
         ) = _buffer_modes_from_env()
-        self._ext = ext_module or _load_extension()
+        self.wait_nanosleep_cycles = _wait_nanosleep_cycles_from_env()
+        self.threads = _threads_from_env()
+        self.vectorized_bf16x2 = _vectorized_bf16x2_from_env()
+        self.vectorized_bf16x2_max_elements = (
+            _vectorized_bf16x2_max_elements_from_env()
+        )
+        self._layout = _make_layout(self.max_elements)
         self._ipc = CudaRTLibrary()
         self._ipc.cudaSetDevice(self.device.index or 0)
-        self._runtime = 0
+        self._slab_ptrs: tuple[int, ...] = ()
+        self._launchers: dict[bool, object] = {}
         self._local_ptr = 0
         self._remote_ptrs: list[int] = []
         self._closed = False
 
-        slab_bytes = int(self._ext.slab_bytes(self.max_elements))
+        slab_bytes = self._layout.bytes
         peer_ptrs = [0] * self.world_size
         try:
             self._local_ptr = self._ipc.cudaMalloc(slab_bytes)
@@ -219,13 +231,26 @@ class PCIeHierarchicalAllReduce:
                 remote_ptr = self._ipc.cudaIpcOpenMemHandleBytes(handles[peer])
                 peer_ptrs[peer] = remote_ptr
                 self._remote_ptrs.append(remote_ptr)
-            self._runtime = int(
-                self._ext.init_runtime(
-                    peer_ptrs,
-                    self.rank,
-                    self.max_elements,
-                )
-            )
+            # Keep the fixed slab addresses in the captured kernel node's
+            # parameter bank.  The CuTe rank specialization references only
+            # this rank's mapped peers, so unmapped entries remain zero and
+            # are dead at compile time.
+            self._slab_ptrs = tuple(peer_ptrs)
+            # Resolve and load the only reachable specialization before the
+            # channel is exposed.  A first call made under CUDA graph capture
+            # must never compile or load a module.
+            with torch.cuda.device(self.device):
+                for vectorized in ({False, True} if self.vectorized_bf16x2 else {False}):
+                    self._launchers[vectorized] = get_hierarchical_launcher(
+                        self.world_size,
+                        self.rank,
+                        self.device.index or 0,
+                        threads=(112 if vectorized else self.threads),
+                        wait_nanosleep_cycles=self.wait_nanosleep_cycles,
+                        double_buffered=self.double_buffered,
+                        deferred_consumption=self.deferred_consumption,
+                        vectorized_bf16x2=vectorized,
+                    )
         except Exception:
             for ptr in self._remote_ptrs:
                 with suppress(Exception):
@@ -288,14 +313,28 @@ class PCIeHierarchicalAllReduce:
             raise ValueError(
                 "output must match input shape/dtype/device and be contiguous"
             )
-        self._ext.all_reduce_bf16(
-            self._runtime,
-            inp,
-            out,
-            selected_blocks,
-            self.double_buffered,
-            self.deferred_consumption,
+        assert len(self._slab_ptrs) == self.world_size
+        vectorized = (
+            self.vectorized_bf16x2
+            and inp.numel() <= self.vectorized_bf16x2_max_elements
+            and inp.data_ptr() % 4 == 0
+            and out.data_ptr() % 4 == 0
         )
+        launcher = self._launchers[vectorized]
+        with torch.cuda.device(self.device):
+            launcher(
+                self._slab_ptrs,
+                inp.data_ptr(),
+                out.data_ptr(),
+                self._layout.stage[0],
+                self._layout.partial[0],
+                self._layout.final[0],
+                self._layout.stage[1],
+                self._layout.partial[1],
+                self._layout.final[1],
+                inp.numel(),
+                selected_blocks,
+            )
         return out
 
     def for_stream(self, stream: object = None) -> "PCIeHierarchicalAllReduce":
@@ -324,9 +363,8 @@ class PCIeHierarchicalAllReduce:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         dist.barrier(group=self.group)
-        if self._runtime:
-            self._ext.destroy_runtime(self._runtime)
-            self._runtime = 0
+        self._slab_ptrs = ()
+        self._launchers.clear()
         for ptr in self._remote_ptrs:
             self._ipc.cudaIpcCloseMemHandle(ptr)
         self._remote_ptrs.clear()
@@ -343,6 +381,6 @@ class PCIeHierarchicalAllReduce:
         self.close()
 
     def __del__(self) -> None:
-        if not getattr(self, "_closed", True):
-            with suppress(Exception):
-                self.close()
+        # Never enter distributed barriers from asymmetric interpreter
+        # teardown. Explicit/context-manager close owns coordinated release.
+        return None

@@ -20,6 +20,8 @@ from b12x.comm.pcie.pcie_oneshot import (
     _require_full_grid_residency,
     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
     _RETAINED_FAILED_IPC_EXPORTS,
+    _CuTeOneshotState,
+    _enable_device_slot_selection,
     parse_pcie_oneshot_max_size,
 )
 
@@ -226,6 +228,28 @@ def test_compute_crossover_size_runs_fine_sweep():
     assert 48 * 1024 in seen_sizes
     assert 56 * 1024 in seen_sizes
     assert results[-1].size_bytes == 64 * 1024
+
+
+def test_graph_slot_bias_preserves_the_next_host_slot() -> None:
+    state = _CuTeOneshotState(
+        rank=0,
+        world_size=2,
+        signal_ptrs=(100, 200),
+        rank_data=torch.empty(256, dtype=torch.uint8),
+        signal_table_address=0,
+        next_table_offset=128,
+        registered_tables={},
+        eager_tables=(300, 400),
+        eager_slot=5,
+    )
+
+    _enable_device_slot_selection(state, capturing=True)
+
+    assert state.device_slot_selection
+    assert state.slot_bias == 1
+    state.eager_slot = 8
+    _enable_device_slot_selection(state, capturing=True)
+    assert state.slot_bias == 1
 
 
 def test_register_buffer_is_idempotent_for_same_mapping():
@@ -1790,12 +1814,13 @@ def test_pool_requires_precreated_channel_during_capture(monkeypatch):
         lambda device: True,
     )
 
-    with pytest.raises(RuntimeError, match="before capture starts"):
+    with pytest.raises(RuntimeError, match=r"pool\.capture\(\)"):
         pool.for_stream()
 
     pool._channels[7] = _make_runtime(eager=True)
 
-    assert pool.for_stream() is pool._channels[7]
+    with pytest.raises(RuntimeError, match=r"pool\.capture\(\)"):
+        pool.for_stream()
 
 
 def test_nested_capture_reuses_its_outer_channel(monkeypatch):

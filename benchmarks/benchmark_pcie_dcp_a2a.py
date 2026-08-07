@@ -296,6 +296,17 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             for operation in ("reduce", "gather", "pair")
         )
         pool.prepare_channels(channel_ids)
+        preparation_channel_id = channel_ids[0]
+        for threads in sorted({threads for threads, _ in launches}):
+            pool.prepare_graph_lse_reduce_scatter(
+                dtype=dtype,
+                threads=threads,
+                channel_id=preparation_channel_id,
+            )
+            pool.prepare_graph_all_gather_heads(
+                threads=threads,
+                channel_id=preparation_channel_id,
+            )
         if rank == 0:
             print(f"# metadata={json.dumps(_metadata(world_size, query_dtype_name))}")
             print(

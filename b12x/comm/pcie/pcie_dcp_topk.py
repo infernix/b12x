@@ -2,31 +2,32 @@
 
 from __future__ import annotations
 
-import os
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from functools import lru_cache
-from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Optional, Sequence
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from torch.utils.cpp_extension import load
 
 from ._cuda_ipc import CudaRTLibrary
+from ._dcp_cute_common import signal_bytes
 from .pcie_oneshot import (
     IPC_SLAB_ALIGNMENT,
     PCIeOneshotAllReduce,
     _align_up,
     _coordinated_close_channels,
     _current_stream_key,
+    _device_guard,
+    _is_current_stream_capturing,
     _normalize_device,
     _OwnedSharedBuffer,
 )
 
 
 SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8)
+_MAX_BLOCKS = 128
+_SIGNAL_BYTES = signal_bytes(_MAX_BLOCKS)
 
 
 def _validate_launch_config(*, threads: int, block_limit: int, world_size: int) -> None:
@@ -77,16 +78,36 @@ def _candidate_staging_layout(
     )
 
 
-@lru_cache(maxsize=1)
-def _load_extension():
-    source = Path(__file__).with_name("pcie_dcp_topk.cu")
-    verbose = os.getenv("B12X_PCIE_DCP_TOPK_VERBOSE_BUILD", "0") == "1"
-    return load(
-        name="b12x_pcie_dcp_topk_ext",
-        sources=[str(source)],
-        extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
-        extra_ldflags=["-lcuda"],
-        verbose=verbose,
+def _tensor_from_cuda_pointer(
+    pointer: int,
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Create a non-owning tensor view over channel-owned CUDA storage."""
+    numel = 1
+    for extent in shape:
+        numel *= int(extent)
+    nbytes = numel * torch.empty((), dtype=dtype).element_size()
+    storage = torch._C._construct_storage_from_data_pointer(
+        int(pointer),
+        device,
+        int(nbytes),
+    )
+    stride: list[int] = []
+    running = 1
+    for extent in reversed(shape):
+        stride.append(running)
+        running *= int(extent)
+    return torch._C._construct_CUDA_Tensor_From_Storage_And_Metadata(
+        {
+            "dtype": dtype,
+            "size": tuple(int(value) for value in shape),
+            "stride": tuple(reversed(stride)),
+            "storage_offset": 0,
+        },
+        storage,
     )
 
 
@@ -121,23 +142,25 @@ class _IPCChannel:
         exchange_group: Optional[ProcessGroup],
         ipc: Optional[CudaRTLibrary],
         owned_buffers: Optional[Sequence[_OwnedSharedBuffer]],
-        ext_module: Any,
         stream_affine: bool,
     ) -> None:
         self.device = _normalize_device(device)
         self.exchange_group = exchange_group
         self._ipc = ipc
         self._owned_buffers = list(owned_buffers or ())
-        self._ext = ext_module
         self._stream_affine = bool(stream_affine)
         self._owner_stream_key: Optional[int] = None
         self._closed = False
         self._ipc_imports_closed = False
         self._ipc_exports_freed = False
-        self._ptr = 0
 
     def _bind_stream(self) -> None:
         if not self._stream_affine or self.device.type != "cuda":
+            return
+        # CUDA graph capture substitutes a torch-owned capture stream handle
+        # for the logical stream.  Keep affinity bound to the caller's eager
+        # stream so the same channel can be warmed, captured, and reused.
+        if _is_current_stream_capturing(self.device):
             return
         stream_key = _current_stream_key(self.device)
         if stream_key is None:
@@ -150,17 +173,10 @@ class _IPCChannel:
                 "per CUDA stream"
             )
 
-    def _dispose(self) -> None:
-        raise NotImplementedError
-
     def _close_ipc_imports(self) -> None:
         if self._ipc_imports_closed:
             return
         self._closed = True
-        if self._ptr:
-            with suppress(Exception):
-                self._dispose()
-            self._ptr = 0
         if self._ipc is not None:
             for shared in self._owned_buffers:
                 for ptr in shared.remote_ptrs:
@@ -172,6 +188,7 @@ class _IPCChannel:
         if self._ipc_exports_freed:
             return
         self._close_ipc_imports()
+        self._candidate_views = ()
         if self._ipc is not None:
             for shared in self._owned_buffers:
                 with suppress(Exception):
@@ -180,8 +197,11 @@ class _IPCChannel:
         self._ipc_exports_freed = True
 
     def close(self) -> None:
-        self._close_ipc_imports()
-        self._free_ipc_exports()
+        _coordinated_close_channels(
+            (self,),
+            exchange_group=self.exchange_group,
+            device=self.device,
+        )
 
     def close_coordinated(self) -> None:
         """Collectively close peer mappings before freeing exported storage."""
@@ -192,12 +212,17 @@ class _IPCChannel:
         )
 
     def __del__(self) -> None:
-        with suppress(Exception):
-            self.close()
+        return None
 
 
 class PCIeDCPTopKOwnerExchange(_IPCChannel):
-    """Write exact DCP candidates directly into each row owner's IPC slab."""
+    """Write exact DCP candidates directly into each row owner's IPC slab.
+
+    CUDA graphs captured from one instance share a device epoch and must be
+    replayed serially. Use a separate instance for independently replayable
+    graphs. Returned candidate views alias channel-owned staging and their
+    consumers must be enqueued on the capture stream before the next replay.
+    """
 
     def __init__(
         self,
@@ -216,6 +241,8 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         ext_module=None,
         stream_affine: bool = True,
     ) -> None:
+        # Compatibility-only: native extension injection was removed.
+        del ext_module
         if world_size not in SUPPORTED_WORLD_SIZES:
             raise ValueError(f"unsupported world size {world_size}")
         if not 0 <= rank < world_size:
@@ -229,13 +256,11 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         ):
             raise ValueError("signal and staging pointers must match world size")
 
-        ext = ext_module or _load_extension()
         self._init_channel(
             device=device,
             exchange_group=exchange_group,
             ipc=ipc,
             owned_buffers=owned_buffers,
-            ext_module=ext,
             stream_affine=stream_affine,
         )
         self.rank = int(rank)
@@ -243,14 +268,40 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         self.max_rows = int(max_rows)
         self.max_owner_rows = self.max_rows // self.world_size
         self.topk = int(topk)
-        self._ptr = self._ext.init_dcp_topk_owner_exchange(
-            list(signal_ptrs),
-            list(staging0_ptrs),
-            list(staging1_ptrs),
-            self.max_rows,
-            self.topk,
-            self.rank,
+        self._signal_ptrs = tuple(int(ptr) for ptr in signal_ptrs)
+        self._staging_ptrs = (
+            tuple(int(ptr) for ptr in staging0_ptrs),
+            tuple(int(ptr) for ptr in staging1_ptrs),
         )
+        self._candidate_plane_elems = (
+            self.max_owner_rows * self.world_size * self.topk
+        )
+        self._next_slot = 0
+        self._graph_slot: Optional[int] = None
+        self._capture_context_depth = 0
+        candidate_shape = (self.max_owner_rows, self.world_size * self.topk)
+        if self.device.type == "cuda":
+            self._candidate_views = tuple(
+                (
+                    _tensor_from_cuda_pointer(
+                        slot_ptrs[self.rank],
+                        candidate_shape,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    _tensor_from_cuda_pointer(
+                        slot_ptrs[self.rank] + self._candidate_plane_elems * 4,
+                        candidate_shape,
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                )
+                for slot_ptrs in self._staging_ptrs
+            )
+        else:
+            # CPU construction remains useful for validation-only unit tests;
+            # no launch is possible until tests install synthetic views.
+            self._candidate_views = ()
 
     @classmethod
     def from_exchange_group(
@@ -270,9 +321,8 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
             raise ValueError("DCP top-k owner exchange requires a CUDA device")
         ipc = CudaRTLibrary()
         ipc.cudaSetDevice(device_obj.index or 0)
-        ext = ext_module or _load_extension()
         layout = _candidate_staging_layout(
-            signal_bytes=int(ext.meta_size()),
+            signal_bytes=_SIGNAL_BYTES,
             max_rows=max_rows,
             topk=topk,
             world_size=world_size,
@@ -302,7 +352,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
                 exchange_group=exchange_group,
                 ipc=ipc,
                 owned_buffers=owned,
-                ext_module=ext,
+                ext_module=ext_module,
                 stream_affine=stream_affine,
             )
         except Exception:
@@ -340,10 +390,68 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         """Stage exact candidates and return channel-owned owner views.
 
         Consumers must be enqueued on this channel's stream before another
-        stage call. CUDA graph replay deliberately reuses its capture-time
-        staging address; a group barrier at the next replay prevents peer
-        writers from racing a slower rank's prior same-stream consumer.
+        stage call or graph replay; the returned tensors are aliasing views,
+        not snapshots. Capture must run inside :meth:`capture`. On first CUDA
+        graph capture the channel permanently pins one staging slot. Every
+        later launch begins with the native peer barrier, so no rank can
+        overwrite that slot until every rank's prior same-stream consumer has
+        retired. The barrier stays inside the one transport kernel and
+        therefore adds no CUDA graph node.
         """
+        with _device_guard(self.device):
+            return self._stage_candidates_on_device(
+                local_indices,
+                local_scores,
+                threads=threads,
+                block_limit=block_limit,
+            )
+
+    def prepare_graph(self, *, threads: int = 512) -> None:
+        """Compile the exact graph launcher before capture begins."""
+        if self._closed:
+            raise RuntimeError("PCIeDCPTopKOwnerExchange is closed")
+        if _is_current_stream_capturing(self.device):
+            raise RuntimeError("prepare_graph() must be called before CUDA graph capture")
+        _validate_launch_config(
+            threads=int(threads),
+            block_limit=1,
+            world_size=self.world_size,
+        )
+        with _device_guard(self.device):
+            self._bind_stream()
+            from ._dcp_topk_cute import prepare_topk_stage
+
+            prepare_topk_stage(
+                self.world_size,
+                self.rank,
+                self.topk,
+                int(threads),
+            )
+
+    @contextmanager
+    def capture(self, *, threads: int = 512):
+        """Own one serialized graph capture without adding graph nodes.
+
+        Enter this context before ``torch.cuda.graph``. Graphs captured from
+        this instance share one epoch and must never replay concurrently.
+        """
+        if self._capture_context_depth:
+            raise RuntimeError("overlapping DCP top-k capture contexts are not allowed")
+        self.prepare_graph(threads=threads)
+        self._capture_context_depth = 1
+        try:
+            yield self
+        finally:
+            self._capture_context_depth = 0
+
+    def _stage_candidates_on_device(
+        self,
+        local_indices: torch.Tensor,
+        local_scores: torch.Tensor,
+        *,
+        threads: int,
+        block_limit: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self._closed:
             raise RuntimeError("PCIeDCPTopKOwnerExchange is closed")
         if local_indices.device != self.device or local_scores.device != self.device:
@@ -369,13 +477,51 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
             world_size=self.world_size,
         )
         self._bind_stream()
-        candidate_indices, candidate_scores = self._ext.stage_owner_candidates(
-            self._ptr,
+        owner_packs = (rows // self.world_size) * (self.topk // 4)
+        blocks = max(1, min(int(block_limit), (owner_packs + threads - 1) // threads))
+        capturing = _is_current_stream_capturing(self.device)
+        if capturing:
+            if self._capture_context_depth <= 0:
+                raise RuntimeError(
+                    "DCP top-k CUDA graph capture requires an active "
+                    "owner.capture() context"
+                )
+            from ._dcp_topk_cute import is_topk_stage_prepared
+
+            if not is_topk_stage_prepared(
+                self.world_size,
+                self.rank,
+                self.topk,
+                int(threads),
+            ):
+                raise RuntimeError(
+                    "cold DCP top-k CUDA graph capture is not allowed; "
+                    "enter owner.capture() before torch.cuda.graph()"
+                )
+        if capturing and self._graph_slot is None:
+            self._graph_slot = self._next_slot
+        if self._graph_slot is not None:
+            slot = self._graph_slot
+            wait_for_prior_consumer = True
+        else:
+            slot = self._next_slot
+            self._next_slot ^= 1
+            wait_for_prior_consumer = False
+        self._launch_stage(
             local_indices,
             local_scores,
-            int(threads),
-            int(block_limit),
+            slot=slot,
+            rows=rows,
+            threads=int(threads),
+            blocks=blocks,
+            wait_for_prior_consumer=wait_for_prior_consumer,
         )
+        candidate_views = self._candidate_views[slot] if self._candidate_views else ()
+        if not candidate_views:
+            raise RuntimeError("DCP top-k candidate views require a CUDA device")
+        owner_rows = rows // self.world_size
+        candidate_indices = candidate_views[0][:owner_rows]
+        candidate_scores = candidate_views[1][:owner_rows]
         expected = (rows // self.world_size, self.world_size * self.topk)
         _validate_candidate_view(
             candidate_indices,
@@ -393,8 +539,34 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         )
         return candidate_indices, candidate_scores
 
-    def _dispose(self) -> None:
-        self._ext.dispose_owner_exchange(self._ptr)
+    def _launch_stage(
+        self,
+        local_indices: torch.Tensor,
+        local_scores: torch.Tensor,
+        *,
+        slot: int,
+        rows: int,
+        threads: int,
+        blocks: int,
+        wait_for_prior_consumer: bool,
+    ) -> None:
+        from ._dcp_topk_cute import stage_owner_candidates
+
+        with torch.cuda.device(self.device):
+            stage_owner_candidates(
+                world_size=self.world_size,
+                rank=self.rank,
+                topk=self.topk,
+                threads=threads,
+                local_indices_ptr=local_indices.data_ptr(),
+                local_scores_ptr=local_scores.data_ptr(),
+                candidate_ptrs=self._staging_ptrs[slot],
+                signal_ptrs=self._signal_ptrs,
+                rows=rows,
+                candidate_plane_elems=self._candidate_plane_elems,
+                blocks=blocks,
+                wait_for_prior_consumer=wait_for_prior_consumer,
+            )
 
 
 def _validate_candidate_view(
@@ -411,7 +583,7 @@ def _validate_candidate_view(
         or tensor.device != device
         or not tensor.is_contiguous()
     ):
-        raise RuntimeError(f"extension returned an invalid candidate {label} view")
+        raise RuntimeError(f"channel returned an invalid candidate {label} view")
 
 
 def _release_failed_allocations(

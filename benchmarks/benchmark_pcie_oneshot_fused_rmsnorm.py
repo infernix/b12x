@@ -101,6 +101,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             fused_residual = torch.randn(shape, dtype=dtype, device=device)
             fused_out = torch.empty_like(fused_in)
             fused_residual_out = torch.empty_like(fused_in)
+            pool.prepare_graph_fused_add_rms_norm(fused_in)
             fused_graph = _capture(
                 lambda: pool.all_reduce_fused_add_rms_norm(
                     fused_in,
@@ -116,6 +117,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             bare_in = torch.randn(shape, dtype=dtype, device=device) * 0.01
             bare_residual = torch.randn(shape, dtype=dtype, device=device)
             bare_out = torch.empty_like(bare_in)
+            pool.prepare_graph_all_reduce(bare_in)
 
             def bare_then_rms() -> None:
                 pool.all_reduce(bare_in, out=bare_out)
