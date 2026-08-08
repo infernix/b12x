@@ -5,7 +5,8 @@ The FP4 track uses the Nemotron 3 Super shared-expert down projection. The
 MXFP8 tracks use the per-rank dense-linear shapes from the cached DeepSeek V4
 Flash DSpark checkpoint at TP=2, excluding routed experts. End-to-end MXFP8
 includes activation quantization and compares only b12x with DeepGEMM; weight
-quantization remains setup work.
+quantization remains setup work. Regular block FP8 uses Qwen linear shapes and
+compares compact FP32 K128 scales with FlashInfer groupwise GEMM.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from b12x.gemm._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 
 from flashinfer import mxfp8_quantize
-from flashinfer.gemm import mm_fp4, mm_mxfp8
+from flashinfer.gemm import gemm_fp8_nt_groupwise, mm_fp4, mm_mxfp8
 from flashinfer.tllm_enums import SfLayout
 
 
@@ -69,17 +70,40 @@ FP8_GEMM_SPECS = [
     ),
 ]
 
+FP8_BLOCK_GEMM_SPECS = [
+    # (name, K, N, note)
+    (
+        "Qwen gate/up",
+        5120,
+        17408,
+        "per-token K128 activations and N128xK128 checkpoint weights",
+    ),
+    (
+        "Qwen down",
+        17408,
+        5120,
+        "per-token K128 activations and N128xK128 checkpoint weights",
+    ),
+]
+
 
 def gemm_specs_for_mode(mode: str):
-    return FP4_GEMM_SPECS if mode == "fp4" else FP8_GEMM_SPECS
+    if mode == "fp4":
+        return FP4_GEMM_SPECS
+    if mode == "fp8-block":
+        return FP8_BLOCK_GEMM_SPECS
+    return FP8_GEMM_SPECS
 
 FP4_BATCH_SIZES = [2, 4, 8]
 FP8_BATCH_SIZES = [1, 2, 4, 8, 4096]
+FP8_BLOCK_BATCH_SIZES = [1, 2, 4, 8, 16, 128, 512, 4096]
 REFERENCE_BACKEND = "cutlass"
 FP4_REFERENCE_LABEL = "FlashInfer CUTLASS FP4"
 FP8_REFERENCE_LABEL = "FlashInfer CUTLASS MXFP8"
+FP8_BLOCK_REFERENCE_LABEL = "FlashInfer CUTLASS FP8 groupwise"
 DEEPGEMM_E2E_REFERENCE_LABEL = "DeepGEMM fp8_gemm_nt e2e"
 COSINE_THRESHOLD = 0.999999
+BLOCK_FP8_COSINE_THRESHOLD = 0.9999
 DEEPGEMM_COSINE_THRESHOLD = 0.999
 
 
@@ -582,6 +606,112 @@ def bench_one_fp8_e2e(
     )
 
 
+def bench_one_fp8_block(
+    M: int,
+    N: int,
+    K: int,
+    *,
+    warmup: int,
+    iters: int,
+    check: bool,
+    l2_flush: Callable[[], None] | None,
+):
+    """Benchmark compact FP32 K128 block scales against FlashInfer groupwise."""
+    if N % 128 or K % 128:
+        raise BenchmarkAbort("fp8-block requires N and K divisible by 128")
+
+    torch.manual_seed(42)
+    a = (torch.randn(M, K, device="cuda", dtype=torch.bfloat16) / 4).to(
+        torch.float8_e4m3fn
+    )
+    b = (torch.randn(N, K, device="cuda", dtype=torch.bfloat16) / 4).to(
+        torch.float8_e4m3fn
+    )
+    a_scale = (torch.rand(M, K // 128, device="cuda") * 0.01 + 0.005).contiguous()
+    b_scale = (
+        torch.rand(N // 128, K // 128, device="cuda") * 0.01 + 0.005
+    ).contiguous()
+    b12x_out = torch.empty(
+        (M, N, 1), device="cuda", dtype=torch.bfloat16
+    )
+    reference_out = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+
+    def b12x_launch():
+        dense_gemm(
+            (a.view(M, K, 1), a_scale),
+            (b.view(N, K, 1), b_scale),
+            ab_dtype="float8_e4m3fn",
+            sf_dtype="float32",
+            c_dtype="bfloat16",
+            sf_vec_size=128,
+            block_fp8=True,
+            expected_m=M,
+            out=b12x_out,
+        )
+
+    def reference_launch():
+        gemm_fp8_nt_groupwise(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            scale_major_mode="K",
+            scale_granularity_mnk=(1, 128, 128),
+            out=reference_out,
+            out_dtype=torch.bfloat16,
+            backend=REFERENCE_BACKEND,
+        )
+
+    results = {}
+    try:
+        b12x_replay = capture_graph_replay(b12x_launch)
+        results["b12x_replay"] = b12x_replay
+        results["b12x_out"] = b12x_out
+        results["b12x"] = bench_events(
+            b12x_replay,
+            warmup=warmup,
+            iters=iters,
+            l2_flush=l2_flush,
+        )
+    except Exception as exc:
+        results["b12x"] = None
+        print(f"      b12x FAILED: {exc}")
+
+    try:
+        reference_replay = capture_graph_replay(reference_launch)
+        results["ref_replay"] = reference_replay
+        results["ref_out"] = reference_out
+        results[FP8_BLOCK_REFERENCE_LABEL] = bench_events(
+            reference_replay,
+            warmup=warmup,
+            iters=iters,
+            l2_flush=l2_flush,
+        )
+    except Exception as exc:
+        results[FP8_BLOCK_REFERENCE_LABEL] = None
+        print(f"      {FP8_BLOCK_REFERENCE_LABEL} FAILED: {exc}")
+
+    if check:
+        if (
+            results.get("b12x_replay") is None
+            or results.get("ref_replay") is None
+        ):
+            raise BenchmarkAbort(
+                "correctness check requires both b12x and reference replays"
+            )
+        results["b12x_replay"]()
+        results["ref_replay"]()
+        torch.cuda.synchronize()
+        check_outputs(
+            results["b12x_out"][:, :, 0],
+            results["ref_out"],
+            label=FP8_BLOCK_REFERENCE_LABEL,
+            cosine_threshold=BLOCK_FP8_COSINE_THRESHOLD,
+        )
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=20)
@@ -592,8 +722,9 @@ def main():
         nargs="+",
         default=None,
         help=(
-            "M values to benchmark. Defaults to 2/4/8 for FP4 and "
-            "1/2/4/8/4096 for FP8."
+            "M values to benchmark. Defaults to 2/4/8 for FP4, "
+            "1/2/4/8/4096 for MXFP8, and a decode-to-prefill sweep for "
+            "regular block FP8."
         ),
     )
     parser.add_argument("--n", type=int, default=None, help="Override output width N.")
@@ -605,11 +736,11 @@ def main():
     )
     parser.add_argument(
         "--dtype",
-        choices=("fp4", "fp8", "fp8-e2e", "all"),
+        choices=("fp4", "fp8", "fp8-block", "fp8-e2e", "all"),
         default="fp4",
         help=(
-            "Benchmark NVFP4, prequantized MXFP8, end-to-end MXFP8 including "
-            "BF16 input quantization, or all three."
+            "Benchmark NVFP4, prequantized MXFP8, regular K128 block FP8, "
+            "end-to-end MXFP8 including BF16 input quantization, or all modes."
         ),
     )
     parser.add_argument(
@@ -663,18 +794,25 @@ def main():
         benchmark_modes = (
             ("fp4", FP4_REFERENCE_LABEL, bench_one_fp4),
             ("fp8", FP8_REFERENCE_LABEL, bench_one_fp8),
+            ("fp8-block", FP8_BLOCK_REFERENCE_LABEL, bench_one_fp8_block),
             ("fp8-e2e", None, bench_one_fp8_e2e),
         )
     elif args.dtype == "fp4":
         benchmark_modes = (("fp4", FP4_REFERENCE_LABEL, bench_one_fp4),)
     elif args.dtype == "fp8":
         benchmark_modes = (("fp8", FP8_REFERENCE_LABEL, bench_one_fp8),)
+    elif args.dtype == "fp8-block":
+        benchmark_modes = (
+            ("fp8-block", FP8_BLOCK_REFERENCE_LABEL, bench_one_fp8_block),
+        )
     else:
         benchmark_modes = (("fp8-e2e", None, bench_one_fp8_e2e),)
     if args.batch_sizes is not None:
         batch_sizes = args.batch_sizes
     elif args.dtype == "fp4":
         batch_sizes = FP4_BATCH_SIZES
+    elif args.dtype == "fp8-block":
+        batch_sizes = FP8_BLOCK_BATCH_SIZES
     else:
         batch_sizes = FP8_BATCH_SIZES
 
@@ -684,15 +822,25 @@ def main():
         print("NVIDIA Nemotron 3 Super shared-expert down-proj")
     elif args.dtype in ("fp8", "fp8-e2e"):
         print("DeepSeek V4 Flash DSpark TP=2 q_b projection")
+    elif args.dtype == "fp8-block":
+        print("Qwen regular block-FP8 linear projections")
     else:
-        print("FP4: Nemotron shared down; MXFP8: DSV4-DSpark TP=2 q_b")
+        print(
+            "FP4: Nemotron shared down; MXFP8: DSV4-DSpark TP=2 q_b; "
+            "block FP8: Qwen linears"
+        )
     print("Timing mode: CUDA graph replay")
     if args.flush_l2:
         print(f"L2 flush: on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)")
     else:
         print("L2 flush: off")
     if args.check:
-        if args.dtype != "fp8-e2e":
+        if args.dtype == "fp8-block":
+            print(
+                "FlashInfer correctness check: on "
+                f"(cos >= {BLOCK_FP8_COSINE_THRESHOLD:.6f})"
+            )
+        elif args.dtype != "fp8-e2e":
             print(
                 "FlashInfer correctness check: on "
                 f"(cos >= {COSINE_THRESHOLD:.6f})"

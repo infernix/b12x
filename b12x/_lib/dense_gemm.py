@@ -630,7 +630,7 @@ class DenseGemmKernel:
         mxfp6_fmt_b: Optional[str] = None,
         b_packed: bool = False,
         plain_fp8: bool = False,
-        fused_quant_bf16: Optional[bool] = None,
+        block_fp8: bool = False,
     ):
         # When set, A/B operands are MX codes carried in Float8E4M3FN
         # byte-containers: the whole kernel runs the MXFP8 smem/TMA/ldmatrix
@@ -645,12 +645,20 @@ class DenseGemmKernel:
             raise ValueError("mxfp6_fmt_a and mxfp6_fmt_b must both be set or both None")
         self.mxfp6_fmt_a = mxfp6_fmt_a
         self.mxfp6_fmt_b = mxfp6_fmt_b
-        self.plain_fp8 = bool(plain_fp8)
+        self.block_fp8 = bool(block_fp8)
+        self.plain_fp8 = bool(plain_fp8 or block_fp8)
         if self.plain_fp8:
             assert mxfp6_fmt_a is None
             assert not b_packed
             assert not fused_quant_a
             assert not quantize_c
+        if self.block_fp8:
+            assert sf_vec_size == 128
+            assert (tile_k or 128) == 128
+            assert load_path == "tma"
+            assert not swap_ab
+            assert not sfb_k_reuse
+            assert not b_tile_major
         if mxfp6_fmt_a is not None:
             # Upstream mainloop variants not wired for the FP6 byte-container
             # path; fail loudly instead of silently miscomputing.
@@ -841,11 +849,14 @@ class DenseGemmKernel:
         self.mma_register_requirement = 232
 
     def _setup_attributes(self):
+        mma_sf_dtype = (
+            cutlass.Float8E8M0FNU if self.block_fp8 else self.sf_dtype
+        )
         if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
             mma_op = cute.nvgpu.warp.MmaMXF8Op(
                 self.a_dtype,
                 self.acc_dtype,
-                self.sf_dtype,
+                mma_sf_dtype,
             )
         elif cutlass.const_expr(
             self.a_dtype == cutlass.Float6E3M2FN
@@ -868,7 +879,7 @@ class DenseGemmKernel:
         atom_layout = cute.make_layout(atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.mma_tile_shape_mnk,
-            self.sf_vec_size,
+            32 if self.block_fp8 else self.sf_vec_size,
             cutlass.const_expr(
                 self.a_dtype == cutlass.Float8E4M3FN
                 or self.a_dtype == cutlass.Float6E3M2FN
@@ -892,18 +903,22 @@ class DenseGemmKernel:
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
 
         # Compute the smem size of SFA/SFB
-        sfa_smem_layout_per_stage = sm120_make_smem_layout_sfa(
-            self.tiled_mma,
-            self.tile_shape_mnk,
-            self.sf_vec_size,
-            1,
-        )
-        sfb_smem_layout_per_stage = sm120_make_smem_layout_sfb(
-            self.tiled_mma,
-            self.tile_shape_mnk,
-            self.sf_vec_size,
-            1,
-        )
+        if self.block_fp8:
+            sfa_smem_layout_per_stage = cute.make_layout((1, 1))
+            sfb_smem_layout_per_stage = cute.make_layout((1, 1))
+        else:
+            sfa_smem_layout_per_stage = sm120_make_smem_layout_sfa(
+                self.tiled_mma,
+                self.tile_shape_mnk,
+                self.sf_vec_size,
+                1,
+            )
+            sfb_smem_layout_per_stage = sm120_make_smem_layout_sfb(
+                self.tiled_mma,
+                self.tile_shape_mnk,
+                self.sf_vec_size,
+                1,
+            )
 
         # MX-FP6 operands use Float8E4M3FN byte containers in global and
         # shared memory. The explicit format is therefore the reliable policy
@@ -980,6 +995,7 @@ class DenseGemmKernel:
             self.epi_stage,
             self.sf_vec_size,
             self.tiled_mma,
+            self.block_fp8,
         )
 
         # Plain (non-swizzled) k-major staging layout for the 3:4-packed B
@@ -1069,30 +1085,35 @@ class DenseGemmKernel:
 
         self._setup_attributes()
 
-        # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
-        self.sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            a.shape, self.sf_vec_size
-        )
-        sfa_tensor = cute.make_tensor(sfa.iterator, self.sfa_layout)
-
-        # With packed B the gmem extent is 3K/4 bytes, but scale-factor geometry
-        # follows the LOGICAL K (one UE8M0 per 32 codes), so rebuild the shape.
-        if cutlass.const_expr(self.b_packed):
-            b_logical_shape = (
-                cute.size(b.shape[0]),
-                cute.size(b.shape[1]) * 4 // 3,
-                cute.size(b.shape[2]),
-            )
+        # Regular block-FP8 carries compact FP32 scales directly. Native MX
+        # paths retain the MMA scale-factor atom layout.
+        if cutlass.const_expr(self.block_fp8):
+            sfa_tensor = sfa
+            sfb_tensor = sfb
         else:
-            b_logical_shape = (
-                cute.size(b.shape[0]),
-                cute.size(b.shape[1]),
-                cute.size(b.shape[2]),
+            self.sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
+                a.shape, self.sf_vec_size
             )
-        self.sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            b_logical_shape, self.sf_vec_size
-        )
-        sfb_tensor = cute.make_tensor(sfb.iterator, self.sfb_layout)
+            sfa_tensor = cute.make_tensor(sfa.iterator, self.sfa_layout)
+
+            # With packed B the gmem extent is 3K/4 bytes, but scale-factor
+            # geometry follows the LOGICAL K.
+            if cutlass.const_expr(self.b_packed):
+                b_logical_shape = (
+                    cute.size(b.shape[0]),
+                    cute.size(b.shape[1]) * 4 // 3,
+                    cute.size(b.shape[2]),
+                )
+            else:
+                b_logical_shape = (
+                    cute.size(b.shape[0]),
+                    cute.size(b.shape[1]),
+                    cute.size(b.shape[2]),
+                )
+            self.sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(
+                b_logical_shape, self.sf_vec_size
+            )
+            sfb_tensor = cute.make_tensor(sfb.iterator, self.sfb_layout)
 
         if cutlass.const_expr(self.b_packed):
             # TMA loads the packed tile (tile_n, 3*tile_k/4 bytes) into the
@@ -1122,11 +1143,12 @@ class DenseGemmKernel:
                 (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
                 1,
             )
-        if cutlass.const_expr(self.fused_quant_a):
-            tma_atom_sfa = tma_atom_b
-            tma_tensor_sfa = sfa_tensor
-        elif cutlass.const_expr(
-            self.use_m1_non_tma_sfa or self.manual_bk64_sf or self.direct_sfa_prefix
+        if cutlass.const_expr(
+            self.block_fp8
+            or self.fused_quant_a
+            or self.use_m1_non_tma_sfa
+            or self.manual_bk64_sf
+            or self.direct_sfa_prefix
         ):
             tma_atom_sfa = tma_atom_b
             tma_tensor_sfa = sfa_tensor
@@ -1138,7 +1160,9 @@ class DenseGemmKernel:
                 1,
                 internal_type=cutlass.Int16,
             )
-        if cutlass.const_expr(self.manual_bk64_sf or self.direct_sfb_representative):
+        if cutlass.const_expr(
+            self.block_fp8 or self.manual_bk64_sf or self.direct_sfb_representative
+        ):
             tma_atom_sfb = tma_atom_b
             tma_tensor_sfb = sfb_tensor
         else:
@@ -1286,6 +1310,42 @@ class DenseGemmKernel:
         flat = cute.group_modes(cute.flatten(fragment), 0, cute.rank(fragment))
         for idx in cutlass.range_constexpr(cute.size(flat)):
             flat[idx] = scale
+
+    @cute.jit
+    def _accumulate_block_fp8_stage(
+        self,
+        accumulators: cute.Tensor,
+        stage_accumulators: cute.Tensor,
+        coord_mn: cute.Tensor,
+        sfa: cute.Tensor,
+        sfb: cute.Tensor,
+        tile_coord_mnl,
+        k_tile_global: Int32,
+    ) -> None:
+        accum_mn = _reshape_acc_to_mn(accumulators)
+        stage_accum_mn = _reshape_acc_to_mn(stage_accumulators)
+        scale_n = (
+            tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])
+        ) // Int32(128)
+        scale_b = cutlass.Float32(
+            sfb[(scale_n, k_tile_global, tile_coord_mnl[2])]
+        )
+        for acc_m in cutlass.range_constexpr(cute.size(accum_mn.shape[0])):
+            coord = coord_mn[acc_m, 0]
+            m_coord = (
+                tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0]) + coord[0]
+            )
+            scale_a = cutlass.Float32(0.0)
+            if m_coord < Int32(sfa.shape[0]):
+                scale_a = cutlass.Float32(
+                    sfa[(m_coord, k_tile_global, tile_coord_mnl[2])]
+                )
+            scale_ab = scale_a * scale_b
+            for acc_n in cutlass.range_constexpr(cute.size(accum_mn.shape[1])):
+                accum_mn[acc_m, acc_n] += (
+                    stage_accum_mn[acc_m, acc_n] * scale_ab
+                )
+                stage_accum_mn[acc_m, acc_n] = 0.0
 
     @cute.jit
     def _make_cpasync_tiled_copy(
@@ -1455,6 +1515,7 @@ class DenseGemmKernel:
                 cpasync.prefetch_descriptor(tma_atom_b)
             if cutlass.const_expr(
                 self.load_path == "tma"
+                and not self.block_fp8
                 and not self.use_m1_non_tma_sfa
                 and not self.fused_quant_a
                 and not self.manual_bk64_sf
@@ -1463,6 +1524,7 @@ class DenseGemmKernel:
                 cpasync.prefetch_descriptor(tma_atom_sfa)
             if cutlass.const_expr(
                 self.load_path == "tma"
+                and not self.block_fp8
                 and not self.manual_bk64_sf
                 and not self.direct_sfb_representative
             ):
@@ -1487,7 +1549,11 @@ class DenseGemmKernel:
             )
         else:
             b_tma_smem_layout = b_smem_layout
-        if cutlass.const_expr(self.fused_quant_a):
+        if cutlass.const_expr(self.block_fp8):
+            tma_copy_bytes = cute.size_in_bytes(
+                self.a_dtype, a_smem_layout
+            ) + cute.size_in_bytes(self.b_dtype, b_tma_smem_layout)
+        elif cutlass.const_expr(self.fused_quant_a):
             tma_copy_bytes = cute.size_in_bytes(
                 self.b_dtype, b_tma_smem_layout
             ) + cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
@@ -1612,7 +1678,11 @@ class DenseGemmKernel:
                 cute.slice_(self.tile_shape_mnk, (0, None, None)),
                 (None, None, None),
             )
-        if cutlass.const_expr(not self.use_m1_non_tma_sfa and not self.fused_quant_a):
+        if cutlass.const_expr(
+            not self.block_fp8
+            and not self.use_m1_non_tma_sfa
+            and not self.fused_quant_a
+        ):
             gSFA_mkl = cute.local_tile(
                 mSFA_mkl,
                 self.sfa_tile_shape_mk,
@@ -1693,6 +1763,7 @@ class DenseGemmKernel:
         # TMA partitions for SFA
         if cutlass.const_expr(
             self.load_path == "tma"
+            and not self.block_fp8
             and not self.use_m1_non_tma_sfa
             and not self.fused_quant_a
             and not self.manual_bk64_sf
@@ -1711,6 +1782,7 @@ class DenseGemmKernel:
         # TMA partitions for SFB
         if cutlass.const_expr(
             self.load_path == "tma"
+            and not self.block_fp8
             and not self.manual_bk64_sf
             and not self.direct_sfb_representative
         ):
@@ -1787,7 +1859,9 @@ class DenseGemmKernel:
 
         tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
         tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
-        if cutlass.const_expr(self.swap_ab):
+        if cutlass.const_expr(self.block_fp8):
+            tCgC = thr_mma.partition_C(gC_mnl)
+        elif cutlass.const_expr(self.swap_ab):
             tCrSFA_full = self._partition_fragment_SFA(
                 sSFB[None, None, 0], thr_mma, tidx
             )
@@ -1808,6 +1882,12 @@ class DenseGemmKernel:
             tCgC = thr_mma.partition_C(gC_mnl)
         acc_shape = tCgC.shape[:3]
         accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+        if cutlass.const_expr(self.block_fp8):
+            stage_accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+            c_identity = cute.make_identity_tensor(
+                cute.slice_(self.tile_shape_mnk, (None, None, 0))
+            )
+            coord_mn = _reshape_acc_to_mn(thr_mma.partition_C(c_identity))
 
         # Cluster/thread sync
         if cute.size(self.cluster_shape_mnk) > 1:
@@ -1885,26 +1965,27 @@ class DenseGemmKernel:
             smem_tiled_copy_A = cute.make_tiled_copy_A(atom_copy_ldmatrix_A, tiled_mma)
             smem_tiled_copy_B = cute.make_tiled_copy_B(atom_copy_ldmatrix_B, tiled_mma)
 
-            atom_copy_ldmatrix_SF = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                self.sf_dtype,
-            )
-            smem_tiled_copy_SFA = cute.make_tiled_copy(
-                atom_copy_ldmatrix_SF,
-                self._get_layoutSFA_TV(tiled_mma),
-                (
-                    cute.size(tiled_mma.permutation_mnk[0]),
-                    cute.size(tiled_mma.permutation_mnk[2]),
-                ),
-            )
-            smem_tiled_copy_SFB = cute.make_tiled_copy(
-                atom_copy_ldmatrix_SF,
-                self._get_layoutSFB_TV(tiled_mma),
-                (
-                    cute.size(tiled_mma.permutation_mnk[1]),
-                    cute.size(tiled_mma.permutation_mnk[2]),
-                ),
-            )
+            if cutlass.const_expr(not self.block_fp8):
+                atom_copy_ldmatrix_SF = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(),
+                    self.sf_dtype,
+                )
+                smem_tiled_copy_SFA = cute.make_tiled_copy(
+                    atom_copy_ldmatrix_SF,
+                    self._get_layoutSFA_TV(tiled_mma),
+                    (
+                        cute.size(tiled_mma.permutation_mnk[0]),
+                        cute.size(tiled_mma.permutation_mnk[2]),
+                    ),
+                )
+                smem_tiled_copy_SFB = cute.make_tiled_copy(
+                    atom_copy_ldmatrix_SF,
+                    self._get_layoutSFB_TV(tiled_mma),
+                    (
+                        cute.size(tiled_mma.permutation_mnk[1]),
+                        cute.size(tiled_mma.permutation_mnk[2]),
+                    ),
+                )
 
             thr_copy_ldmatrix_A = smem_tiled_copy_A.get_slice(tidx)
             thr_copy_ldmatrix_B = smem_tiled_copy_B.get_slice(tidx)
@@ -1917,23 +1998,26 @@ class DenseGemmKernel:
             )
             tCrB_copy_view = thr_copy_ldmatrix_B.retile(tCrB)
 
-            thr_copy_ldmatrix_SFA = smem_tiled_copy_SFA.get_slice(tidx)
-            thr_copy_ldmatrix_SFB = smem_tiled_copy_SFB.get_slice(tidx)
-            tCsSFA_copy_view_full = thr_copy_ldmatrix_SFA.partition_S(
-                sSFB if cutlass.const_expr(self.swap_ab) else sSFA
-            )
-            tCrSFA_copy_view_full = thr_copy_ldmatrix_SFA.retile(tCrSFA_full)
-            tCsSFB_copy_view_full = thr_copy_ldmatrix_SFB.partition_S(
-                sSFA if cutlass.const_expr(self.swap_ab) else sSFB
-            )
-            tCrSFB_copy_view_full = thr_copy_ldmatrix_SFB.retile(tCrSFB_full)
+            if cutlass.const_expr(not self.block_fp8):
+                thr_copy_ldmatrix_SFA = smem_tiled_copy_SFA.get_slice(tidx)
+                thr_copy_ldmatrix_SFB = smem_tiled_copy_SFB.get_slice(tidx)
+                tCsSFA_copy_view_full = thr_copy_ldmatrix_SFA.partition_S(
+                    sSFB if cutlass.const_expr(self.swap_ab) else sSFA
+                )
+                tCrSFA_copy_view_full = thr_copy_ldmatrix_SFA.retile(tCrSFA_full)
+                tCsSFB_copy_view_full = thr_copy_ldmatrix_SFB.partition_S(
+                    sSFA if cutlass.const_expr(self.swap_ab) else sSFB
+                )
+                tCrSFB_copy_view_full = thr_copy_ldmatrix_SFB.retile(tCrSFB_full)
 
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
                 gC_mnl_slice = gC_mnl[(None, None, *tile_coord_mnl)]
                 sfa_tile_offset = tile_coord_mnl[0] % self.sfa_tiles_per_block
                 sfb_tile_offset = tile_coord_mnl[1] % self.sfb_tiles_per_block
-                if cutlass.const_expr(self.swap_ab):
+                if cutlass.const_expr(self.block_fp8):
+                    pass
+                elif cutlass.const_expr(self.swap_ab):
                     if cutlass.const_expr(self.sfb_tiles_per_block > 1):
                         sSFB_tile = cute.local_tile(
                             sSFB,
@@ -2012,6 +2096,8 @@ class DenseGemmKernel:
                         tCrSFB_tile = tCrSFB_full
                         tCrSFB_tile_copy_view = tCrSFB_copy_view_full
                 accumulators.fill(0.0)
+                if cutlass.const_expr(self.block_fp8):
+                    stage_accumulators.fill(0.0)
 
                 # Pipelined MAINLOOP
                 mainloop_consumer_state.reset_count()
@@ -2045,12 +2131,13 @@ class DenseGemmKernel:
                         packed_b_lookahead_state.advance()
                 tCsA_p = tCsA_copy_view[None, None, None, mainloop_consumer_state.index]
                 tCsB_p = tCsB_copy_view[None, None, None, mainloop_consumer_state.index]
-                tCsSFA_p = tCsSFA_tile_copy_view[
-                    None, None, None, mainloop_consumer_state.index
-                ]
-                tCsSFB_p = tCsSFB_tile_copy_view[
-                    None, None, None, mainloop_consumer_state.index
-                ]
+                if cutlass.const_expr(not self.block_fp8):
+                    tCsSFA_p = tCsSFA_tile_copy_view[
+                        None, None, None, mainloop_consumer_state.index
+                    ]
+                    tCsSFB_p = tCsSFB_tile_copy_view[
+                        None, None, None, mainloop_consumer_state.index
+                    ]
                 cute.copy(
                     smem_tiled_copy_A,
                     tCsA_p[None, None, 0],
@@ -2062,42 +2149,46 @@ class DenseGemmKernel:
                     tCrB_copy_view[None, None, 0],
                 )
 
-                tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
-                tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
-                tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_tile_copy_view)
-                tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_tile_copy_view)
+                if cutlass.const_expr(not self.block_fp8):
+                    tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
+                    tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                    tCrSFA_copy_view_filtered = cute.filter_zeros(
+                        tCrSFA_tile_copy_view
+                    )
+                    tCrSFB_copy_view_filtered = cute.filter_zeros(
+                        tCrSFB_tile_copy_view
+                    )
 
-                # Whole-stage SF copy: scale bytes for all k blocks of the
-                # acquired stage load in one bulk copy (per-k_block SF reloads
-                # dominated the LDS/issue budget at prefill M).
-                cute.copy(
-                    smem_tiled_copy_SFA,
-                    tCsSFA_p_filtered,
-                    tCrSFA_copy_view_filtered,
-                )
-                if cutlass.const_expr(self.direct_sfb_representative):
-                    self._fill_replicated_sfb_fragment(
-                        tCrSFB_tile[None, None, 0],
-                        sSFB[
-                            (
-                                Int32(0),
-                                Int32(0),
-                                mainloop_consumer_state.index,
-                            )
-                        ],
-                    )
-                elif cutlass.const_expr(self.sfb_k_reuse):
+                    # Whole-stage SF copy: scale bytes for all k blocks of the
+                    # acquired stage load in one bulk copy.
                     cute.copy(
-                        smem_tiled_copy_SFB,
-                        tCsSFB_p_filtered[None, None, 0],
-                        tCrSFB_copy_view_filtered[None, None, 0],
+                        smem_tiled_copy_SFA,
+                        tCsSFA_p_filtered,
+                        tCrSFA_copy_view_filtered,
                     )
-                else:
-                    cute.copy(
-                        smem_tiled_copy_SFB,
-                        tCsSFB_p_filtered,
-                        tCrSFB_copy_view_filtered,
-                    )
+                    if cutlass.const_expr(self.direct_sfb_representative):
+                        self._fill_replicated_sfb_fragment(
+                            tCrSFB_tile[None, None, 0],
+                            sSFB[
+                                (
+                                    Int32(0),
+                                    Int32(0),
+                                    mainloop_consumer_state.index,
+                                )
+                            ],
+                        )
+                    elif cutlass.const_expr(self.sfb_k_reuse):
+                        cute.copy(
+                            smem_tiled_copy_SFB,
+                            tCsSFB_p_filtered[None, None, 0],
+                            tCrSFB_copy_view_filtered[None, None, 0],
+                        )
+                    else:
+                        cute.copy(
+                            smem_tiled_copy_SFB,
+                            tCsSFB_p_filtered,
+                            tCrSFB_copy_view_filtered,
+                        )
 
                 for k_tile in range(
                     0,
@@ -2155,12 +2246,13 @@ class DenseGemmKernel:
                             tCsB_p = tCsB_copy_view[
                                 None, None, None, mainloop_consumer_state.index
                             ]
-                            tCsSFA_p = tCsSFA_tile_copy_view[
-                                None, None, None, mainloop_consumer_state.index
-                            ]
-                            tCsSFB_p = tCsSFB_tile_copy_view[
-                                None, None, None, mainloop_consumer_state.index
-                            ]
+                            if cutlass.const_expr(not self.block_fp8):
+                                tCsSFA_p = tCsSFA_tile_copy_view[
+                                    None, None, None, mainloop_consumer_state.index
+                                ]
+                                tCsSFB_p = tCsSFB_tile_copy_view[
+                                    None, None, None, mainloop_consumer_state.index
+                                ]
                             mainloop_pipeline.consumer_wait(
                                 mainloop_consumer_state, peek_ab_full_status
                             )
@@ -2197,7 +2289,11 @@ class DenseGemmKernel:
                             for _nt in range(self.num_n_tiles):
                                 if cutlass.const_expr(self.plain_fp8):
                                     _emit_plain_fp8_dense_mma_k_block(
-                                        accumulators,
+                                        (
+                                            stage_accumulators
+                                            if cutlass.const_expr(self.block_fp8)
+                                            else accumulators
+                                        ),
                                         tCrA,
                                         tCrB,
                                         _mt,
@@ -2239,6 +2335,17 @@ class DenseGemmKernel:
                                         tCrB[None, _nt, k_block_idx],
                                         accumulators[None, _mt, _nt],
                                     )
+                        if cutlass.const_expr(self.block_fp8):
+                            if k_block_idx == num_k_blocks - 1:
+                                self._accumulate_block_fp8_stage(
+                                    accumulators,
+                                    stage_accumulators,
+                                    coord_mn,
+                                    directSFA_mkl,
+                                    directSFB_nkl,
+                                    tile_coord_mnl,
+                                    k_tile_start + Int32(k_tile),
+                                )
                         if cutlass.const_expr(self.b_packed):
                             # Deferred expansion barrier (see expansion call
                             # above): must precede the k_block_next=0 ldmatrix
@@ -2257,45 +2364,47 @@ class DenseGemmKernel:
                         )
 
                         if k_block_idx == num_k_blocks - 1:
-                            # New stage acquired above: bulk-load its whole SF
-                            # tile once. The current tile's k_block MMAs have
-                            # all consumed their SF registers by this point.
-                            tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
-                            tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
-                            tCrSFA_copy_view_filtered = cute.filter_zeros(
-                                tCrSFA_tile_copy_view
-                            )
-                            tCrSFB_copy_view_filtered = cute.filter_zeros(
-                                tCrSFB_tile_copy_view
-                            )
-                            cute.copy(
-                                smem_tiled_copy_SFA,
-                                tCsSFA_p_filtered,
-                                tCrSFA_copy_view_filtered,
-                            )
-                            if cutlass.const_expr(self.direct_sfb_representative):
-                                self._fill_replicated_sfb_fragment(
-                                    tCrSFB_tile[None, None, 0],
-                                    sSFB[
-                                        (
-                                            Int32(0),
-                                            Int32(0),
-                                            mainloop_consumer_state.index,
-                                        )
-                                    ],
+                            if cutlass.const_expr(not self.block_fp8):
+                                # New stage acquired above: bulk-load its whole
+                                # SF tile once.
+                                tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
+                                tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                                tCrSFA_copy_view_filtered = cute.filter_zeros(
+                                    tCrSFA_tile_copy_view
                                 )
-                            elif cutlass.const_expr(self.sfb_k_reuse):
+                                tCrSFB_copy_view_filtered = cute.filter_zeros(
+                                    tCrSFB_tile_copy_view
+                                )
                                 cute.copy(
-                                    smem_tiled_copy_SFB,
-                                    tCsSFB_p_filtered[None, None, 0],
-                                    tCrSFB_copy_view_filtered[None, None, 0],
+                                    smem_tiled_copy_SFA,
+                                    tCsSFA_p_filtered,
+                                    tCrSFA_copy_view_filtered,
                                 )
-                            else:
-                                cute.copy(
-                                    smem_tiled_copy_SFB,
-                                    tCsSFB_p_filtered,
-                                    tCrSFB_copy_view_filtered,
-                                )
+                                if cutlass.const_expr(
+                                    self.direct_sfb_representative
+                                ):
+                                    self._fill_replicated_sfb_fragment(
+                                        tCrSFB_tile[None, None, 0],
+                                        sSFB[
+                                            (
+                                                Int32(0),
+                                                Int32(0),
+                                                mainloop_consumer_state.index,
+                                            )
+                                        ],
+                                    )
+                                elif cutlass.const_expr(self.sfb_k_reuse):
+                                    cute.copy(
+                                        smem_tiled_copy_SFB,
+                                        tCsSFB_p_filtered[None, None, 0],
+                                        tCrSFB_copy_view_filtered[None, None, 0],
+                                    )
+                                else:
+                                    cute.copy(
+                                        smem_tiled_copy_SFB,
+                                        tCsSFB_p_filtered,
+                                        tCrSFB_copy_view_filtered,
+                                    )
 
                 # Hoist out last k_tile
                 for k_block_idx in cutlass.range_constexpr(num_k_blocks):
@@ -2325,7 +2434,11 @@ class DenseGemmKernel:
                         for _nt in range(self.num_n_tiles):
                             if cutlass.const_expr(self.plain_fp8):
                                 _emit_plain_fp8_dense_mma_k_block(
-                                    accumulators,
+                                    (
+                                        stage_accumulators
+                                        if cutlass.const_expr(self.block_fp8)
+                                        else accumulators
+                                    ),
                                     tCrA,
                                     tCrB,
                                     _mt,
@@ -2367,6 +2480,17 @@ class DenseGemmKernel:
                                     tCrB[None, _nt, k_block_idx],
                                     accumulators[None, _mt, _nt],
                                 )
+                    if cutlass.const_expr(self.block_fp8):
+                        if k_block_idx == num_k_blocks - 1:
+                            self._accumulate_block_fp8_stage(
+                                accumulators,
+                                stage_accumulators,
+                                coord_mn,
+                                directSFA_mkl,
+                                directSFB_nkl,
+                                tile_coord_mnl,
+                                k_tile_start + Int32(k_tile_iter_cnt - 1),
+                            )
 
                 if cutlass.const_expr(self.swap_ab):
                     acc_mn = _reshape_acc_to_mn(accumulators, transpose=True)
@@ -3046,6 +3170,7 @@ class DenseGemmKernel:
                     tBgB_nkl = tBgB[(None, tile_coord_mnl[1], None, tile_coord_mnl[2])]
                 if cutlass.const_expr(
                     self.load_path == "tma"
+                    and not self.block_fp8
                     and not self.use_m1_non_tma_sfa
                     and not self.fused_quant_a
                     and not self.manual_bk64_sf
@@ -3057,6 +3182,7 @@ class DenseGemmKernel:
                     ]
                 if cutlass.const_expr(
                     self.load_path == "tma"
+                    and not self.block_fp8
                     and not self.manual_bk64_sf
                     and not self.direct_sfb_representative
                 ):
@@ -3139,7 +3265,8 @@ class DenseGemmKernel:
                             tAsA_pipe = tAsA[(None, mainloop_producer_state.index)]
 
                         if cutlass.const_expr(
-                            not self.use_m1_non_tma_sfa
+                            not self.block_fp8
+                            and not self.use_m1_non_tma_sfa
                             and not self.fused_quant_a
                             and not self.manual_bk64_sf
                             and not self.direct_sfa_prefix
@@ -3148,7 +3275,8 @@ class DenseGemmKernel:
                             tAsSFA_pipe = tAsSFA[(None, mainloop_producer_state.index)]
 
                         if cutlass.const_expr(
-                            not self.manual_bk64_sf
+                            not self.block_fp8
+                            and not self.manual_bk64_sf
                             and not self.direct_sfb_representative
                         ):
                             tBgSFB_k = tBgSFB_nkl[(None, k_tile_global)]
@@ -3772,9 +3900,11 @@ class DenseGemmKernel:
                             ),
                         )
 
-                    if cutlass.const_expr(self.load_path == "cpasync"):
-                        pass
-                    elif cutlass.const_expr(self.fused_quant_a):
+                    if cutlass.const_expr(
+                        self.load_path == "cpasync"
+                        or self.block_fp8
+                        or self.fused_quant_a
+                    ):
                         pass
                     elif cutlass.const_expr(self.a_bf16_fused):
                         pass  # scales already written above
@@ -3994,7 +4124,8 @@ class DenseGemmKernel:
                                         ),
                                     )
                         if cutlass.const_expr(
-                            not self.manual_bk64_sf
+                            not self.block_fp8
+                            and not self.manual_bk64_sf
                             and not self.direct_sfb_representative
                         ):
                             cute.copy(
@@ -4132,6 +4263,7 @@ class DenseGemmKernel:
         epi_stage: int,
         sf_vec_size: int,
         tiled_mma,
+        block_fp8: bool = False,
     ) -> tuple:
         a_smem_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
 
@@ -4169,18 +4301,22 @@ class DenseGemmKernel:
             order=(0, 1, 2) if b_is_k_major else (1, 0, 2),
         )
 
-        sfa_smem_layout_staged = sm120_make_smem_layout_sfa(
-            tiled_mma,
-            tile_shape_mnk,
-            sf_vec_size,
-            ab_stage,
-        )
-        sfb_smem_layout_staged = sm120_make_smem_layout_sfb(
-            tiled_mma,
-            tile_shape_mnk,
-            sf_vec_size,
-            ab_stage,
-        )
+        if block_fp8:
+            sfa_smem_layout_staged = cute.make_layout((1, 1, ab_stage))
+            sfb_smem_layout_staged = cute.make_layout((1, 1, ab_stage))
+        else:
+            sfa_smem_layout_staged = sm120_make_smem_layout_sfa(
+                tiled_mma,
+                tile_shape_mnk,
+                sf_vec_size,
+                ab_stage,
+            )
+            sfb_smem_layout_staged = sm120_make_smem_layout_sfb(
+                tiled_mma,
+                tile_shape_mnk,
+                sf_vec_size,
+                ab_stage,
+            )
 
         c_smem_shape = epi_tile
         c_major_mode_size = epi_tile[1] if c_layout.is_n_major_c() else epi_tile[0]
@@ -4292,11 +4428,22 @@ class DenseGemmKernel:
         *,
         load_path: str = "tma",
         swap_ab: bool = False,
+        block_fp8: bool = False,
     ) -> bool:
         # The current target only supports cluster (1,1)
         if cluster_shape_mn != (1, 1):
             return False
         if load_path not in _DENSE_LOAD_PATHS:
+            return False
+        if block_fp8 and (
+            ab_dtype != cutlass.Float8E4M3FN
+            or sf_dtype != cutlass.Float32
+            or sf_vec_size != 128
+            or load_path != "tma"
+            or swap_ab
+            or l != 1
+            or n % 128 != 0
+        ):
             return False
         if swap_ab:
             if l != 1:
@@ -4345,12 +4492,13 @@ class DenseGemmKernel:
         # Current target MMA constraints:
         #   sf_vec_size=16 requires sf_dtype=Float8E4M3FN
         #   sf_vec_size=32 requires sf_dtype=Float8E8M0FNU
-        if sf_vec_size == 16 and sf_dtype != cutlass.Float8E4M3FN:
-            return False
-        if sf_vec_size == 32 and sf_dtype != cutlass.Float8E8M0FNU:
-            return False
-        if ab_dtype == cutlass.Float8E4M3FN and sf_vec_size != 32:
-            return False
+        if not block_fp8:
+            if sf_vec_size == 16 and sf_dtype != cutlass.Float8E4M3FN:
+                return False
+            if sf_vec_size == 32 and sf_dtype != cutlass.Float8E8M0FNU:
+                return False
+            if ab_dtype == cutlass.Float8E4M3FN and sf_vec_size != 32:
+                return False
         if is_mxfp6_ab_dtype(ab_dtype) and sf_vec_size != 32:
             return False
         # Public output is 16-bit; split-K internally uses FP32 partial output.
@@ -4360,7 +4508,9 @@ class DenseGemmKernel:
         if a_major != "k" or b_major != "k":
             return False
         # Alignment: K must be divisible by tile_k
-        if ab_dtype == cutlass.Float8E4M3FN or is_mxfp6_ab_dtype(ab_dtype):
+        if block_fp8:
+            tile_k = 128
+        elif ab_dtype == cutlass.Float8E4M3FN or is_mxfp6_ab_dtype(ab_dtype):
             tile_k = mxfp6_tile_k() if is_mxfp6_ab_dtype(ab_dtype) else 128
         else:
             tile_k = sf_vec_size * 8
@@ -4401,6 +4551,7 @@ class _DenseGemmLaunch:
         direct_m1_wo_a_inputs: bool = False,
         target_occupancy: int = 1,
         plain_fp8: bool = False,
+        block_fp8: bool = False,
     ):
         self._n = n
         self._k = k
@@ -4435,6 +4586,7 @@ class _DenseGemmLaunch:
         self._direct_m1_wo_a_inputs = direct_m1_wo_a_inputs
         self._target_occupancy = target_occupancy
         self._plain_fp8 = bool(plain_fp8)
+        self._block_fp8 = bool(block_fp8)
         if b_tile_major:
             if (n, k, l) == (1024, 4096, 4):
                 self._b_tile_n = 64
@@ -4462,6 +4614,7 @@ class _DenseGemmLaunch:
             c_major,
             load_path=load_path,
             swap_ab=swap_ab,
+            block_fp8=block_fp8,
         ):
             raise TypeError(
                 "dense_gemm launch is unsupported with "
@@ -4600,8 +4753,23 @@ class _DenseGemmLaunch:
             alpha_ptr,
             layout=cute.make_ordered_layout((1,), order=(0,)),
         )
-        sfa_tensor = cute.make_tensor(sfa_ptr, layout=cute.make_layout((1,)))
-        sfb_tensor = cute.make_tensor(sfb_ptr, layout=cute.make_layout((1,)))
+        if cutlass.const_expr(self._block_fp8):
+            sfa_tensor = cute.make_tensor(
+                sfa_ptr,
+                layout=cute.make_ordered_layout(
+                    (m, self._k // 128, self._l), order=(1, 0, 2)
+                ),
+            )
+            sfb_tensor = cute.make_tensor(
+                sfb_ptr,
+                layout=cute.make_ordered_layout(
+                    (self._n // 128, self._k // 128, self._l),
+                    order=(1, 0, 2),
+                ),
+            )
+        else:
+            sfa_tensor = cute.make_tensor(sfa_ptr, layout=cute.make_layout((1,)))
+            sfb_tensor = cute.make_tensor(sfb_ptr, layout=cute.make_layout((1,)))
         policy = self._policy
         DenseGemmKernel(
             sf_vec_size=self._sf_vec_size,
@@ -4631,6 +4799,7 @@ class _DenseGemmLaunch:
             direct_m1_wo_a_inputs=self._direct_m1_wo_a_inputs,
             target_occupancy=self._target_occupancy,
             plain_fp8=self._plain_fp8,
+            block_fp8=self._block_fp8,
         )(
             a_tensor,
             a_tensor,
@@ -5856,6 +6025,7 @@ def _get_compiled_dense_gemm(
     direct_sfa_live16: bool = False,
     direct_m1_wo_a_inputs: bool = False,
     plain_fp8: bool = False,
+    block_fp8: bool = False,
 ) -> Callable:
     def _make_runtime_pointers(
         input_tensors: Optional[List[torch.Tensor]],
@@ -5966,6 +6136,7 @@ def _get_compiled_dense_gemm(
         direct_sfa_live16=direct_sfa_live16,
         direct_m1_wo_a_inputs=direct_m1_wo_a_inputs,
         plain_fp8=plain_fp8,
+        block_fp8=block_fp8,
         target_occupancy=_dense_gemm_target_occupancy(
             n=n,
             k=k,
@@ -6923,7 +7094,7 @@ def dense_gemm(
     x_bf16: Optional[torch.Tensor] = None,
     w_gscale: Optional[torch.Tensor] = None,
     plain_fp8: bool = False,
-    row_scale: Optional[torch.Tensor] = None,
+    block_fp8: bool = False,
 ) -> torch.Tensor:
     """Execute dense block-scaled GEMM for one expert-major batch stack.
 
@@ -6963,11 +7134,9 @@ def dense_gemm(
     SM12x dense pipeline. The scalar ``alpha`` carries the combined activation
     and weight dequantization scale.
 
-    ``row_scale``: optional contiguous ``(M,)`` tensor in the C dtype, applied
-    per output row in the epilogue. It replaces a separate ``out.mul_(v)``
-    launch and reproduces that multiply bit-for-bit, including its second
-    rounding to the C dtype — it is NOT equivalent to folding the same values
-    into ``alpha``. MX-FP6 only.
+    ``block_fp8``: accumulate ordinary E4M3 MMA over each K128 block, then
+    apply compact FP32 activation ``[M,K/128]`` and weight
+    ``[N/128,K/128]`` scales before adding it to the final accumulator.
     """
     a_torch, sfa_torch = lhs
     b_torch, sfb_torch = rhs
@@ -6994,7 +7163,11 @@ def dense_gemm(
         is_mxfp8 = True
         is_mxfp6 = False
         mma_k = 32
-        tile_k = _select_mxfp8_tile_k(m, n, k, expected_m, sm_count)
+        tile_k = (
+            128
+            if block_fp8
+            else _select_mxfp8_tile_k(m, n, k, expected_m, sm_count)
+        )
     elif ab_dtype in ("float6_e3m2fn", "float6_e2m3fn"):
         is_mxfp8 = False
         is_mxfp6 = True
@@ -7014,6 +7187,41 @@ def dense_gemm(
                 raise ValueError(f"unsupported {name}={fmt!r}")
     else:
         raise TypeError(f"dense_gemm unsupported ab_dtype: {ab_dtype}")
+    if block_fp8:
+        plain_fp8 = True
+        expected_sfa_shape = (m, k // 128)
+        expected_sfb_shape = (n // 128, k // 128)
+        if (
+            sf_dtype != "float32"
+            or sf_vec_size != 128
+            or l != 1
+            or n % 128 != 0
+            or k % 128 != 0
+            or sfa_torch.shape != expected_sfa_shape
+            or sfb_torch.shape != expected_sfb_shape
+            or sfa_torch.dtype != torch.float32
+            or sfb_torch.dtype != torch.float32
+            or not sfa_torch.is_contiguous()
+            or not sfb_torch.is_contiguous()
+        ):
+            raise ValueError(
+                "block_fp8 requires L=1, N/K divisible by 128, "
+                "sf_dtype='float32', sf_vec_size=128, and contiguous FP32 "
+                f"scales shaped {expected_sfa_shape} and {expected_sfb_shape}"
+            )
+        if (
+            load_path not in (None, "tma")
+            or swap_ab not in (None, False)
+            or rhs_values_tiled is not None
+            or _quantized_c is not None
+            or sfb_k_replicated
+        ):
+            raise ValueError(
+                "block_fp8 currently requires unswapped TMA operands without "
+                "tiled RHS, quantized output, or replicated weight scales"
+            )
+        load_path = "tma"
+        swap_ab = False
     if plain_fp8 and not is_mxfp8:
         raise ValueError("plain_fp8 requires ab_dtype='float8_e4m3fn'")
     if plain_fp8 and (
@@ -7485,6 +7693,7 @@ def dense_gemm(
             b_tile_major=False,
             alpha_is_one=alpha_is_one,
             plain_fp8=True,
+            block_fp8=block_fp8,
         )
         compiled_plain_fp8(
             a_tensor_gpu=a_torch,
