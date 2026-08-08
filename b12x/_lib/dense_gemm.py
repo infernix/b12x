@@ -630,6 +630,7 @@ class DenseGemmKernel:
         mxfp6_fmt_b: Optional[str] = None,
         b_packed: bool = False,
         plain_fp8: bool = False,
+        fused_quant_bf16: Optional[bool] = None,
         block_fp8: bool = False,
     ):
         # When set, A/B operands are MX codes carried in Float8E4M3FN
@@ -7094,6 +7095,7 @@ def dense_gemm(
     x_bf16: Optional[torch.Tensor] = None,
     w_gscale: Optional[torch.Tensor] = None,
     plain_fp8: bool = False,
+    row_scale: Optional[torch.Tensor] = None,
     block_fp8: bool = False,
 ) -> torch.Tensor:
     """Execute dense block-scaled GEMM for one expert-major batch stack.
@@ -7133,6 +7135,9 @@ def dense_gemm(
     ``plain_fp8``: emit non-block-scaled E4M3 warp MMA while reusing the
     SM12x dense pipeline. The scalar ``alpha`` carries the combined activation
     and weight dequantization scale.
+
+    ``row_scale``: optional contiguous ``(M,)`` tensor in the C dtype, applied
+    per output row in the epilogue. MX-FP6 only.
 
     ``block_fp8``: accumulate ordinary E4M3 MMA over each K128 block, then
     apply compact FP32 activation ``[M,K/128]`` and weight
