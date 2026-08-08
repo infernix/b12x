@@ -154,7 +154,11 @@ _SOURCE_FORMATS = {
     "compressed_tensors",
     "mxfp6_e2m3",
     "exl3_trellis_mcg",
+    "qsrt_sqg_e4m3",
 }
+_TRELLIS_SOURCE_FORMATS = frozenset(
+    {"exl3_trellis_mcg", "qsrt_sqg_e4m3"}
+)
 _SOURCES_BY_QUANT_MODE = {
     "nvfp4": frozenset({"modelopt_nvfp4"}),
     "w4a8_nvfp4": frozenset({"modelopt_nvfp4"}),
@@ -167,6 +171,7 @@ _SOURCES_BY_QUANT_MODE = {
             "fp4_e8m0_k32",
             "compressed_tensors",
             "exl3_trellis_mcg",
+            "qsrt_sqg_e4m3",
         }
     ),
     "w6a8_mx": frozenset({"mxfp6_e2m3"}),
@@ -271,6 +276,7 @@ class MoEWeightPreparationPlan:
     storage_policy: WeightStoragePolicy
     trellis_bits: int | None = None
     trellis_tile_config: tuple[int, int, int, int] | None = None
+    qsrt_storage_format: str | None = None
 
     def __post_init__(self) -> None:
         specs = tuple(self.specs)
@@ -298,10 +304,17 @@ class MoEWeightPreparationPlan:
         object.__setattr__(
             self, "storage_policy", WeightStoragePolicy(self.storage_policy)
         )
-        if self.source_format == "exl3_trellis_mcg":
+        if self.source_format in _TRELLIS_SOURCE_FORMATS:
             bits = 3 if self.trellis_bits is None else int(self.trellis_bits)
-            if bits not in (3, 4, 5, 6):
-                raise ValueError(f"trellis_bits must be one of 3, 4, 5, 6; got {bits}")
+            valid_bits = (
+                (2, 3, 4)
+                if self.source_format == "qsrt_sqg_e4m3"
+                else (3, 4, 5, 6)
+            )
+            if bits not in valid_bits:
+                raise ValueError(
+                    f"trellis_bits must be one of {valid_bits}; got {bits}"
+                )
             tile_config = self.trellis_tile_config or (64, 256, 64, 256)
             tile_config = tuple(int(value) for value in tile_config)
             if len(tile_config) != 4 or any(
@@ -312,10 +325,42 @@ class MoEWeightPreparationPlan:
                 )
             object.__setattr__(self, "trellis_bits", bits)
             object.__setattr__(self, "trellis_tile_config", tile_config)
-        elif self.trellis_bits is not None or self.trellis_tile_config is not None:
+            storage_format = (
+                None
+                if self.qsrt_storage_format is None
+                else str(self.qsrt_storage_format).lower()
+            )
+            if self.source_format == "qsrt_sqg_e4m3":
+                if storage_format != "qsrt_atoms_v1":
+                    raise ValueError(
+                        "QSRT MoE weights require "
+                        "qsrt_storage_format='qsrt_atoms_v1'"
+                    )
+                if bits != 3:
+                    raise ValueError(
+                        "QSRT atoms require trellis_bits=3 average rate"
+                    )
+                if self.intermediate_size != 256:
+                    raise ValueError(
+                        "the current QSRT atom kernel requires "
+                        "intermediate_size=256"
+                    )
+                if tile_config[1] != 256:
+                    raise ValueError(
+                        "the current QSRT atom kernel requires FC1 tile_n=256"
+                    )
+            elif storage_format is not None:
+                raise ValueError(
+                    "qsrt_storage_format is valid only for qsrt_sqg_e4m3"
+                )
+            object.__setattr__(self, "qsrt_storage_format", storage_format)
+        elif (
+            self.trellis_bits is not None
+            or self.trellis_tile_config is not None
+            or self.qsrt_storage_format is not None
+        ):
             raise ValueError(
-                "trellis_bits/trellis_tile_config require "
-                "source_format='exl3_trellis_mcg'"
+                "QSRT storage settings require a QSRT source format"
             )
         for name in ("num_experts", "hidden_size", "intermediate_size"):
             if getattr(self, name) <= 0:
@@ -544,7 +589,7 @@ def make_moe_spec(
         quant_mode=quant_mode,
     )
 
-    if source_format == "exl3_trellis_mcg":
+    if source_format in _TRELLIS_SOURCE_FORMATS:
         # Trellis stores codebook indices without a per-weight scale grid. The
         # W4A16 ABI still carries a four-byte dummy E4M3 K/32 scale pointer.
         source_scale = ScaleEncoding.E4M3_K32
@@ -597,6 +642,7 @@ def plan_moe_weight_preparation(
     w4a16_layout: PreparedWeightLayout | str | None = None,
     trellis_bits: int | None = None,
     trellis_tile_config: tuple[int, int, int, int] | None = None,
+    qsrt_storage_format: str | None = None,
 ) -> MoEWeightPreparationPlan:
     """Choose the minimal representation set for the requested recipes.
 
@@ -640,10 +686,10 @@ def plan_moe_weight_preparation(
         )
     if (
         requested_w4a16_layout is PreparedWeightLayout.TRELLIS_NATIVE
-        and source_format != "exl3_trellis_mcg"
+        and source_format not in _TRELLIS_SOURCE_FORMATS
     ):
         raise ValueError(
-            "trellis_native layout requires source_format='exl3_trellis_mcg'"
+            "trellis_native layout requires an EXL3 trellis source format"
         )
 
     transforms: set[WeightPreparationTransform] = set()
@@ -705,7 +751,7 @@ def plan_moe_weight_preparation(
             )
             continue
         if spec.quant_mode == "w4a16":
-            if source_format == "exl3_trellis_mcg":
+            if source_format in _TRELLIS_SOURCE_FORMATS:
                 if spec.activation not in {"silu", "situ"}:
                     raise ValueError(
                         "EXL3 Trellis W4A16 currently requires silu or situ"
@@ -800,6 +846,7 @@ def plan_moe_weight_preparation(
         storage_policy=storage_policy,
         trellis_bits=trellis_bits,
         trellis_tile_config=trellis_tile_config,
+        qsrt_storage_format=qsrt_storage_format,
     )
 
 

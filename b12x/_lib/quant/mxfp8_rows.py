@@ -41,6 +41,7 @@ class _MXFP8RowsQuantLaunch:
         source_type: type[cutlass.Numeric],
         subgroup_width: int,
         threads: int,
+        trellis_native_mma_order: bool,
     ) -> None:
         self._k = int(k)
         self._groups_k = self._k // 32
@@ -48,6 +49,7 @@ class _MXFP8RowsQuantLaunch:
         self._subgroup_width = int(subgroup_width)
         self._threads = int(threads)
         self._warps_per_cta = self._threads // 32
+        self._trellis_native_mma_order = bool(trellis_native_mma_order)
 
     @cute.jit
     def __call__(
@@ -162,9 +164,36 @@ class _MXFP8RowsQuantLaunch:
                 group = (task % group_tiles) * Int32(4) + subgroup
                 if group < Int32(self._groups_k):
                     values = cute.make_rmem_tensor((4,), cutlass.Float32)
-                    k0 = group * Int32(32) + lane4 * Int32(4)
-                    for elem in cutlass.range_constexpr(4):
-                        values[elem] = cutlass.Float32(source[row, k0 + Int32(elem)])
+                    k0 = group * Int32(32)
+                    if cutlass.const_expr(self._trellis_native_mma_order):
+                        # Match the direct native-trellis B assignment.  Each
+                        # output word contains one native EXL lane's four K
+                        # values; the eight words are a permutation wholly
+                        # within this K32 scale group.
+                        r = Int32(0)
+                        tile = Int32(0)
+                        if lane4 < Int32(4):
+                            r = ((lane4 & Int32(1)) << Int32(1)) | (
+                                lane4 >> Int32(1)
+                            )
+                        else:
+                            q = lane4 - Int32(4)
+                            r = (
+                                ((Int32(1) - (q & Int32(1))) << Int32(1))
+                                | (q >> Int32(1))
+                            )
+                            tile = Int32(16)
+                        base = k0 + tile + (r << Int32(1))
+                        values[0] = cutlass.Float32(source[row, base])
+                        values[1] = cutlass.Float32(source[row, base + Int32(1)])
+                        values[2] = cutlass.Float32(source[row, base + Int32(8)])
+                        values[3] = cutlass.Float32(source[row, base + Int32(9)])
+                    else:
+                        k0 += lane4 * Int32(4)
+                        for elem in cutlass.range_constexpr(4):
+                            values[elem] = cutlass.Float32(
+                                source[row, k0 + Int32(elem)]
+                            )
 
                     max_abs = fabs_f32(values[0])
                     for elem in cutlass.range_constexpr(1, 4):
@@ -246,6 +275,7 @@ def _get_compiled_mxfp8_rows_quant(
     source_dtype: torch.dtype,
     subgroup_width: int,
     threads: int,
+    value_order: str,
 ) -> Callable:
     k = int(k)
     if k <= 0 or k % 32 != 0:
@@ -268,8 +298,29 @@ def _get_compiled_mxfp8_rows_quant(
         raise ValueError(
             f"MXFP8 CuTe quantizer threads must be a positive multiple of 32, got {threads}"
         )
-    launch = _MXFP8RowsQuantLaunch(k, source_type, subgroup_width, threads)
-    cache_key = (k, source_dtype_name, int(subgroup_width), int(threads))
+    if value_order not in {"linear", "trellis_native_mma"}:
+        raise ValueError(
+            "MXFP8 CuTe quantizer value_order must be 'linear' or "
+            f"'trellis_native_mma', got {value_order!r}"
+        )
+    if value_order == "trellis_native_mma" and subgroup_width != 8:
+        raise ValueError(
+            "trellis_native_mma MXFP8 ordering requires subgroup_width=8"
+        )
+    launch = _MXFP8RowsQuantLaunch(
+        k,
+        source_type,
+        subgroup_width,
+        threads,
+        value_order == "trellis_native_mma",
+    )
+    cache_key = (
+        k,
+        source_dtype_name,
+        int(subgroup_width),
+        int(threads),
+        value_order,
+    )
     raise_if_kernel_resolution_frozen(
         "cute.compile",
         target=launch,
@@ -286,7 +337,7 @@ def _get_compiled_mxfp8_rows_quant(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "gemm.mxfp8_quant_cute",
-            2,
+            3,
             cache_key,
         ),
     )
@@ -349,8 +400,15 @@ def quantize_mxfp8_rows_cute(
     values: torch.Tensor,
     scale_rows: torch.Tensor,
     scale_mma: torch.Tensor,
+    *,
+    value_order: str = "linear",
 ) -> None:
-    """Quantize contiguous BF16 rows into the dense-GEMM MXFP8 layouts."""
+    """Quantize contiguous BF16 rows into dense-GEMM MXFP8 layouts.
+
+    ``trellis_native_mma`` applies the fixed within-K32 byte permutation used
+    by direct native-trellis E4M3 B fragments.  It changes neither values nor
+    scale groups and avoids a separate activation transpose kernel.
+    """
 
     if source.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(
@@ -358,9 +416,16 @@ def quantize_mxfp8_rows_cute(
         )
     if source.ndim != 2 or not source.is_contiguous():
         raise ValueError("CuTe MXFP8 quantizer requires contiguous [M,K] input")
-    subgroup_width = _WARP_SUBGROUP_WIDTH if int(source.shape[0]) > 8 else 0
+    if value_order == "trellis_native_mma":
+        subgroup_width = 8
+    else:
+        subgroup_width = _WARP_SUBGROUP_WIDTH if int(source.shape[0]) > 8 else 0
     _get_compiled_mxfp8_rows_quant(
-        int(source.shape[1]), source.dtype, subgroup_width, _THREADS
+        int(source.shape[1]),
+        source.dtype,
+        subgroup_width,
+        _THREADS,
+        value_order,
     )(
         source,
         values,

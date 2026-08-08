@@ -340,3 +340,86 @@ def test_cute_migration_mxfp8_quant_gpu_oracle_and_graph(m: int) -> None:
         rtol=0,
         atol=0,
     )
+
+
+def test_cute_migration_mxfp8_quant_trellis_native_mma_order() -> None:
+    """The direct-trellis order permutes bytes only within each K32 group."""
+    require_b12x()
+    m, k = 16, 128
+    generator = torch.Generator(device="cuda").manual_seed(46_832)
+    source = (
+        torch.randn(
+            (m, k),
+            generator=generator,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / 4
+    ).contiguous()
+    expected = quantize_mxfp8_rows_torch(source)
+    actual = empty_mxfp8_rows_for_dense_gemm(m, k, device="cuda")
+
+    def run() -> None:
+        quantize_mxfp8_rows_cute(
+            source,
+            actual.values,
+            actual.scale_rows,
+            actual.scale_mma,
+            value_order="trellis_native_mma",
+        )
+
+    run()
+    torch.cuda.synchronize()
+    perm = torch.tensor(
+        (
+            0, 1, 8, 9, 4, 5, 12, 13,
+            2, 3, 10, 11, 6, 7, 14, 15,
+            20, 21, 28, 29, 16, 17, 24, 25,
+            22, 23, 30, 31, 18, 19, 26, 27,
+        ),
+        device="cuda",
+    )
+    expected_values = (
+        expected.values.view(torch.uint8)
+        .reshape(m, k // 32, 32)[:, :, perm]
+        .reshape(m, k)
+    )
+    torch.testing.assert_close(
+        actual.values.view(torch.uint8), expected_values, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        actual.scale_rows.view(torch.uint8),
+        expected.scale_rows.view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        actual.scale_mma.view(torch.uint8),
+        expected.scale_mma.view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    source.copy_(
+        torch.randn(
+            source.shape,
+            generator=generator,
+            dtype=source.dtype,
+            device=source.device,
+        )
+        / 4
+    )
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = quantize_mxfp8_rows_torch(source)
+    expected_values = (
+        expected.values.view(torch.uint8)
+        .reshape(m, k // 32, 32)[:, :, perm]
+        .reshape(m, k)
+    )
+    torch.testing.assert_close(
+        actual.values.view(torch.uint8), expected_values, rtol=0, atol=0
+    )

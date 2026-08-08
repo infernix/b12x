@@ -11,7 +11,10 @@ from b12x._lib.intrinsics import (
 )
 from b12x.moe.fused_moe._impl import (
     plan_b12x_fp4_moe_weights,
+    prewarm_w4a16_fc2_e8m0,
+    prepare_w4a16_fc2_e8m0,
     prepare_b12x_fp4_moe_weights,
+    run_w4a16_fc2_e8m0,
 )
 from b12x.moe._shared.execution import PreparedWeightLayout
 from b12x.moe._shared.kernels.reference import (
@@ -26,6 +29,7 @@ from b12x.moe._shared.kernels.w4a16.host import (
 )
 from b12x.moe._shared.kernels.w4a16.kernel import (
     _DEFAULT_MAX_SHARED_MEM,
+    _W4A16_SMALL_M_DIRECT_MAX_M,
     MoEMicroKernelW4A16SmallMDirect,
     _small_m_direct_host_barrier_reset_enabled,
     _w4a16_stream_is_capturing,
@@ -325,6 +329,7 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
         activation="silu",
         trellis_bits=3,
         trellis_tile_config=None,
+        qsrt_storage_format=None,
     )
     fused_calls: list[dict[str, object]] = []
     resolved_fused = object()
@@ -367,9 +372,17 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
         collect_activation_amax=False,
     )
 
-    assert len(fused_calls) == 2
-    assert {call["size_m"] for call in fused_calls} == {3072}
-    assert {call["max_m_blocks"] for call in fused_calls} == {542}
+    main_calls = [call for call in fused_calls if call["size_m"] == 3072]
+    direct_calls = [call for call in fused_calls if call["size_m"] != 3072]
+    assert len(main_calls) == 2
+    assert {call["max_m_blocks"] for call in main_calls} == {542}
+    assert {call["size_m"] for call in direct_calls} == set(
+        range(1, _W4A16_SMALL_M_DIRECT_MAX_M + 1)
+    )
+    assert all(
+        sum(call["size_m"] == direct_m for call in direct_calls) == 2
+        for direct_m in range(1, _W4A16_SMALL_M_DIRECT_MAX_M + 1)
+    )
     assert (
         workspace.planned_fused_moe_launches[("trellis3_t256", "e4m3_k32", 3072, False)]
         is resolved_fused
@@ -3196,3 +3209,99 @@ def test_tp_moe_w4a16_dispatch_uses_native_path() -> None:
 
     assert actual is output
     _assert_matches_oracle(actual, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_fc2_only_consumes_contiguous_bf16_and_native_mxfp4() -> None:
+    experts, hidden_size, intermediate_size, routes = 2, 128, 256, 3
+    # MXFP4 nibbles 1 and 2 decode to 0.5 and 1.0 at unit UE8M0 scale.
+    w2 = torch.empty(
+        (experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2[0].fill_(0x11)
+    w2[1].fill_(0x22)
+    scales = torch.full(
+        (experts, hidden_size, intermediate_size // 32),
+        127,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    intermediate = torch.ones(
+        (routes, intermediate_size), dtype=torch.bfloat16, device="cuda"
+    )
+    route_ids = torch.tensor([0, 1, 0], dtype=torch.int32, device="cuda")
+    route_weights = torch.tensor([0.25, 0.5, 1.0], dtype=torch.float32, device="cuda")
+
+    prepared = prepare_w4a16_fc2_e8m0(w2, scales)
+    actual = run_w4a16_fc2_e8m0(
+        intermediate,
+        prepared,
+        route_ids,
+        route_weights,
+    )
+    expected_values = torch.tensor(
+        [32.0, 128.0, 128.0], dtype=torch.bfloat16, device="cuda"
+    )
+    expected = expected_values[:, None].expand_as(actual)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_fc2_only_is_cuda_graph_safe_with_preallocated_output() -> None:
+    experts, hidden_size, intermediate_size, routes = 5, 128, 256, 7
+    w2 = torch.empty(
+        (experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    for expert in range(experts):
+        w2[expert].fill_((expert + 1) | ((expert + 1) << 4))
+    scales = torch.full(
+        (experts, hidden_size, intermediate_size // 32),
+        127,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    intermediate = torch.ones(
+        (routes, intermediate_size), dtype=torch.bfloat16, device="cuda"
+    )
+    route_ids = torch.tensor(
+        [0, 1, 2, 3, 4, 0, 2], dtype=torch.int32, device="cuda"
+    )
+    route_weights = torch.linspace(
+        0.125, 0.875, routes, dtype=torch.float32, device="cuda"
+    )
+    output = torch.empty(
+        (routes, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
+
+    prepared = prepare_w4a16_fc2_e8m0(w2, scales)
+    prewarm_w4a16_fc2_e8m0(prepared, route_ids_dtype=torch.int32)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run_w4a16_fc2_e8m0(
+            intermediate,
+            prepared,
+            route_ids,
+            route_weights,
+            output=output,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected = torch.empty_like(output)
+    run_w4a16_fc2_e8m0(
+        intermediate,
+        prepared,
+        route_ids,
+        route_weights,
+        output=expected,
+    )
+    torch.cuda.synchronize()
+    assert captured is output
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)

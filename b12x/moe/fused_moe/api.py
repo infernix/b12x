@@ -58,7 +58,16 @@ from ._impl import (
     prepare_b12x_fp4_moe_weights as prepare_weights,
 )
 from ._impl import (
+    prepare_w4a16_fc2_e8m0 as prepare_fc2_weights,
+)
+from ._impl import (
+    prewarm_w4a16_fc2_e8m0 as prewarm_fc2,
+)
+from ._impl import (
     b12x_moe_fp4 as run,
+)
+from ._impl import (
+    run_w4a16_fc2_e8m0 as run_fc2,
 )
 from ._impl import (
     b12x_route_experts_fast as route,
@@ -98,10 +107,13 @@ __all__ = [
     "plan_execution",
     "plan_weights",
     "prepare_weights",
+    "prepare_fc2_weights",
+    "prewarm_fc2",
     "bind",
     "bind_sparse",
     "bind_route",
     "run",
+    "run_fc2",
     "run_sparse",
     "route",
     "route_topk",

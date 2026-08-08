@@ -2,8 +2,10 @@
 scatter, in one launch family.
 
 Recipes (``META.recipes``) are arguments, not separate ops: nvfp4, mxfp4,
-w4a8_mx, w4a8_nvfp4, w4a16 (weight layouts packed/modelopt/nf3_2p1 and the
-``exl3_trellis_mcg`` full-rotation source). Activations: silu, situ, relu2,
+w4a8_mx, w4a8_nvfp4, w4a16 (weight layouts packed/modelopt and the
+legacy ``exl3_trellis_mcg`` or TP-independent ``qsrt_sqg_e4m3``
+full-rotation sources).
+Activations: silu, situ, relu2,
 swigluoai_uninterleave. Kernel
 regimes (micro / dynamic / tiny-decode / w4a16) are selected declaratively by
 ``plan_execution``.
@@ -58,10 +60,13 @@ META = OpMeta(
         "plan_execution",
         "plan_weights",
         "prepare_weights",
+        "prepare_fc2_weights",
+        "prewarm_fc2",
         "bind",
         "bind_sparse",
         "bind_route",
         "run",
+        "run_fc2",
         "run_sparse",
         "route",
         "route_topk",
@@ -76,6 +81,7 @@ META = OpMeta(
         "w4a8_nvfp4",
         "w4a16",
         "w4a16/exl3_trellis_mcg",
+        "w4a16/qsrt_sqg_e4m3",
     ),
     requires=("triton",),
     provenance=Provenance(
@@ -108,9 +114,12 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         plan_execution,
         plan_weights,
         prepare_weights,
+        prepare_fc2_weights,
+        prewarm_fc2,
         route,
         route_topk,
         run,
+        run_fc2,
         run_sparse,
     )
 

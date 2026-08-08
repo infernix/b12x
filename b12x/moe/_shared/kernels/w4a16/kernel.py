@@ -35,6 +35,8 @@ from b12x._lib.intrinsics import (
     fmax_f32,
     f16_mma_m16n8k16_f32,
     f16_mma_rhs_fragments_as_mma_a_m16n8k16_f32,
+    fp8x4_e4m3_to_bfloat2x2_native_sm120,
+    fp8x4_e4m3_to_half2x2,
     half2_to_float2_scaled,
     get_ptr_as_int64,
     half2_mul,
@@ -55,12 +57,12 @@ from b12x._lib.intrinsics import (
     packed_dequant_e4m3x4_to_half2x2,
     packed_dequant_e8m0x4_to_bfloat2x2,
     packed_dequant_e8m0x4_to_half2x2,
-    packed_dequant_nf3x8_to_bfloat2x4,
     packed_dequant_trellis_to_bfloat2x4,
     packed_dequant_trellis_to_half2x4,
     packed_dequant_trellis_stream_to_bfloat2x4,
     packed_dequant_trellis_stream_to_half2x4,
-    nf3_codebook_pools,
+    packed_decode_sqg_xor_cheb_t12_to_e4m3x8,
+    ld_global_nc_v4_u32,
     pack_f32x2_to_bfloat2,
     pack_f32x2_to_f16x2,
     red_add_global_bf16x2,
@@ -81,6 +83,7 @@ from b12x._lib.intrinsics import (
     trellis_align_stream_u32x2,
     warp_reduce,
 )
+from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_lut
 from b12x._lib.utils import current_cuda_stream, make_ptr
 from b12x.moe._shared.kernels.w4a16.route_pack import (
     pack_topk_routes_by_expert as _pack_topk_routes_by_expert,
@@ -115,20 +118,55 @@ from b12x.moe._shared.kernels.micro import (
 _ALLOWED_ROUTED_SIZES = _W4A16_ALLOWED_ROUTED_SIZES
 _PACK_FACTOR = 8
 _STAGES = 4
+
+
+def _w4a16_small_m_splitk_enabled() -> bool:
+    """Experimental small-M split-K schedule toggle.  NOT yet correct.
+
+    The m8 TC-decode schedule normally assigns one whole-K mn-tile per CTA
+    when the grid is larger than the tile count, idling the remaining CTAs.
+    That is the right call for cheap decoders (MCG/MUL1), where the stripe
+    split-K finalize costs more than it recovers, but it leaves ~5/6 of the
+    GPU idle through the FC1 phase of expensive decoders: at TP12 decode
+    the QSRT state-table path drops from 210.5/263.7 us to 81.5/99.9 us
+    (P33/P24) under this flag, and MCG from 54.8/58.9 us to 34.4/38.5 us.
+
+    Pair-rate correctness under the stripe partition requires the decode
+    and pair window loads to see ABSOLUTE k-tile indices
+    (``reduce_k_tile + tile_idx``); the pipelines' ``tile_idx`` is
+    slice-local and only the staging bases carry the slice offset.  The
+    K-axis K2/K4 boundary (``logical_k16 < 8``) mis-selects rates on every
+    mid-column slice otherwise (P33 is rate-uniform and immune).  Fixed and
+    validated: the full pair reference suite passes with this flag on and
+    off.  The flag participates in every affected kernel cache key.
+    """
+
+    return os.environ.get("B12X_W4A16_SMALL_M_SPLITK", "0") == "1"
+
+
+def _sqg_xor_cheb_t12_smem_enabled() -> bool:
+    """Stage the 4 KiB SQG-XOR-Cheb-T12 staircase once per fused CTA.
+
+    The dynamic switch exists to compare the staged table against the direct
+    L1/L2 path under an otherwise identical compiled split-K schedule.
+    """
+
+    return os.environ.get("B12X_SQG_XOR_CHEB_T12_SMEM", "1") == "1"
+
+
 _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT = 64
 _DEVICE_MAX_REG_BYTES = 255 * 1024
 _DEFAULT_MAX_SHARED_MEM = 101_376
 _SCALAR_ACC_FRAGMENT_WIDTH = 1
-_WEIGHT_LAYOUTS = {"packed", "modelopt", "nf3_2p1", "trellis3_t256"}
+_WEIGHT_LAYOUTS = {"packed", "modelopt", "trellis3_t256"}
 _MODEL_OPT_W13_LAYOUTS = {"w13", "w31"}
 _TRELLIS256_W13_LAYOUTS = {"packed", "trellis3_t256_proj"}
-# NF3 codebook: 8 bf16 codepoints for the 3-bit ("nf3_2p1") weight layout. The
-# device dequant reads these as prmt pools (see nf3_codebook_pools); the host
-# injects the 4 pool words as compile-time constants into the GEMM.
-_NF3_CODEBOOK = (-1.0, -0.6047, -0.3563, -0.1275, 0.1275, 0.3563, 0.6047, 1.0)
-# Native EXL3 t256 tiles contain 256 tail-biting codes at one compile-time
+# Native QSRT t256 tiles contain 256 tail-biting codes at one compile-time
 # bitrate. Their exact storage is [16*bits] int16 == [8*bits] uint32 per tile.
-_TRELLIS256_BITS = (3, 4, 5, 6)
+_TRELLIS256_BITS = (2, 3, 4, 5, 6)
+_TRELLIS256_CODEBOOKS = {"mcg", "sqg_xor_cheb_t12"}
+_SQG_XOR_CHEB_T12_LUT_ENTRIES = 1 << 12
+_SQG_XOR_CHEB_T12_SMEM_REGION_BYTES = _SQG_XOR_CHEB_T12_LUT_ENTRIES
 _SCALE_FORMATS = {
     "e4m3_k16": "e4m3_k16",
     "e8m0_k32": "e8m0_k32",
@@ -138,6 +176,7 @@ _E8M0_K32_FP16_GLOBAL_COMPENSATION = float(2.0**7)
 _E8M0_K32_BF16_GLOBAL_COMPENSATION = float(2.0**119)
 _MAX_DIRECT_TOPK_ROUTE_M = 6
 _W4A16_SMALL_M_DIRECT_MAX_M = 8
+_FC2_DIRECT_MIN_EXPERT_CAPACITY = 1024
 
 # TC-decode: a small-M decode specialization that runs on the PACKED W4A16
 # object (the same weights/scales the prefill GEMM uses). It reuses the packed
@@ -217,14 +256,8 @@ _W4A16_REGS_SM121 = {
     (128, 4, 4, 8, False): 255,
     (128, 4, 8, 4, False): 255,
 }
-# Layout overlay: the nf3_2p1 dequant inner loop (codebook prmt pools, 12B
-# staged triples) allocates fewer registers than the packed e2m1 loop.
-# Measured from ncu on SM120 JIT output at the production hybrid tile config;
-# unmeasured specializations fall back to the packed table (a conservative
+# Unmeasured specializations fall back to the packed table (a conservative
 # upper bound).
-_W4A16_REGS_SM121_NF3 = {
-    (256, 4, 16, 4, False): 238,
-}
 _SMALL_BATCH_TILE_CONFIGS = (
     (128, 128, 256),
     (64, 128, 128),
@@ -282,10 +315,6 @@ def _w4a16_num_regs(
         int(cta_k_blocks),
         bool(uses_m_block_8),
     )
-    if weight_layout == "nf3_2p1":
-        hit = _W4A16_REGS_SM121_NF3.get(key)
-        if hit is not None:
-            return hit
     try:
         return _W4A16_REGS_SM121[key]
     except KeyError as exc:
@@ -308,7 +337,7 @@ def _shared_memory_footprint(
     cta_k = int(tile_k)
     sh_block_meta_size = cta_m * 16
     sh_a_size = _STAGES * (cta_m * cta_k) * 2
-    staged_weight_bits = 3 if weight_layout == "nf3_2p1" else int(weight_bits)
+    staged_weight_bits = int(weight_bits)
     sh_b_size = _STAGES * (cta_k * cta_n * staged_weight_bits // 8)
     sh_red_size = cta_m * (cta_n + 8) * 2
     sh_bias_size = cta_n * 2
@@ -516,6 +545,9 @@ class W4A16GemmCompileResult:
     w13_layout: str = "w13"
     dense_route_fast_path: bool = False
     trellis_bits: int = 3
+    trellis_codebook: str = "sqg_xor_cheb_t12"
+    trellis_pair_kind: str | None = None
+    trellis_rate_axis: str | None = None
 
 
 @dataclass(frozen=True)
@@ -576,8 +608,19 @@ class W4A16FusedMoeCompileResult:
     intermediate_rotation: bool = False
     dual_a: bool = False
     trellis_bits: int = 3
+    trellis_codebook: str = "sqg_xor_cheb_t12"
+    fc1_trellis_pair_kind: str | None = None
+    fc2_trellis_pair_kind: str | None = None
     full_rotation: bool = False
     rotation_input_dtype: str = "fp16"
+    # CUDA function attributes are available after a fresh compile.  The
+    # on-disk object-cache loader does not currently expose the CUDA-dialect
+    # introspection surface, so cached entries retain the sentinel values.
+    kernel_symbol: str | None = None
+    registers_per_thread: int = -1
+    local_memory_bytes: int = -1
+    cta_threads: int = -1
+    shared_memory_bytes: int = -1
 
 
 @dataclass(frozen=True)
@@ -596,6 +639,15 @@ class _W4A16SmallMDirectLaunch(NamedTuple):
     topk: int
     activation: str
     fast_math: bool
+    topk_ids_dtype: torch.dtype
+
+
+class _W4A16FC2DirectLaunch(NamedTuple):
+    compiled: object
+    grid_x: int
+    hidden_size: int
+    intermediate_size: int
+    num_experts: int
     topk_ids_dtype: torch.dtype
 
 
@@ -662,6 +714,7 @@ class MoEMicroKernelW4A16SmallMDirect(MoEMicroKernelBackend):
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
         w13_layout: str = "w13",
+        compile_time_phase: int = 0,
     ):
         super().__init__(
             sf_vec_size=16,
@@ -679,6 +732,7 @@ class MoEMicroKernelW4A16SmallMDirect(MoEMicroKernelBackend):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             w13_layout=w13_layout,
+            compile_time_phase=compile_time_phase,
         )
 
 
@@ -702,6 +756,9 @@ class W4A16GemmKernel:
         scale_format: str = "e4m3_k16",
         w13_layout: str = "w13",
         trellis_bits: int = 3,
+        trellis_codebook: str = "sqg_xor_cheb_t12",
+        trellis_pair_kind: str | None = None,
+        trellis_rate_axis: str | None = None,
         source_n_rotation: int = 0,
         single_token_route_fast_path: bool = False,
         direct_topk_routes: bool = False,
@@ -720,6 +777,7 @@ class W4A16GemmKernel:
         if weight_layout not in _WEIGHT_LAYOUTS:
             raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
         trellis_bits = int(trellis_bits)
+        trellis_codebook = str(trellis_codebook).lower()
         scale_format = _normalize_scale_format(scale_format)
         if weight_layout == "modelopt":
             if w13_layout not in _MODEL_OPT_W13_LAYOUTS:
@@ -730,14 +788,12 @@ class W4A16GemmKernel:
         else:
             w13_layout = "packed"
             source_n_rotation = 0
-        if weight_layout == "nf3_2p1":
-            if scale_format != "e4m3_k32":
-                raise ValueError(
-                    "nf3_2p1 W4A16 weights require scale_format='e4m3_k32'"
-                )
-            if element_dtype != "bf16":
-                raise ValueError("nf3_2p1 W4A16 weights are bf16-activation only (v1)")
         if weight_layout == "trellis3_t256":
+            if trellis_codebook not in _TRELLIS256_CODEBOOKS:
+                raise ValueError(
+                    "trellis3_t256 codebook must be one of "
+                    f"{sorted(_TRELLIS256_CODEBOOKS)}, got {trellis_codebook!r}"
+                )
             if trellis_bits not in _TRELLIS256_BITS:
                 raise ValueError(
                     "trellis3_t256 bits must be one of "
@@ -747,14 +803,48 @@ class W4A16GemmKernel:
                 raise ValueError(
                     "trellis3_t256 W4A16 weights require scale_format='e4m3_k32'"
                 )
-        elif trellis_bits != 3:
-            raise ValueError("trellis_bits is only valid for trellis3_t256 weights")
+        trellis_pair_kind = (
+            None if trellis_pair_kind is None else str(trellis_pair_kind).upper()
+        )
+        trellis_rate_axis = (
+            None if trellis_rate_axis is None else str(trellis_rate_axis).lower()
+        )
+        if (trellis_pair_kind is None) != (trellis_rate_axis is None):
+            raise ValueError(
+                "trellis_pair_kind and trellis_rate_axis must be supplied together"
+            )
+        if trellis_pair_kind is not None:
+            if weight_layout != "trellis3_t256":
+                raise ValueError("trellis pairs require trellis3_t256 weights")
+            if trellis_pair_kind not in {"P24", "P33", "PDYNAMIC"}:
+                raise ValueError(
+                    "trellis_pair_kind must be P24, P33, or PDYNAMIC, got "
+                    f"{trellis_pair_kind!r}"
+                )
+            if trellis_rate_axis not in {"k", "n"}:
+                raise ValueError(
+                    f"trellis_rate_axis must be 'k' or 'n', got {trellis_rate_axis!r}"
+                )
+            if trellis_bits != 3:
+                raise ValueError("P24/P33 pair containers must average three bits")
         if epilogue_activation not in (None, "relu2"):
             raise ValueError(
                 "W4A16 GEMM epilogue activation currently supports only relu2"
             )
         if tile_n % 16 != 0 or tile_k % 16 != 0:
             raise ValueError("tile_n/tile_k must be multiples of 16")
+        if trellis_rate_axis == "n" and (size_n % 256 or tile_n != 256):
+            raise ValueError(
+                "N-axis trellis pairs require size_n % 256 == 0 and "
+                "tile_n=256 so every CTA consumes one complete fixed-rate pair"
+            )
+        if trellis_rate_axis == "k" and (
+            size_k != 256 or tile_k > 128 or 128 % tile_k
+        ):
+            raise ValueError(
+                "K-axis trellis pairs require size_k=256 and a tile_k that "
+                "divides one 128-channel record"
+            )
         scale_group_size = _scale_group_size(scale_format)
         has_n_tile_tail = int(size_n) % int(tile_n) != 0
         has_k_tile_tail = int(size_k) % int(tile_k) != 0
@@ -822,7 +912,16 @@ class W4A16GemmKernel:
         self.epilogue_relu2 = epilogue_activation == "relu2"
         self.weight_layout = weight_layout
         self.trellis_bits = trellis_bits
-        self.weight_layout_nf3 = weight_layout == "nf3_2p1"
+        self.trellis_codebook = trellis_codebook
+        self.trellis_pair_kind = trellis_pair_kind
+        self.trellis_rate_axis = trellis_rate_axis
+        self.weight_layout_trellis256_pair = trellis_pair_kind is not None
+        self.trellis_pair_dynamic = trellis_pair_kind == "PDYNAMIC"
+        self.sqg_xor_cheb_t12_smem = False
+        # Small-M stripe split-K: opt out of the one-tile-per-CTA fast path
+        # so decode-heavy small-M phases spread each mn-tile's K range across
+        # multiple CTAs (existing tail scheduling plus cross-CTA finalize).
+        self.small_m_splitk = _w4a16_small_m_splitk_enabled()
         self.weight_layout_trellis256 = weight_layout == "trellis3_t256"
         self.weight_layout_trellis256_proj = (
             self.weight_layout_trellis256 and w13_layout == "trellis3_t256_proj"
@@ -834,23 +933,13 @@ class W4A16GemmKernel:
                 "trellis3_t256_proj requires each FC1 projection to contain "
                 "an integral number of CTA N tiles"
             )
-        self.b_region_variable = self.weight_layout_nf3 or self.weight_layout_trellis256
+        self.b_region_variable = self.weight_layout_trellis256
         self.scale_format = scale_format
         self.scale_format_e8m0_k32 = scale_format == "e8m0_k32"
-        # k32 scale cadence (two K16 rows share one scale group). Shared by the
-        # native E8M0 K/32 path and the NF3 e4m3-style K/32 path; the scale
+        # k32 scale cadence (two K16 rows share one scale group); the scale
         # DECODE stays keyed on scale_format_e8m0_k32 (e4m3_k32 uses the e4m3
         # decode arm, its 2**116 compensation lives in the global_scale tensor).
         self.scale_k32 = scale_format in ("e8m0_k32", "e4m3_k32")
-        # NF3 codebook prmt pools (host-computed compile-time constants injected
-        # into the device dequant). Only consumed by the nf3_2p1 path; cheap to
-        # compute unconditionally.
-        (
-            self._nf3_cb0,
-            self._nf3_cb1,
-            self._nf3_cb2,
-            self._nf3_cb3,
-        ) = nf3_codebook_pools(_NF3_CODEBOOK)
         self.scale_group_size = int(scale_group_size)
         self.scale_k_groups = _covering_count(self.size_k, self.scale_group_size)
         self.n_tiles = _covering_count(self.size_n, self.tile_n)
@@ -982,27 +1071,28 @@ class W4A16GemmKernel:
         self.b_sh_stride_threads = self.b_sh_stride
         self.b_sh_stage = self.b_sh_stride * self.cta_k_blocks
         self.b_sh_wr_iters = self.b_sh_stage // self.cta_threads
-        # Native t256 uses 4*bits bytes per 32 codes; NF3 uses 12 bytes and
+        # Native t256 uses 4*bits bytes per 32 codes;
         # packed/modelopt use 16 bytes for the same logical unit.
         self.b_unit_bytes = (
-            4 * self.trellis_bits
+            16
+            if self.weight_layout_trellis256_pair
+            and self.trellis_rate_axis == "k"
+            else 4 * self.trellis_bits
             if self.weight_layout_trellis256
-            else 12
-            if self.weight_layout_nf3
             else 16
         )
         self.b_sh_stage_bytes = self.b_sh_stage * self.b_unit_bytes
         if self.b_region_variable:
             if self.b_sh_stage_bytes % 16 != 0:
                 raise ValueError(
-                    "nf3/trellis B stage bytes must be a multiple of 16; "
+                    "trellis B stage bytes must be a multiple of 16; "
                     f"got {self.b_sh_stage_bytes}"
                 )
             self.b_sh_chunks = self.b_sh_stage_bytes // 16
-            self.b_sh_wr_iters_nf3 = _covering_count(self.b_sh_chunks, self.cta_threads)
+            self.b_sh_wr_iters_var = _covering_count(self.b_sh_chunks, self.cta_threads)
         else:
             self.b_sh_chunks = self.b_sh_stage
-            self.b_sh_wr_iters_nf3 = self.b_sh_wr_iters
+            self.b_sh_wr_iters_var = self.b_sh_wr_iters
 
         self.s_sh_stride = 16 * self.cta_n_blocks // 16
         self.s_tb_groups = (
@@ -1023,10 +1113,9 @@ class W4A16GemmKernel:
         self.sh_topk_off = sh_block_route_indices + sh_rd_block_route_indices
 
         sh_red_size = (2 * self.cta_n_blocks + 1) * 16 * self.cta_m_blocks
-        # B region size in int4 (16-byte) units. NF3 units are 12 bytes, so the
-        # region is 0.75x; round the total up to a 16-byte multiple so the
-        # following SMEM regions keep their 16-byte alignment (exact for all
-        # supported tiles since b_sh_stage is a multiple of 4).
+        # B region size in int4 (16-byte) units, rounded up to a 16-byte
+        # multiple so the following SMEM regions keep their 16-byte alignment
+        # (exact for all supported tiles since b_sh_stage is a multiple of 4).
         sh_b_size = _covering_count(_STAGES * self.b_sh_stage_bytes, 16)
         sh_size_min = min(sh_red_size, sh_b_size)
         sh_size_max = max(sh_red_size, sh_b_size)
@@ -1066,6 +1155,9 @@ class W4A16GemmKernel:
             self.epilogue_relu2,
             self.weight_layout,
             self.trellis_bits,
+            self.trellis_codebook,
+            self.trellis_pair_kind,
+            self.trellis_rate_axis,
             self.scale_format,
             self.w13_layout,
             self.source_n_rotation,
@@ -1086,6 +1178,8 @@ class W4A16GemmKernel:
             self.schedule_whole_tiles,
             self.schedule_route_block_factor,
             self.paired_m8_routes,
+            self.sqg_xor_cheb_t12_smem,
+            self.small_m_splitk,
         )
 
     @cute.jit
@@ -1223,6 +1317,7 @@ class W4A16GemmKernel:
         topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
+        trellis_lut_flat: cute.Tensor,
         active_m: cutlass.Int32,
         grid_x: cutlass.Int32,
         stream: cuda.CUstream,
@@ -1255,6 +1350,7 @@ class W4A16GemmKernel:
             topk_weights_flat,
             c_tmp_f32_flat,
             locks_i32_flat,
+            trellis_lut_flat,
             active_m,
         ).launch(
             grid=grid,
@@ -1278,6 +1374,7 @@ class W4A16GemmKernel:
         topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
+        trellis_lut_flat: cute.Tensor,
         active_m: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -1298,6 +1395,7 @@ class W4A16GemmKernel:
         smem_base = shared_ptr_to_u32(storage.words.data_ptr())
 
         grid_x, _, _ = cute.arch.grid_dim()
+        trellis_lut_addr = get_ptr_as_int64(trellis_lut_flat, Int32(0))
         self._run_persistent_gemm(
             a_bf16_flat,
             a_alt_bf16_flat,
@@ -1311,6 +1409,7 @@ class W4A16GemmKernel:
             topk_weights_flat,
             c_tmp_f32_flat,
             locks_i32_flat,
+            trellis_lut_addr,
             smem_base,
             tid,
             cta,
@@ -1333,6 +1432,7 @@ class W4A16GemmKernel:
         topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
+        trellis_lut_addr: Int64,
         smem_base: Int32,
         tid: Int32,
         cta: Int32,
@@ -1363,7 +1463,7 @@ class W4A16GemmKernel:
             tail_mn_tiles = Int32(0)
             full_grid_mn_iters = (global_mn_tiles + grid_x - Int32(1)) // grid_x
         if cutlass.const_expr(not self.schedule_whole_tiles):
-            if cutlass.const_expr(self.uses_m_block_8):
+            if cutlass.const_expr(self.uses_m_block_8 and not self.small_m_splitk):
                 # TC-decode small-M: when every mn-tile fits inside the launched grid
                 # (FC1 has only route_blocks*n_tiles tiles, far fewer than grid_x),
                 # the default tail path fans each mn-tile across multiple CTAs along
@@ -1374,6 +1474,10 @@ class W4A16GemmKernel:
                 # grid-barrier participant count are unchanged (so FC2 coverage is
                 # untouched); only FC1's intra-GEMM work partition changes. Numerically
                 # identical: a single CTA computes the whole K-reduction per tile.
+                # Decode-heavy codecs opt back into the stripe split-K partition
+                # via ``B12X_W4A16_SMALL_M_SPLITK`` (see
+                # ``_w4a16_small_m_splitk_enabled``): idling 5/6 of the grid
+                # through an expensive FC1 costs far more than the finalize.
                 if global_mn_tiles <= grid_x:
                     force_one_tile_per_cta = Int32(1)
             if force_one_tile_per_cta != Int32(0):
@@ -1513,6 +1617,7 @@ class W4A16GemmKernel:
                             topk_weights_flat,
                             c_tmp_f32_flat,
                             locks_i32_flat,
+                            trellis_lut_addr,
                             smem_base,
                             tid,
                             route_block_idx,
@@ -1765,6 +1870,7 @@ class W4A16GemmKernel:
         topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
+        trellis_lut_addr: Int64,
         smem_base: Int32,
         tid: Int32,
         route_block_idx: Int32,
@@ -1776,6 +1882,116 @@ class W4A16GemmKernel:
         reduce_slice_idx: Int32,
         lock_slot: Int32,
         active_size_m: Int32,
+    ):
+        if cutlass.const_expr(self.trellis_pair_dynamic):
+            # One expert-static, CTA-uniform branch chooses a fully specialized
+            # pair path.  The mode never changes during this tile, so carrying
+            # it as a constexpr keeps all inner staging/decode loops branchless.
+            if scales_i32_flat[expert_idx].to(Int32) != Int32(0):
+                self._run_tile_with_pair_override(
+                    a_bf16_flat,
+                    a_alt_bf16_flat,
+                    b_i32_flat,
+                    c_bf16_flat,
+                    scales_i32_flat,
+                    global_scale,
+                    packed_route_indices,
+                    topk_weights_flat,
+                    c_tmp_f32_flat,
+                    locks_i32_flat,
+                    trellis_lut_addr,
+                    smem_base,
+                    tid,
+                    route_block_idx,
+                    expert_idx,
+                    output_n_tile,
+                    reduce_k_tile,
+                    reduce_tile_count,
+                    reduce_slice_count,
+                    reduce_slice_idx,
+                    lock_slot,
+                    active_size_m,
+                    1,
+                )
+            else:
+                self._run_tile_with_pair_override(
+                    a_bf16_flat,
+                    a_alt_bf16_flat,
+                    b_i32_flat,
+                    c_bf16_flat,
+                    scales_i32_flat,
+                    global_scale,
+                    packed_route_indices,
+                    topk_weights_flat,
+                    c_tmp_f32_flat,
+                    locks_i32_flat,
+                    trellis_lut_addr,
+                    smem_base,
+                    tid,
+                    route_block_idx,
+                    expert_idx,
+                    output_n_tile,
+                    reduce_k_tile,
+                    reduce_tile_count,
+                    reduce_slice_count,
+                    reduce_slice_idx,
+                    lock_slot,
+                    active_size_m,
+                    0,
+                )
+            return
+        self._run_tile_with_pair_override(
+            a_bf16_flat,
+            a_alt_bf16_flat,
+            b_i32_flat,
+            c_bf16_flat,
+            scales_i32_flat,
+            global_scale,
+            packed_route_indices,
+            topk_weights_flat,
+            c_tmp_f32_flat,
+            locks_i32_flat,
+            trellis_lut_addr,
+            smem_base,
+            tid,
+            route_block_idx,
+            expert_idx,
+            output_n_tile,
+            reduce_k_tile,
+            reduce_tile_count,
+            reduce_slice_count,
+            reduce_slice_idx,
+            lock_slot,
+            active_size_m,
+            -1,
+        )
+
+    @cute.jit
+    def _run_tile_with_pair_override(
+        self,
+        a_bf16_flat: cute.Tensor,
+        a_alt_bf16_flat: cute.Tensor,
+        b_i32_flat: cute.Tensor,
+        c_bf16_flat: cute.Tensor,
+        scales_i32_flat: cute.Tensor,
+        global_scale: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        trellis_lut_addr: Int64,
+        smem_base: Int32,
+        tid: Int32,
+        route_block_idx: Int32,
+        expert_idx: Int32,
+        output_n_tile: Int32,
+        reduce_k_tile: Int32,
+        reduce_tile_count: Int32,
+        reduce_slice_count: Int32,
+        reduce_slice_idx: Int32,
+        lock_slot: Int32,
+        active_size_m: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
         if cutlass.const_expr(self.uses_m_block_8):
             self._run_tile_m8(
@@ -1789,6 +2005,7 @@ class W4A16GemmKernel:
                 topk_weights_flat,
                 c_tmp_f32_flat,
                 locks_i32_flat,
+                trellis_lut_addr,
                 smem_base,
                 tid,
                 route_block_idx,
@@ -1800,6 +2017,7 @@ class W4A16GemmKernel:
                 reduce_slice_idx,
                 lock_slot,
                 active_size_m,
+                dynamic_pair_override,
             )
         else:
             self._run_tile_large_m(
@@ -1813,6 +2031,7 @@ class W4A16GemmKernel:
                 topk_weights_flat,
                 c_tmp_f32_flat,
                 locks_i32_flat,
+                trellis_lut_addr,
                 smem_base,
                 tid,
                 route_block_idx,
@@ -1824,6 +2043,7 @@ class W4A16GemmKernel:
                 reduce_slice_idx,
                 lock_slot,
                 active_size_m,
+                dynamic_pair_override,
             )
 
     @cute.jit
@@ -1997,6 +2217,7 @@ class W4A16GemmKernel:
         topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
+        trellis_lut_addr: Int64,
         smem_base: Int32,
         tid: Int32,
         route_block_idx: Int32,
@@ -2008,6 +2229,7 @@ class W4A16GemmKernel:
         reduce_slice_idx: Int32,
         lock_slot: Int32,
         active_size_m: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
         (
             global_scale_f32,
@@ -2035,7 +2257,6 @@ class W4A16GemmKernel:
             active_size_m,
         )
         a_sh_rd = self._a_shared_read_offset(tid, 8)
-
         # LLVM 23 also promotes this 16-f32 accumulator across the pipelined
         # control-flow joins, repeatedly packing adjacent values through i64
         # temporaries.  Keep the values in independent scalar fragments, as in
@@ -2071,6 +2292,7 @@ class W4A16GemmKernel:
             a_rows_per_iter,
             output_n_tile,
             expert_idx,
+            dynamic_pair_override,
         )
 
         b_scale_cur = cute.make_rmem_tensor((2, 4), Uint32)
@@ -2083,6 +2305,8 @@ class W4A16GemmKernel:
             s_sh_rd,
             Int32(0),
             Int32(0),
+            reduce_k_tile,
+            dynamic_pair_override,
         )
         a_regs_cur = cute.make_rmem_tensor((2,), Uint32)
         a_regs_next = cute.make_rmem_tensor((2,), Uint32)
@@ -2099,6 +2323,7 @@ class W4A16GemmKernel:
             a_alt_bf16_flat,
             b_i32_flat,
             scales_i32_flat,
+            trellis_lut_addr,
             smem_base,
             tid,
             acc,
@@ -2126,6 +2351,7 @@ class W4A16GemmKernel:
             a_rows_per_iter,
             output_n_tile,
             expert_idx,
+            dynamic_pair_override,
             True,
         )
 
@@ -2162,6 +2388,7 @@ class W4A16GemmKernel:
         topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
+        trellis_lut_addr: Int64,
         smem_base: Int32,
         tid: Int32,
         route_block_idx: Int32,
@@ -2267,6 +2494,7 @@ class W4A16GemmKernel:
             a_alt_bf16_flat,
             b_i32_flat,
             scales_i32_flat,
+            trellis_lut_addr,
             smem_base,
             tid,
             acc0,
@@ -2350,6 +2578,7 @@ class W4A16GemmKernel:
         topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
+        trellis_lut_addr: Int64,
         smem_base: Int32,
         tid: Int32,
         route_block_idx: Int32,
@@ -2361,6 +2590,7 @@ class W4A16GemmKernel:
         reduce_slice_idx: Int32,
         lock_slot: Int32,
         active_size_m: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
         (
             global_scale_f32,
@@ -2388,7 +2618,6 @@ class W4A16GemmKernel:
             active_size_m,
         )
         a_sh_rd = self._a_shared_read_offset(tid, 16)
-
         # Keep each accumulator element in its own scalar rmem tensor. LLVM 23
         # otherwise promotes the 128-f32 accumulator to wide vector PHIs and
         # repeatedly packs/unpacks adjacent f32 values through i64 temporaries.
@@ -2447,6 +2676,7 @@ class W4A16GemmKernel:
             a_rows_per_iter,
             output_n_tile,
             expert_idx,
+            dynamic_pair_override,
         )
 
         b_scale_cur = cute.make_rmem_tensor((2, 4), Uint32)
@@ -2459,6 +2689,8 @@ class W4A16GemmKernel:
             s_sh_rd,
             Int32(0),
             Int32(0),
+            reduce_k_tile,
+            dynamic_pair_override,
         )
         a_regs = cute.make_rmem_tensor((self.cta_m_blocks, 4), Uint32)
         a_regs_next = cute.make_rmem_tensor((self.cta_m_blocks, 4), Uint32)
@@ -2475,6 +2707,7 @@ class W4A16GemmKernel:
             a_alt_bf16_flat,
             b_i32_flat,
             scales_i32_flat,
+            trellis_lut_addr,
             smem_base,
             tid,
             acc0,
@@ -2502,6 +2735,7 @@ class W4A16GemmKernel:
             a_rows_per_iter,
             output_n_tile,
             expert_idx,
+            dynamic_pair_override,
             False,
         )
 
@@ -2532,6 +2766,7 @@ class W4A16GemmKernel:
         a_alt_bf16_flat: cute.Tensor,
         b_i32_flat: cute.Tensor,
         scales_i32_flat: cute.Tensor,
+        trellis_lut_addr: Int64,
         smem_base: Int32,
         tid: Int32,
         acc0,
@@ -2559,6 +2794,7 @@ class W4A16GemmKernel:
         a_rows_per_iter: Int32,
         output_n_tile: Int32,
         expert_idx: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
         uses_m_block_8: cutlass.Constexpr[bool],
     ):
         b_frag = cute.make_rmem_tensor((2, 2), Uint32)
@@ -2579,6 +2815,8 @@ class W4A16GemmKernel:
                             kk,
                             tile_idx,
                             k_tiles,
+                            reduce_k_tile,
+                            dynamic_pair_override,
                             uses_m_block_8,
                         )
 
@@ -2608,56 +2846,60 @@ class W4A16GemmKernel:
                             a_rows_per_iter,
                             output_n_tile,
                             expert_idx,
+                            dynamic_pair_override,
                         )
 
-                        for jj in cutlass.range_constexpr(4):
-                            if cutlass.const_expr(self.weight_layout_trellis256):
-                                self._scaled_dequant_b_fragment_trellis256(
-                                    b_frag,
-                                    b_scale_cur[0, jj],
-                                    b_scale_cur[1, jj],
-                                )
-                            elif cutlass.const_expr(self.weight_layout_nf3):
-                                # NF3 triple: lo16 = half (jj % 2) of word
-                                # (jj // 2); hi8 = byte jj of the hi word; scale
-                                # register is the same per-jj lane as packed.
-                                lo_w = b_scale_cur[0, jj // 2]
-                                lo16 = (lo_w >> Uint32(16 * (jj % 2))) & Uint32(0xFFFF)
-                                hi8 = (b_scale_cur[0, 2] >> Uint32(8 * jj)) & Uint32(
-                                    0xFF
-                                )
-                                s = b_scale_cur[1, jj]
-                                self._scaled_dequant_b_fragment_nf3(
-                                    b_frag, lo16, hi8, s
-                                )
-                            else:
-                                q, s = self._select_b_scale_register(jj, b_scale_cur)
-                                self._scaled_dequant_b_fragment(b_frag, q, s)
-                            if cutlass.const_expr(uses_m_block_8):
-                                self._mma_accumulate_m8(
+                        if cutlass.const_expr(self.trellis_pair_dynamic):
+                            if cutlass.const_expr(
+                                int(dynamic_pair_override) == 1
+                            ):
+                                self._dequant_and_accumulate_bundle(
                                     acc0,
-                                    jj,
-                                    a_regs_cur,
+                                    acc1,
+                                    acc2,
+                                    acc3,
                                     b_frag,
+                                    b_scale_cur,
+                                    a_regs_cur,
+                                    tid,
+                                    reduce_k_tile + tile_idx,
+                                    kk,
+                                    trellis_lut_addr,
+                                    uses_m_block_8,
+                                    1,
                                 )
                             else:
-                                for mb in cutlass.range_constexpr(self.cta_m_blocks):
-                                    if cutlass.const_expr(mb == 0):
-                                        self._mma_accumulate_large_m(
-                                            acc0, a_regs_cur, mb, jj, b_frag
-                                        )
-                                    elif cutlass.const_expr(mb == 1):
-                                        self._mma_accumulate_large_m(
-                                            acc1, a_regs_cur, mb, jj, b_frag
-                                        )
-                                    elif cutlass.const_expr(mb == 2):
-                                        self._mma_accumulate_large_m(
-                                            acc2, a_regs_cur, mb, jj, b_frag
-                                        )
-                                    else:
-                                        self._mma_accumulate_large_m(
-                                            acc3, a_regs_cur, mb, jj, b_frag
-                                        )
+                                self._dequant_and_accumulate_bundle(
+                                    acc0,
+                                    acc1,
+                                    acc2,
+                                    acc3,
+                                    b_frag,
+                                    b_scale_cur,
+                                    a_regs_cur,
+                                    tid,
+                                    reduce_k_tile + tile_idx,
+                                    kk,
+                                    trellis_lut_addr,
+                                    uses_m_block_8,
+                                    0,
+                                )
+                        else:
+                            self._dequant_and_accumulate_bundle(
+                                acc0,
+                                acc1,
+                                acc2,
+                                acc3,
+                                b_frag,
+                                b_scale_cur,
+                                a_regs_cur,
+                                tid,
+                                reduce_k_tile + tile_idx,
+                                kk,
+                                trellis_lut_addr,
+                                uses_m_block_8,
+                                -1,
+                            )
 
                         if cutlass.const_expr(uses_m_block_8):
                             self._copy_a_register_bundle(
@@ -2688,6 +2930,8 @@ class W4A16GemmKernel:
                     s_sh_rd,
                     Int32(0),
                     Int32(0),
+                    reduce_k_tile + tile_idx,
+                    dynamic_pair_override,
                 )
                 self._load_a_register_bundle(
                     a_regs_cur,
@@ -2705,6 +2949,7 @@ class W4A16GemmKernel:
         a_alt_bf16_flat: cute.Tensor,
         b_i32_flat: cute.Tensor,
         scales_i32_flat: cute.Tensor,
+        trellis_lut_addr: Int64,
         smem_base: Int32,
         tid: Int32,
         acc0,
@@ -2791,18 +3036,7 @@ class W4A16GemmKernel:
                                     b_frag,
                                     b_scale_cur[0, jj],
                                     b_scale_cur[1, jj],
-                                )
-                            elif cutlass.const_expr(self.weight_layout_nf3):
-                                lo_w = b_scale_cur[0, jj // 2]
-                                lo16 = (lo_w >> Uint32(16 * (jj % 2))) & Uint32(0xFFFF)
-                                hi8 = (b_scale_cur[0, 2] >> Uint32(8 * jj)) & Uint32(
-                                    0xFF
-                                )
-                                self._scaled_dequant_b_fragment_nf3(
-                                    b_frag,
-                                    lo16,
-                                    hi8,
-                                    b_scale_cur[1, jj],
+                                    trellis_lut_addr,
                                 )
                             else:
                                 q, s = self._select_b_scale_register(jj, b_scale_cur)
@@ -2849,6 +3083,129 @@ class W4A16GemmKernel:
                     Int32(0),
                     Int32(0),
                 )
+
+    @cute.jit
+    def _dequant_and_accumulate_bundle(
+        self,
+        acc0,
+        acc1,
+        acc2,
+        acc3,
+        b_frag: cute.Tensor,
+        b_scale_cur: cute.Tensor,
+        a_regs_cur: cute.Tensor,
+        tid: Int32,
+        tile_idx: Int32,
+        kk: cutlass.Constexpr[int],
+        trellis_lut_addr: Int64,
+        uses_m_block_8: cutlass.Constexpr[bool],
+        dynamic_pair_override: cutlass.Constexpr[int],
+    ):
+        if cutlass.const_expr(
+            uses_m_block_8
+            and self.weight_layout_trellis256_pair
+            and self.trellis_rate_axis == "k"
+            and (
+                self.trellis_pair_kind == "P24"
+                or (
+                    self.trellis_pair_dynamic
+                    and int(dynamic_pair_override) == 1
+                )
+            )
+        ):
+            # FC2 assigns an entire warp/kk fragment to one side of the P24
+            # pair.  Select K2 versus K4 once, outside the four unrolled N16
+            # fragments, instead of repeating the same uniform branch in each
+            # dequantization call.
+            warp_id = tid >> Int32(5)
+            warp_row = warp_id // Int32(self.tb_n_warps)
+            kt_local = Int32(self.b_sh_wr_iters) * warp_row + Int32(kk)
+            logical_k16 = tile_idx * Int32(self.cta_k_blocks) + kt_local
+            if logical_k16 < Int32(8):
+                for jj in cutlass.range_constexpr(4):
+                    self._scaled_dequant_b_fragment_trellis256_bits(
+                        b_frag,
+                        b_scale_cur[0, jj],
+                        b_scale_cur[1, jj],
+                        trellis_lut_addr,
+                        2,
+                    )
+                    self._mma_accumulate_m8(acc0, jj, a_regs_cur, b_frag)
+            else:
+                for jj in cutlass.range_constexpr(4):
+                    self._scaled_dequant_b_fragment_trellis256_bits(
+                        b_frag,
+                        b_scale_cur[0, jj],
+                        b_scale_cur[1, jj],
+                        trellis_lut_addr,
+                        4,
+                    )
+                    self._mma_accumulate_m8(acc0, jj, a_regs_cur, b_frag)
+            return
+
+        for jj in cutlass.range_constexpr(4):
+            if cutlass.const_expr(self.weight_layout_trellis256):
+                if cutlass.const_expr(self.weight_layout_trellis256_pair):
+                    if cutlass.const_expr(int(dynamic_pair_override) == 0):
+                        self._scaled_dequant_b_fragment_trellis256_bits(
+                            b_frag,
+                            b_scale_cur[0, jj],
+                            b_scale_cur[1, jj],
+                            trellis_lut_addr,
+                            3,
+                        )
+                    elif cutlass.const_expr(int(dynamic_pair_override) == 1):
+                        self._scaled_dequant_b_fragment_trellis256_p24(
+                            b_frag,
+                            b_scale_cur[0, jj],
+                            b_scale_cur[1, jj],
+                            trellis_lut_addr,
+                            tid,
+                            jj,
+                            tile_idx,
+                            kk,
+                        )
+                    else:
+                        self._scaled_dequant_b_fragment_trellis256_pair(
+                            b_frag,
+                            b_scale_cur[0, jj],
+                            b_scale_cur[1, jj],
+                            trellis_lut_addr,
+                            tid,
+                            jj,
+                            tile_idx,
+                            kk,
+                        )
+                else:
+                    self._scaled_dequant_b_fragment_trellis256(
+                        b_frag,
+                        b_scale_cur[0, jj],
+                        b_scale_cur[1, jj],
+                        trellis_lut_addr,
+                    )
+            else:
+                q, s = self._select_b_scale_register(jj, b_scale_cur)
+                self._scaled_dequant_b_fragment(b_frag, q, s)
+            if cutlass.const_expr(uses_m_block_8):
+                self._mma_accumulate_m8(acc0, jj, a_regs_cur, b_frag)
+            else:
+                for mb in cutlass.range_constexpr(self.cta_m_blocks):
+                    if cutlass.const_expr(mb == 0):
+                        self._mma_accumulate_large_m(
+                            acc0, a_regs_cur, mb, jj, b_frag
+                        )
+                    elif cutlass.const_expr(mb == 1):
+                        self._mma_accumulate_large_m(
+                            acc1, a_regs_cur, mb, jj, b_frag
+                        )
+                    elif cutlass.const_expr(mb == 2):
+                        self._mma_accumulate_large_m(
+                            acc2, a_regs_cur, mb, jj, b_frag
+                        )
+                    else:
+                        self._mma_accumulate_large_m(
+                            acc3, a_regs_cur, mb, jj, b_frag
+                        )
 
     @cute.jit
     def _finish_tile(
@@ -3326,11 +3683,15 @@ class W4A16GemmKernel:
         s_sh_rd: Int32,
         pipe: Int32,
         kk: Int32,
+        tile_idx: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
         if cutlass.const_expr(self.weight_layout_trellis256):
             # TRELLIS-256: no per-weight scale; the (2,4) bundle carries the 4
             # jj-tiles' pre-funnelled windows -> regs[0,jj]=win_a, regs[1,jj]=win_b.
-            return self._load_b_registers_trellis256(smem_base, tid, pipe, kk)
+            return self._load_b_registers_trellis256(
+                smem_base, tid, pipe, kk, tile_idx, dynamic_pair_override
+            )
         if cutlass.const_expr(self.weight_layout == "modelopt"):
             q0, q1, q2, q3 = self._load_b_registers_modelopt_shared(
                 smem_base,
@@ -3338,29 +3699,6 @@ class W4A16GemmKernel:
                 pipe,
                 kk,
             )
-        elif cutlass.const_expr(self.weight_layout_nf3):
-            # NF3-MAPPING-V1: the thread's 32-code unit index within the pipe's
-            # B region equals the stock staged-unit index (algebraically
-            # identical to b_sh_stride*kk + b_sh_rd): cur_group_id is the K16 row
-            # within the tile, (tid % b_sh_stride) is the N-pair. Each unit is a
-            # 12-byte (lo0, lo1, hi) triple; three scalar u32 loads over stride-3
-            # words are bank-conflict free (gcd(3, 32) == 1). q3 is unused.
-            nf3_warp_id = tid // Int32(32)
-            nf3_warp_row = nf3_warp_id // Int32(self.tb_n_warps)
-            nf3_group = Int32(self.b_sh_wr_iters) * nf3_warp_row + kk
-            nf3_unit = nf3_group * Int32(self.b_sh_stride) + (
-                tid % Int32(self.b_sh_stride)
-            )
-            b_addr = (
-                smem_base
-                + Int32(self.sh_b_off * 16)
-                + pipe * Int32(self.b_sh_stage_bytes)
-                + nf3_unit * Int32(12)
-            )
-            q0 = ld_shared_u32(b_addr)
-            q1 = ld_shared_u32(b_addr + Int32(4))
-            q2 = ld_shared_u32(b_addr + Int32(8))
-            q3 = Uint32(0)
         else:
             b_addr = self._int4_addr(
                 smem_base,
@@ -3399,6 +3737,8 @@ class W4A16GemmKernel:
         s_sh_rd: Int32,
         pipe: Int32,
         kk: Int32,
+        tile_idx: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
         q0, q1, q2, q3, s0, s1, s2, s3 = self._load_b_scale_registers(
             smem_base,
@@ -3407,6 +3747,8 @@ class W4A16GemmKernel:
             s_sh_rd,
             pipe,
             kk,
+            tile_idx,
+            dynamic_pair_override,
         )
         regs[0, 0] = q0
         regs[0, 1] = q1
@@ -3447,6 +3789,8 @@ class W4A16GemmKernel:
         kk: cutlass.Constexpr[int],
         tile_idx: Int32,
         k_tiles: Int32,
+        reduce_k_tile: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
         uses_m_block_8: cutlass.Constexpr[bool],
     ):
         self._clear_b_scale_register_bundle(b_scale_next)
@@ -3462,6 +3806,8 @@ class W4A16GemmKernel:
                     s_sh_rd,
                     Int32(pipe),
                     Int32(kk + 1),
+                    reduce_k_tile + tile_idx,
+                    dynamic_pair_override,
                 )
                 self._load_a_register_bundle(
                     a_regs_next,
@@ -3482,6 +3828,8 @@ class W4A16GemmKernel:
                     s_sh_rd,
                     Int32((pipe + 1) % _STAGES),
                     Int32(0),
+                    reduce_k_tile + next_tile,
+                    dynamic_pair_override,
                 )
                 self._load_a_register_bundle(
                     a_regs_next,
@@ -3583,43 +3931,21 @@ class W4A16GemmKernel:
         frag[1, 0] = b1_0
         frag[1, 1] = b1_1
 
-    @cute.jit
-    def _scaled_dequant_b_fragment_nf3(
-        self, frag: cute.Tensor, lo16: Uint32, hi8: Uint32, s: Uint32
-    ):
-        # NF3: 8 3-bit codes (2 lo-bits in lo16, 1 hi-bit in hi8) -> 4 bf16x2
-        # codebook fragments, in the SAME element order the packed path uses:
-        # o0=(cb[c0],cb[c1]) -> frag[0,0], o1 -> frag[0,1], o2 -> frag[1,0],
-        # o3 -> frag[1,1]. frag[0,*] takes the N-col-0 scale lane, frag[1,*] the
-        # N-col-1 lane (identical broadcast to _scaled_dequant_b_fragment).
-        o0, o1, o2, o3 = packed_dequant_nf3x8_to_bfloat2x4(
-            lo16,
-            hi8,
-            Uint32(self._nf3_cb0),
-            Uint32(self._nf3_cb1),
-            Uint32(self._nf3_cb2),
-            Uint32(self._nf3_cb3),
-        )
-        s_lane0 = bfloat2_broadcast_lane(s, Int32(0))
-        s_lane1 = bfloat2_broadcast_lane(s, Int32(1))
-        frag[0, 0] = self._elem2_mul(o0, s_lane0)
-        frag[0, 1] = self._elem2_mul(o1, s_lane0)
-        frag[1, 0] = self._elem2_mul(o2, s_lane1)
-        frag[1, 1] = self._elem2_mul(o3, s_lane1)
 
     @cute.jit
-    def _trellis256_lane_geom(
+    def _trellis256_lane_geom_bits(
         self,
         lane: Int32,
         weight_offset: cutlass.Constexpr[int],
         weight_count: cutlass.Constexpr[int],
+        bits: cutlass.Constexpr[int],
     ):
-        bits = Int32(self.trellis_bits)
-        ring_u32 = Int32(8 * self.trellis_bits)
+        bits_i32 = Int32(int(bits))
+        ring_u32 = Int32(8 * int(bits))
         t_offset = Int32(8) * lane + Int32(weight_offset)
-        b1 = (t_offset + Int32(257)) * bits
+        b1 = (t_offset + Int32(257)) * bits_i32
         b0 = b1 - Int32(16)
-        b2 = b1 + Int32((int(weight_count) - 1) * self.trellis_bits)
+        b2 = b1 + Int32((int(weight_count) - 1) * int(bits))
         i0 = b0 >> Int32(5)
         i2 = (b2 - Int32(1)) >> Int32(5)
         ia = i0 - ring_u32 * (i0 >= ring_u32).to(Int32)
@@ -3628,9 +3954,66 @@ class W4A16GemmKernel:
         return ia, ib, s2, i2 - i0
 
     @cute.jit
+    def _trellis256_lane_geom(
+        self,
+        lane: Int32,
+        weight_offset: cutlass.Constexpr[int],
+        weight_count: cutlass.Constexpr[int],
+    ):
+        return self._trellis256_lane_geom_bits(
+            lane, weight_offset, weight_count, self.trellis_bits
+        )
+
+    @cute.jit
     def _trellis_funnel256(self, a: Uint32, b: Uint32, s2: Int32):
         merged = (Int64(a) << Int64(32)) | Int64(b)
         return Uint32(merged >> Int64(s2))
+
+    @cute.jit
+    def _scaled_dequant_b_fragment_trellis256_bits(
+        self,
+        frag: cute.Tensor,
+        win_a: Uint32,
+        win_b: Uint32,
+        trellis_lut_addr: Int64,
+        bits: cutlass.Constexpr[int],
+    ):
+        if cutlass.const_expr(self.trellis_codebook == "mcg"):
+            if cutlass.const_expr(int(bits) == 6):
+                if cutlass.const_expr(self.is_fp16):
+                    o0, o1, o2, o3 = packed_dequant_trellis_stream_to_half2x4(
+                        win_a, win_b, int(bits)
+                    )
+                else:
+                    o0, o1, o2, o3 = packed_dequant_trellis_stream_to_bfloat2x4(
+                        win_a, win_b, int(bits)
+                    )
+            elif cutlass.const_expr(self.is_fp16):
+                o0, o1, o2, o3 = packed_dequant_trellis_to_half2x4(
+                    win_a, win_b, int(bits)
+                )
+            else:
+                o0, o1, o2, o3 = packed_dequant_trellis_to_bfloat2x4(
+                    win_a, win_b, int(bits)
+                )
+        else:
+            e_lo, e_hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
+                win_a,
+                win_b,
+                trellis_lut_addr,
+                int(bits),
+                t12_in_shared=self.sqg_xor_cheb_t12_smem,
+            )
+            if cutlass.const_expr(self.is_fp16):
+                o0, o1 = fp8x4_e4m3_to_half2x2(e_lo)
+                o2, o3 = fp8x4_e4m3_to_half2x2(e_hi)
+            else:
+                o0, o1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(e_lo)
+                o2, o3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(e_hi)
+        frag[0, 0] = o0
+        frag[0, 1] = o1
+        frag[1, 0] = o2
+        frag[1, 1] = o3
 
     @cute.jit
     def _scaled_dequant_b_fragment_trellis256(
@@ -3638,28 +4021,202 @@ class W4A16GemmKernel:
         frag: cute.Tensor,
         win_a: Uint32,
         win_b: Uint32,
+        trellis_lut_addr: Int64,
     ):
-        if cutlass.const_expr(self.trellis_bits == 6):
-            if cutlass.const_expr(self.is_fp16):
-                o0, o1, o2, o3 = packed_dequant_trellis_stream_to_half2x4(
-                    win_a, win_b, self.trellis_bits
+        self._scaled_dequant_b_fragment_trellis256_bits(
+            frag, win_a, win_b, trellis_lut_addr, self.trellis_bits
+        )
+
+    @cute.jit
+    def _scaled_dequant_b_fragment_trellis256_pair(
+        self,
+        frag: cute.Tensor,
+        win_a: Uint32,
+        win_b: Uint32,
+        trellis_lut_addr: Int64,
+        tid: Int32,
+        jj: cutlass.Constexpr[int],
+        tile_idx: Int32,
+        kk: cutlass.Constexpr[int],
+    ):
+        # Dynamic pair kernels dispatch to bitrate-specific arms before entering
+        # the MMA loop.  This fallback therefore serves only static P33/P24
+        # specializations and contains no runtime mode branch.
+        if cutlass.const_expr(self.trellis_pair_kind == "P33"):
+            self._scaled_dequant_b_fragment_trellis256_bits(
+                frag, win_a, win_b, trellis_lut_addr, 3
+            )
+            return
+        self._scaled_dequant_b_fragment_trellis256_p24(
+            frag, win_a, win_b, trellis_lut_addr, tid, jj, tile_idx, kk
+        )
+
+    @cute.jit
+    def _scaled_dequant_b_fragment_trellis256_p24(
+        self,
+        frag: cute.Tensor,
+        win_a: Uint32,
+        win_b: Uint32,
+        trellis_lut_addr: Int64,
+        tid: Int32,
+        jj: cutlass.Constexpr[int],
+        tile_idx: Int32,
+        kk: cutlass.Constexpr[int],
+    ):
+        warp_id = tid >> Int32(5)
+        if cutlass.const_expr(self.trellis_rate_axis == "n"):
+            # The MMA work is striped LLHH inside each four-N16 warp slab so
+            # every warp executes two K2 and two K4 fragments.  The epilogue
+            # scatters these accumulator fragments back to the reference
+            # record0 || record1 channel order before the outer Hadamard.
+            if cutlass.const_expr(jj < 2):
+                self._scaled_dequant_b_fragment_trellis256_bits(
+                    frag, win_a, win_b, trellis_lut_addr, 2
                 )
             else:
-                o0, o1, o2, o3 = packed_dequant_trellis_stream_to_bfloat2x4(
-                    win_a, win_b, self.trellis_bits
+                self._scaled_dequant_b_fragment_trellis256_bits(
+                    frag, win_a, win_b, trellis_lut_addr, 4
                 )
-        elif cutlass.const_expr(self.is_fp16):
-            o0, o1, o2, o3 = packed_dequant_trellis_to_half2x4(
-                win_a, win_b, self.trellis_bits
+        else:
+            warp_row = warp_id // Int32(self.tb_n_warps)
+            kt_local = Int32(self.b_sh_wr_iters) * warp_row + Int32(kk)
+            logical_k16 = tile_idx * Int32(self.cta_k_blocks) + kt_local
+            if logical_k16 < Int32(8):
+                self._scaled_dequant_b_fragment_trellis256_bits(
+                    frag, win_a, win_b, trellis_lut_addr, 2
+                )
+            else:
+                self._scaled_dequant_b_fragment_trellis256_bits(
+                    frag, win_a, win_b, trellis_lut_addr, 4
+                )
+
+    @cute.jit
+    def _load_trellis256_pair_tile_windows(
+        self,
+        b_region: Int32,
+        tile_base_u32: Int32,
+        lane: Int32,
+        bits: cutlass.Constexpr[int],
+    ):
+        ia, ib, s2, _ = self._trellis256_lane_geom_bits(lane, 0, 8, bits)
+        a = ld_shared_u32(b_region + (tile_base_u32 + ia) * Int32(4))
+        b = ld_shared_u32(b_region + (tile_base_u32 + ib) * Int32(4))
+        return (
+            self._trellis_funnel256(a, b, s2),
+            self._trellis_funnel256(a, b, s2 + Int32(4 * int(bits))),
+        )
+
+    @cute.jit
+    def _load_b_registers_trellis256_pair(
+        self,
+        smem_base: Int32,
+        tid: Int32,
+        pipe: Int32,
+        kk: Int32,
+        tile_idx: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
+    ):
+        regs = cute.make_rmem_tensor((2, 4), Uint32)
+        if cutlass.const_expr(
+            self.trellis_pair_kind == "P24"
+            or (
+                self.trellis_pair_dynamic
+                and int(dynamic_pair_override) == 1
+            )
+        ):
+            self._load_b_registers_trellis256_pair_bits(
+                regs, smem_base, tid, pipe, kk, tile_idx, 2, 4
             )
         else:
-            o0, o1, o2, o3 = packed_dequant_trellis_to_bfloat2x4(
-                win_a, win_b, self.trellis_bits
+            self._load_b_registers_trellis256_pair_bits(
+                regs, smem_base, tid, pipe, kk, tile_idx, 3, 3
             )
-        frag[0, 0] = o0
-        frag[0, 1] = o1
-        frag[1, 0] = o2
-        frag[1, 1] = o3
+        return (
+            regs[0, 0],
+            regs[0, 1],
+            regs[0, 2],
+            regs[0, 3],
+            regs[1, 0],
+            regs[1, 1],
+            regs[1, 2],
+            regs[1, 3],
+        )
+
+    @cute.jit
+    def _load_b_registers_trellis256_pair_bits(
+        self,
+        regs: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        pipe: Int32,
+        kk: Int32,
+        tile_idx: Int32,
+        low_bits: cutlass.Constexpr[int],
+        high_bits: cutlass.Constexpr[int],
+    ):
+        lane = tid & Int32(31)
+        warp_id = tid >> Int32(5)
+        warp_row = warp_id // Int32(self.tb_n_warps)
+        w_n = warp_id % Int32(self.tb_n_warps)
+        kt_local = Int32(self.b_sh_wr_iters) * warp_row + kk
+        b_region = (
+            smem_base + Int32(self.sh_b_off * 16) + pipe * Int32(self.b_sh_stage_bytes)
+        )
+        wa = [Uint32(0), Uint32(0), Uint32(0), Uint32(0)]
+        wb = [Uint32(0), Uint32(0), Uint32(0), Uint32(0)]
+        if cutlass.const_expr(self.trellis_rate_axis == "n"):
+            pair_span_u32 = 8 * 8 * (low_bits + high_bits)
+            high_base_u32 = 8 * 8 * low_bits
+            for jj in cutlass.range_constexpr(4):
+                # Reference storage remains record0 || record1.  MMA register
+                # assignment is LLHH within a warp; the epilogue restores the
+                # original contiguous output-channel order.
+                if cutlass.const_expr(jj < 2):
+                    record_n16 = Int32(2) * w_n + Int32(jj)
+                    tile_base = (
+                        kt_local * Int32(pair_span_u32)
+                        + record_n16 * Int32(8 * low_bits)
+                    )
+                    wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
+                        b_region, tile_base, lane, low_bits
+                    )
+                else:
+                    record_n16 = Int32(2) * w_n + Int32(jj - 2)
+                    tile_base = (
+                        kt_local * Int32(pair_span_u32)
+                        + Int32(high_base_u32)
+                        + record_n16 * Int32(8 * high_bits)
+                    )
+                    wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
+                        b_region, tile_base, lane, high_bits
+                    )
+        else:
+            # Each K16 row owns a max-K4 shared slot.  K2/K3 rows occupy only
+            # the compact prefix; the remainder is intentionally untouched.
+            logical_k16 = tile_idx * Int32(self.cta_k_blocks) + kt_local
+            tile_slot_u32 = self.cta_n_blocks * 8 * 4
+            kt_base_u32 = kt_local * Int32(tile_slot_u32)
+            for jj in cutlass.range_constexpr(4):
+                local_n16 = Int32(4) * w_n + Int32(jj)
+                tile_base = Int32(0)
+                if cutlass.const_expr(int(low_bits) == int(high_bits)):
+                    tile_base = kt_base_u32 + local_n16 * Int32(8 * low_bits)
+                    wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
+                        b_region, tile_base, lane, low_bits
+                    )
+                elif logical_k16 < Int32(8):
+                    tile_base = kt_base_u32 + local_n16 * Int32(8 * low_bits)
+                    wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
+                        b_region, tile_base, lane, low_bits
+                    )
+                else:
+                    tile_base = kt_base_u32 + local_n16 * Int32(8 * high_bits)
+                    wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
+                        b_region, tile_base, lane, high_bits
+                    )
+        for jj in cutlass.range_constexpr(4):
+            regs[0, jj] = wa[jj]
+            regs[1, jj] = wb[jj]
 
     @cute.jit
     def _load_b_registers_trellis256(
@@ -3668,7 +4225,18 @@ class W4A16GemmKernel:
         tid: Int32,
         pipe: Int32,
         kk: Int32,
+        tile_idx: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
+        if cutlass.const_expr(self.weight_layout_trellis256_pair):
+            return self._load_b_registers_trellis256_pair(
+                smem_base,
+                tid,
+                pipe,
+                kk,
+                tile_idx,
+                dynamic_pair_override,
+            )
         lane = tid & Int32(31)
         warp_id = tid >> Int32(5)
         warp_row = warp_id // Int32(self.tb_n_warps)
@@ -4022,6 +4590,7 @@ class W4A16GemmKernel:
         a_rows_per_iter: Int32,
         output_n_tile: Int32,
         expert_idx: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
         for i in cutlass.range_constexpr(self.a_sh_wr_iters):
             row = a_rows_per_iter * Int32(i) + a_gl_rd_row
@@ -4093,86 +4662,177 @@ class W4A16GemmKernel:
 
         if cutlass.const_expr(self.weight_layout_trellis256):
             t256_n16 = self.size_n // 16
-            t256_tile_u32 = 8 * self.trellis_bits
-            t256_expert_u32 = (self.size_k // 16) * t256_n16 * t256_tile_u32
-            t256_chunks_per_kt = self.cta_n_blocks * (2 * self.trellis_bits)
-            t256_total_chunks = self.cta_k_blocks * t256_chunks_per_kt
-            for i in cutlass.range_constexpr(self.b_sh_wr_iters_nf3):
-                t256_chunk = Int32(i * self.cta_threads) + tid
-                t256_kt = t256_chunk // Int32(t256_chunks_per_kt)
-                t256_in_kt = t256_chunk - t256_kt * Int32(t256_chunks_per_kt)
-                b_dst = (
-                    smem_base
-                    + Int32(self.sh_b_off * 16)
-                    + pipe * Int32(self.b_sh_stage_bytes)
-                    + t256_chunk * Int32(16)
-                )
-                if cutlass.const_expr(self.weight_layout_trellis256_proj):
-                    t256_half_n16 = t256_n16 // 2
-                    t256_out_n16 = output_n_tile * Int32(self.cta_n_blocks)
-                    t256_proj = (t256_out_n16 >= Int32(t256_half_n16)).to(Int32)
-                    t256_local_n16 = t256_out_n16 - t256_proj * Int32(t256_half_n16)
-                    t256_proj_expert_u32 = (
-                        (self.size_k // 16) * t256_half_n16 * t256_tile_u32
+            if cutlass.const_expr(self.weight_layout_trellis256_pair):
+                low_bits = 3
+                high_bits = 3
+                if cutlass.const_expr(
+                    self.trellis_pair_kind == "P24"
+                    or (
+                        self.trellis_pair_dynamic
+                        and int(dynamic_pair_override) == 1
                     )
-                    # Projection-major W13 is physically [2, E, ...].  Derive
-                    # the projection-plane stride from the runtime tensor
-                    # extent so one compiled EXL3 kernel can serve artifacts
-                    # with different compact expert counts.
-                    t256_plane_u32 = Int64(cute.size(b_i32_flat)) // Int64(2)
-                    b_src_i64 = (
-                        Int64(t256_proj) * t256_plane_u32
-                        + Int64(expert_idx) * Int64(t256_proj_expert_u32)
-                        + (Int64(tile_idx) * Int64(self.cta_k_blocks) + Int64(t256_kt))
-                        * Int64(t256_half_n16 * t256_tile_u32)
-                        + Int64(t256_local_n16) * Int64(t256_tile_u32)
-                        + Int64(t256_in_kt) * Int64(4)
-                    )
+                ):
+                    low_bits = 2
+                    high_bits = 4
+                if cutlass.const_expr(self.trellis_rate_axis == "n"):
+                    # Preparation swizzles the reference record-major payload
+                    # into one fixed-size compact pair span per K16 row.
+                    pair_u32_per_k16 = Int32(8 * 8 * (low_bits + high_bits))
+                    t256_chunks_per_kt = self.cta_n_blocks * 6
+                    t256_total_chunks = self.cta_k_blocks * t256_chunks_per_kt
+                    t256_pair_u32 = (self.size_k // 16) * pair_u32_per_k16
+                    for i in cutlass.range_constexpr(self.b_sh_wr_iters_var):
+                        t256_chunk = Int32(i * self.cta_threads) + tid
+                        t256_kt = t256_chunk // Int32(t256_chunks_per_kt)
+                        t256_in_kt = (
+                            t256_chunk - t256_kt * Int32(t256_chunks_per_kt)
+                        )
+                        b_dst = (
+                            smem_base
+                            + Int32(self.sh_b_off * 16)
+                            + pipe * Int32(self.b_sh_stage_bytes)
+                            + t256_chunk * Int32(16)
+                        )
+                        pair_base_i64 = Int64(0)
+                        if cutlass.const_expr(self.weight_layout_trellis256_proj):
+                            # Projection-major FC1 payload: [projection, E,
+                            # K16, compact-pair-row].  TP12 has exactly one
+                            # 256-channel pair per gate/up projection.
+                            pair_plane_u32 = Int64(cute.size(b_i32_flat)) // Int64(2)
+                            pair_base_i64 = (
+                                Int64(output_n_tile) * pair_plane_u32
+                                + Int64(expert_idx) * Int64(t256_pair_u32)
+                            )
+                        else:
+                            # Dense/expert-major payload: [E, pair, K16,
+                            # compact-pair-row].
+                            pair_base_i64 = (
+                                Int64(expert_idx) * Int64(self.size_n // 256)
+                                + Int64(output_n_tile)
+                            ) * Int64(t256_pair_u32)
+                        b_src_i64 = (
+                            pair_base_i64
+                            + (
+                                Int64(tile_idx) * Int64(self.cta_k_blocks)
+                                + Int64(t256_kt)
+                            )
+                            * Int64(pair_u32_per_k16)
+                            + Int64(t256_in_kt) * Int64(4)
+                        )
+                        cp_async4_shared_global_pred(
+                            b_dst,
+                            get_ptr_as_int64(b_i32_flat, b_src_i64),
+                            (t256_chunk < Int32(t256_total_chunks)).to(Int32),
+                        )
                 else:
-                    b_src_i64 = (
-                        Int64(t256_expert_u32) * Int64(expert_idx)
-                        + (Int64(tile_idx) * Int64(self.cta_k_blocks) + Int64(t256_kt))
-                        * Int64(t256_n16 * t256_tile_u32)
-                        + Int64(output_n_tile)
-                        * Int64(self.cta_n_blocks * t256_tile_u32)
-                        + Int64(t256_in_kt) * Int64(4)
+                    # The two source records remain contiguous in both payload
+                    # and physical K.  Reserve K4-sized shared slots, then copy
+                    # each compact K2/K3/K4 source tile into its K16 slot's
+                    # prefix.
+                    max_chunks_per_kt = self.cta_n_blocks * 8
+                    t256_expert_u32 = (self.size_k // 16) * t256_n16 * 24
+                    low_record_u32 = Int32(8 * t256_n16 * 8 * low_bits)
+                    for i in cutlass.range_constexpr(self.b_sh_wr_iters_var):
+                        t256_chunk = Int32(i * self.cta_threads) + tid
+                        t256_kt = t256_chunk // Int32(max_chunks_per_kt)
+                        t256_in_kt = (
+                            t256_chunk - t256_kt * Int32(max_chunks_per_kt)
+                        )
+                        logical_k16 = (
+                            tile_idx * Int32(self.cta_k_blocks) + t256_kt
+                        )
+                        high_record = (logical_k16 >= Int32(8)).to(Int32)
+                        local_k16 = logical_k16 - high_record * Int32(8)
+                        record_bits = Int32(low_bits)
+                        if high_record != Int32(0):
+                            record_bits = Int32(high_bits)
+                        record_base_u32 = high_record * low_record_u32
+                        actual_chunks = Int32(self.cta_n_blocks * 2) * record_bits
+                        b_dst = (
+                            smem_base
+                            + Int32(self.sh_b_off * 16)
+                            + pipe * Int32(self.b_sh_stage_bytes)
+                            + t256_chunk * Int32(16)
+                        )
+                        b_src_i64 = (
+                            Int64(t256_expert_u32) * Int64(expert_idx)
+                            + Int64(record_base_u32)
+                            + Int64(local_k16)
+                            * Int64(t256_n16 * 8)
+                            * Int64(record_bits)
+                            + Int64(output_n_tile)
+                            * Int64(self.cta_n_blocks * 8)
+                            * Int64(record_bits)
+                            + Int64(t256_in_kt) * Int64(4)
+                        )
+                        cp_async4_shared_global_pred(
+                            b_dst,
+                            get_ptr_as_int64(b_i32_flat, b_src_i64),
+                            (t256_in_kt < actual_chunks).to(Int32),
+                        )
+            else:
+                t256_tile_u32 = 8 * self.trellis_bits
+                t256_expert_u32 = (
+                    (self.size_k // 16) * t256_n16 * t256_tile_u32
+                )
+                t256_chunks_per_kt = self.cta_n_blocks * (2 * self.trellis_bits)
+                t256_total_chunks = self.cta_k_blocks * t256_chunks_per_kt
+                for i in cutlass.range_constexpr(self.b_sh_wr_iters_var):
+                    t256_chunk = Int32(i * self.cta_threads) + tid
+                    t256_kt = t256_chunk // Int32(t256_chunks_per_kt)
+                    t256_in_kt = (
+                        t256_chunk - t256_kt * Int32(t256_chunks_per_kt)
                     )
-                cp_async4_shared_global_pred(
-                    b_dst,
-                    get_ptr_as_int64(b_i32_flat, b_src_i64),
-                    (t256_chunk < Int32(t256_total_chunks)).to(Int32),
-                )
-
-        if cutlass.const_expr(self.weight_layout_nf3):
-            # NF3 flat-span staging: the packer lays the per-(expert,
-            # output_n_tile, k-stage) B block out as ONE contiguous 12-byte-triple
-            # span (n_tile-major, then K16-row, then N-pair), so we copy it
-            # verbatim as 16-byte cp.async chunks. SMEM byte X of the pipe's B
-            # region == global byte X of the span, so the register read (unit*12)
-            # indexes it directly. b_gl_rd_base is unused on this path.
-            nf3_units_per_expert = (self.size_n * self.size_k) // 32
-            nf3_ntile_stride = (self.size_k // 16) * (self.tile_n // 2)
-            nf3_span_base_unit = (
-                Int32(nf3_units_per_expert) * expert_idx
-                + Int32(nf3_ntile_stride) * output_n_tile
-                + tile_idx * Int32(self.cta_k_blocks * self.b_sh_stride)
-            )
-            for i in cutlass.range_constexpr(self.b_sh_wr_iters_nf3):
-                nf3_chunk = Int32(i * self.cta_threads) + tid
-                b_dst = (
-                    smem_base
-                    + Int32(self.sh_b_off * 16)
-                    + pipe * Int32(self.b_sh_stage_bytes)
-                    + nf3_chunk * Int32(16)
-                )
-                # int32-element index of the chunk's first word:
-                # (span_base_unit*12 + chunk*16) / 4 = span_base_unit*3 + chunk*4.
-                b_src_i32 = nf3_span_base_unit * Int32(3) + nf3_chunk * Int32(4)
-                cp_async4_shared_global_pred(
-                    b_dst,
-                    get_ptr_as_int64(b_i32_flat, b_src_i32),
-                    (nf3_chunk < Int32(self.b_sh_chunks)).to(Int32),
-                )
+                    b_dst = (
+                        smem_base
+                        + Int32(self.sh_b_off * 16)
+                        + pipe * Int32(self.b_sh_stage_bytes)
+                        + t256_chunk * Int32(16)
+                    )
+                    if cutlass.const_expr(self.weight_layout_trellis256_proj):
+                        t256_half_n16 = t256_n16 // 2
+                        t256_out_n16 = output_n_tile * Int32(self.cta_n_blocks)
+                        t256_proj = (
+                            t256_out_n16 >= Int32(t256_half_n16)
+                        ).to(Int32)
+                        t256_local_n16 = (
+                            t256_out_n16 - t256_proj * Int32(t256_half_n16)
+                        )
+                        t256_proj_expert_u32 = (
+                            (self.size_k // 16)
+                            * t256_half_n16
+                            * t256_tile_u32
+                        )
+                        # Projection-major W13 is physically [2, E, ...].
+                        t256_plane_u32 = Int64(cute.size(b_i32_flat)) // Int64(2)
+                        b_src_i64 = (
+                            Int64(t256_proj) * t256_plane_u32
+                            + Int64(expert_idx) * Int64(t256_proj_expert_u32)
+                            + (
+                                Int64(tile_idx) * Int64(self.cta_k_blocks)
+                                + Int64(t256_kt)
+                            )
+                            * Int64(t256_half_n16 * t256_tile_u32)
+                            + Int64(t256_local_n16) * Int64(t256_tile_u32)
+                            + Int64(t256_in_kt) * Int64(4)
+                        )
+                    else:
+                        b_src_i64 = (
+                            Int64(t256_expert_u32) * Int64(expert_idx)
+                            + (
+                                Int64(tile_idx) * Int64(self.cta_k_blocks)
+                                + Int64(t256_kt)
+                            )
+                            * Int64(t256_n16 * t256_tile_u32)
+                            + Int64(output_n_tile)
+                            * Int64(self.cta_n_blocks * t256_tile_u32)
+                            + Int64(t256_in_kt) * Int64(4)
+                        )
+                    cp_async4_shared_global_pred(
+                        b_dst,
+                        get_ptr_as_int64(b_i32_flat, b_src_i64),
+                        (t256_chunk < Int32(t256_total_chunks)).to(Int32),
+                    )
 
         for i in cutlass.range_constexpr(
             0 if self.b_region_variable else self.b_sh_wr_iters
@@ -4268,6 +4928,7 @@ class W4A16GemmKernel:
         a_rows_per_iter: Int32,
         output_n_tile: Int32,
         expert_idx: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
         if cutlass.const_expr(kk == self.b_sh_wr_iters - 2):
             self._prefetch_lookahead_tile(
@@ -4295,6 +4956,7 @@ class W4A16GemmKernel:
                 a_rows_per_iter,
                 output_n_tile,
                 expert_idx,
+                dynamic_pair_override,
             )
 
     @cute.jit
@@ -4322,6 +4984,7 @@ class W4A16GemmKernel:
         a_rows_per_iter: Int32,
         output_n_tile: Int32,
         expert_idx: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
         for pipe in cutlass.range_constexpr(_STAGES - 1):
             if Int32(pipe) < k_tiles:
@@ -4348,6 +5011,7 @@ class W4A16GemmKernel:
                     a_rows_per_iter,
                     output_n_tile,
                     expert_idx,
+                    dynamic_pair_override,
                 )
             else:
                 cute.arch.cp_async_commit_group()
@@ -4381,6 +5045,7 @@ class W4A16GemmKernel:
         a_rows_per_iter: Int32,
         output_n_tile: Int32,
         expert_idx: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
         fetch_tile = tile_idx + Int32(_STAGES - 1)
         if fetch_tile < k_tiles:
@@ -4407,6 +5072,7 @@ class W4A16GemmKernel:
                 a_rows_per_iter,
                 output_n_tile,
                 expert_idx,
+                dynamic_pair_override,
             )
         else:
             cute.arch.cp_async_commit_group()
@@ -4781,13 +5447,32 @@ class W4A16GemmKernel:
             + (tid & Int32(31)) // Int32(4)
             + Int32(64) * (tid // Int32(32))
         )
-
         if tid // Int32(32) < Int32(self.tb_n_warps):
             write_scale = cutlass.Float32(1.0)
             if cutlass.const_expr(not self.mul_topk_weights):
                 write_scale = global_scale_f32
             for jj in cutlass.range_constexpr(4):
                 wr = c_sh_wr + Int32(16 * jj)
+                if cutlass.const_expr(
+                    self.weight_layout_trellis256_pair
+                    and self.trellis_rate_axis == "n"
+                ):
+                    # MMA register assignment is [L0,L1,H0,H1] per warp for
+                    # balanced P24 work.  Scatter the four N16 fragments back
+                    # to contiguous [L(0..7),H(0..7)] record order in output
+                    # SMEM.  This is a bijection and occurs before the outer
+                    # H128, so the public channel/transform semantics do not
+                    # change.
+                    warp_n = tid // Int32(32)
+                    semantic_n16 = Int32(2) * warp_n + Int32(jj)
+                    if cutlass.const_expr(jj >= 2):
+                        semantic_n16 = (
+                            Int32(8)
+                            + Int32(2) * warp_n
+                            + Int32(jj - 2)
+                        )
+                    compute_n16 = Int32(4) * warp_n + Int32(jj)
+                    wr += Int32(16) * (semantic_n16 - compute_n16)
                 self._st_shared_elem_from_f32(
                     smem_base + Int32(self.sh_red_off * 16) + (wr * Int32(2)),
                     acc[(jj * 4) // _SCALAR_ACC_FRAGMENT_WIDTH][
@@ -5124,19 +5809,39 @@ class W4A16GemmKernel:
             for mb in cutlass.range_constexpr(self.cta_m_blocks):
                 if cutlass.const_expr(mb == 0):
                     self._store_tile_large_m_block(
-                        acc0, smem_base, c_sh_wr, c_sh_stride, write_scale
+                        acc0,
+                        smem_base,
+                        c_sh_wr,
+                        c_sh_stride,
+                        tid // Int32(32),
+                        write_scale,
                     )
                 elif cutlass.const_expr(mb == 1):
                     self._store_tile_large_m_block(
-                        acc1, smem_base, c_sh_wr, c_sh_stride, write_scale
+                        acc1,
+                        smem_base,
+                        c_sh_wr,
+                        c_sh_stride,
+                        tid // Int32(32),
+                        write_scale,
                     )
                 elif cutlass.const_expr(mb == 2):
                     self._store_tile_large_m_block(
-                        acc2, smem_base, c_sh_wr, c_sh_stride, write_scale
+                        acc2,
+                        smem_base,
+                        c_sh_wr,
+                        c_sh_stride,
+                        tid // Int32(32),
+                        write_scale,
                     )
                 else:
                     self._store_tile_large_m_block(
-                        acc3, smem_base, c_sh_wr, c_sh_stride, write_scale
+                        acc3,
+                        smem_base,
+                        c_sh_wr,
+                        c_sh_stride,
+                        tid // Int32(32),
+                        write_scale,
                     )
                 c_sh_wr += Int32(16 * (4 * (2 * self.cta_n_blocks + 1)))
         self._epilogue_sync(sync_barrier)
@@ -5182,10 +5887,26 @@ class W4A16GemmKernel:
         smem_base: Int32,
         c_sh_wr: Int32,
         c_sh_stride: Int32,
+        warp_n: Int32,
         write_scale: cutlass.Float32,
     ):
         for jj in cutlass.range_constexpr(4):
             wr = c_sh_wr + Int32(8 * jj)
+            if cutlass.const_expr(
+                self.weight_layout_trellis256_pair
+                and self.trellis_rate_axis == "n"
+            ):
+                # Match the M<=8 epilogue: restore the reference record order
+                # from the balanced LLHH per-warp MMA assignment before H128.
+                semantic_n16 = Int32(2) * warp_n + Int32(jj)
+                if cutlass.const_expr(jj >= 2):
+                    semantic_n16 = (
+                        Int32(8)
+                        + Int32(2) * warp_n
+                        + Int32(jj - 2)
+                    )
+                compute_n16 = Int32(4) * warp_n + Int32(jj)
+                wr += Int32(8) * (semantic_n16 - compute_n16)
             self._write_bf16x2_shared(
                 smem_base,
                 wr,
@@ -5261,6 +5982,9 @@ class W4A16FusedMoeKernel:
         scale_format: str = "e4m3_k16",
         w13_layout: str = "w13",
         trellis_bits: int = 3,
+        trellis_codebook: str = "sqg_xor_cheb_t12",
+        fc1_trellis_pair_kind: str | None = None,
+        fc2_trellis_pair_kind: str | None = None,
         direct_topk_routes: bool = False,
         use_expert_map: bool = False,
         tc_decode_fused_sum: bool = False,
@@ -5292,8 +6016,7 @@ class W4A16FusedMoeKernel:
         else:
             w13_layout = "packed"
         self.tc_decode_fused_sum = bool(tc_decode_fused_sum)
-        # When two TC-decode launches share one pre-zeroed output (the NF3 hybrid
-        # runs an NVFP4 launch then an NF3 launch into the same tensor), only the
+        # When two TC-decode launches share one pre-zeroed output, only the
         # first must zero it. Default True preserves single-launch behavior.
         self.tc_zero_output = bool(tc_zero_output)
         self.collect_activation_amax = bool(collect_activation_amax)
@@ -5325,6 +6048,14 @@ class W4A16FusedMoeKernel:
         }
         self.top_k = int(top_k)
         self.moe_block_size = int(moe_block_size)
+        # Classic stripe split-K experiment: revert the whole-tile wave
+        # schedule (and the paired-route grouping that requires it) so
+        # decode-heavy small-M phases spread each mn-tile's K range across
+        # many CTAs instead of idling most of the grid.
+        self.small_m_splitk = _w4a16_small_m_splitk_enabled()
+        if self.small_m_splitk:
+            schedule_whole_tiles = False
+            fc2_schedule_route_block_factor = 1
         self.fc2_moe_block_size = int(
             moe_block_size if fc2_moe_block_size is None else fc2_moe_block_size
         )
@@ -5358,6 +6089,42 @@ class W4A16FusedMoeKernel:
         self.swiglu_beta = float(swiglu_beta)
         self.weight_layout = weight_layout
         self.trellis_bits = int(trellis_bits)
+        self.trellis_codebook = str(trellis_codebook).lower()
+        if self.weight_layout == "trellis3_t256":
+            if self.trellis_codebook not in _TRELLIS256_CODEBOOKS:
+                raise ValueError(
+                    "trellis3_t256 codebook must be one of "
+                    f"{sorted(_TRELLIS256_CODEBOOKS)}, got {self.trellis_codebook!r}"
+                )
+        self.fc1_trellis_pair_kind = (
+            None
+            if fc1_trellis_pair_kind is None
+            else str(fc1_trellis_pair_kind).upper()
+        )
+        self.fc2_trellis_pair_kind = (
+            None
+            if fc2_trellis_pair_kind is None
+            else str(fc2_trellis_pair_kind).upper()
+        )
+        if (self.fc1_trellis_pair_kind is None) != (
+            self.fc2_trellis_pair_kind is None
+        ):
+            raise ValueError(
+                "fused trellis pair weights require both FC1 and FC2 pair kinds"
+            )
+        if self.fc1_trellis_pair_kind is not None:
+            if weight_layout != "trellis3_t256":
+                raise ValueError("fused trellis pairs require trellis3_t256 weights")
+            if self.trellis_bits != 3:
+                raise ValueError("fused trellis pairs must average three bits")
+            if (
+                self.fc1_trellis_pair_kind != "PDYNAMIC"
+                or self.fc2_trellis_pair_kind != "PDYNAMIC"
+            ):
+                raise ValueError(
+                    "fused trellis pairs require PDYNAMIC mode tables; "
+                    "homogeneous P24/P33 use all-one/all-zero tables"
+                )
         self.scale_format = scale_format
         self.w13_layout = w13_layout
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
@@ -5370,7 +6137,8 @@ class W4A16FusedMoeKernel:
         if self.use_expert_map and not self.direct_topk_routes:
             raise ValueError("use_expert_map requires direct_topk_routes")
         self.schedule_whole_tiles = bool(
-            schedule_whole_tiles or weight_layout == "trellis3_t256"
+            (schedule_whole_tiles or weight_layout == "trellis3_t256")
+            and not self.small_m_splitk
         )
         self.intermediate_rotation = bool(intermediate_rotation)
         if self.intermediate_rotation:
@@ -5435,6 +6203,11 @@ class W4A16FusedMoeKernel:
             scale_format=scale_format,
             w13_layout=w13_layout,
             trellis_bits=self.trellis_bits,
+            trellis_codebook=self.trellis_codebook,
+            trellis_pair_kind=self.fc1_trellis_pair_kind,
+            trellis_rate_axis=(
+                "n" if self.fc1_trellis_pair_kind is not None else None
+            ),
             source_n_rotation=fc1_source_n_rotation,
             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
@@ -5463,6 +6236,11 @@ class W4A16FusedMoeKernel:
             scale_format=scale_format,
             w13_layout=("packed" if weight_layout == "trellis3_t256" else w13_layout),
             trellis_bits=self.trellis_bits,
+            trellis_codebook=self.trellis_codebook,
+            trellis_pair_kind=self.fc2_trellis_pair_kind,
+            trellis_rate_axis=(
+                "k" if self.fc2_trellis_pair_kind is not None else None
+            ),
             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
             fused_topk_sum=self.tc_decode_fused_sum,
@@ -5483,6 +6261,21 @@ class W4A16FusedMoeKernel:
         self.sms = self.fc1.sms
         self.blocks_per_sm = min(self.fc1.blocks_per_sm, self.fc2.blocks_per_sm)
         self.shared_words = max(self.fc1.shared_words, self.fc2.shared_words)
+        self.sqg_xor_cheb_t12_smem = (
+            self.trellis_codebook == "sqg_xor_cheb_t12"
+            and _sqg_xor_cheb_t12_smem_enabled()
+        )
+        self.sqg_xor_cheb_t12_smem_off = 0
+        if self.sqg_xor_cheb_t12_smem:
+            self.sqg_xor_cheb_t12_smem_off = (
+                self.shared_words * 4 + 15
+            ) // 16 * 16
+            self.shared_words = (
+                self.sqg_xor_cheb_t12_smem_off
+                + _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES
+            ) // 4
+            self.fc1.sqg_xor_cheb_t12_smem = True
+            self.fc2.sqg_xor_cheb_t12_smem = True
         self.barrier_count_off = self.sms * 4
         self.barrier_sense_off = self.sms * 4 + 1
 
@@ -5505,6 +6298,9 @@ class W4A16FusedMoeKernel:
             self.swiglu_beta,
             self.weight_layout,
             self.trellis_bits,
+            self.trellis_codebook,
+            self.fc1_trellis_pair_kind,
+            self.fc2_trellis_pair_kind,
             self.scale_format,
             self.apply_router_weight_on_input,
             self.zero_fc2_output,
@@ -5519,6 +6315,8 @@ class W4A16FusedMoeKernel:
             self.full_rotation,
             self.broadcast_suh,
             self.rotation_input_dtype,
+            self.sqg_xor_cheb_t12_smem,
+            self.small_m_splitk,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
             self.cta_threads,
@@ -5565,6 +6363,7 @@ class W4A16FusedMoeKernel:
         topk_weights_flat: cute.Tensor,
         c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
+        trellis_lut_addr: Int64,
         smem_base: Int32,
         tid: Int32,
         active_size_m: Int32,
@@ -5598,6 +6397,7 @@ class W4A16FusedMoeKernel:
                     topk_weights_flat,
                     c_tmp_f32_flat,
                     locks_i32_flat,
+                    trellis_lut_addr,
                     smem_base,
                     tid,
                     route_block_idx,
@@ -5622,6 +6422,7 @@ class W4A16FusedMoeKernel:
                     topk_weights_flat,
                     c_tmp_f32_flat,
                     locks_i32_flat,
+                    trellis_lut_addr,
                     smem_base,
                     tid,
                     route_block_idx,
@@ -5663,6 +6464,8 @@ class W4A16FusedMoeKernel:
         suh_gate_ptr: cute.Pointer,
         suh_up_ptr: cute.Pointer,
         expert_map_ptr: cute.Pointer,
+        fc1_trellis_lut_ptr: cute.Pointer,
+        fc2_trellis_lut_ptr: cute.Pointer,
         weight_num_experts: cutlass.Int32,
         route_num_experts: cutlass.Int32,
         active_m: cutlass.Int32,
@@ -5691,19 +6494,6 @@ class W4A16FusedMoeKernel:
                 * Int64(self.intermediate_size // 16)
                 * Int64(self.hidden_size // 16)
                 * Int64(8 * self.trellis_bits)
-            )
-        elif cutlass.const_expr(self.weight_layout == "nf3_2p1"):
-            w13_elements = (
-                expert_count
-                * Int64(self.hidden_size // 16)
-                * Int64(self.fc1_cols // 2)
-                * Int64(3)
-            )
-            w2_elements = (
-                expert_count
-                * Int64(self.intermediate_size // 16)
-                * Int64(self.hidden_size // 2)
-                * Int64(3)
             )
         else:
             w13_elements = (
@@ -5810,6 +6600,18 @@ class W4A16FusedMoeKernel:
                 (Int64(route_num_experts) + Int64(1),), stride=(1,)
             ),
         )
+        fc1_trellis_lut_flat = cute.make_tensor(
+            fc1_trellis_lut_ptr,
+            layout=cute.make_layout(
+                (Int64(_SQG_XOR_CHEB_T12_LUT_ENTRIES),), stride=(1,)
+            ),
+        )
+        fc2_trellis_lut_flat = cute.make_tensor(
+            fc2_trellis_lut_ptr,
+            layout=cute.make_layout(
+                (Int64(_SQG_XOR_CHEB_T12_LUT_ENTRIES),), stride=(1,)
+            ),
+        )
         grid = (grid_x, 1, 1)
         self.kernel(
             a_bf16_flat,
@@ -5837,6 +6639,8 @@ class W4A16FusedMoeKernel:
             suh_gate_flat,
             suh_up_flat,
             expert_map_flat,
+            fc1_trellis_lut_flat,
+            fc2_trellis_lut_flat,
             weight_num_experts,
             route_num_experts,
             active_m,
@@ -5880,6 +6684,8 @@ class W4A16FusedMoeKernel:
         suh_gate_flat: cute.Tensor,
         suh_up_flat: cute.Tensor,
         expert_map_flat: cute.Tensor,
+        fc1_trellis_lut_flat: cute.Tensor,
+        fc2_trellis_lut_flat: cute.Tensor,
         weight_num_experts: cutlass.Int32,
         route_num_experts: cutlass.Int32,
         active_m: cutlass.Int32,
@@ -5902,6 +6708,26 @@ class W4A16FusedMoeKernel:
 
         storage = smem.allocate(Storage)
         smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+        fc1_trellis_lut_addr = get_ptr_as_int64(fc1_trellis_lut_flat, Int32(0))
+        fc2_trellis_lut_addr = get_ptr_as_int64(fc2_trellis_lut_flat, Int32(0))
+
+        # The emit hooks receive the staged T12 table's shared byte offset
+        # through the LUT ABI slot.
+        fc1_phase_lut_addr = fc1_trellis_lut_addr
+        fc2_phase_lut_addr = fc2_trellis_lut_addr
+        if cutlass.const_expr(self.sqg_xor_cheb_t12_smem):
+            self._sqg_smem_copy(
+                fc1_trellis_lut_addr,
+                smem_base + Int32(self.sqg_xor_cheb_t12_smem_off),
+                _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES,
+                tid,
+            )
+            cute.arch.sync_threads()
+            table_addr = Int64(
+                smem_base + Int32(self.sqg_xor_cheb_t12_smem_off)
+            )
+            fc1_phase_lut_addr = table_addr
+            fc2_phase_lut_addr = table_addr
 
         fc1_emit_tile = None
         fc2_emit_tile = None
@@ -5920,6 +6746,7 @@ class W4A16FusedMoeKernel:
                 topk_weights_flat,
                 fc1_c_tmp_f32_flat,
                 locks_i32_flat,
+                fc1_phase_lut_addr,
                 smem_base,
                 tid,
                 active_m,
@@ -5940,6 +6767,7 @@ class W4A16FusedMoeKernel:
                 topk_weights_flat,
                 fc2_c_tmp_f32_flat,
                 locks_i32_flat,
+                fc2_phase_lut_addr,
                 smem_base,
                 tid,
                 active_m * Int32(self.top_k),
@@ -5972,6 +6800,8 @@ class W4A16FusedMoeKernel:
             suh_gate_flat,
             suh_up_flat,
             expert_map_flat,
+            fc1_trellis_lut_addr,
+            fc2_trellis_lut_addr,
             weight_num_experts,
             route_num_experts,
             smem_base,
@@ -6011,6 +6841,8 @@ class W4A16FusedMoeKernel:
         suh_gate_flat: cute.Tensor,
         suh_up_flat: cute.Tensor,
         expert_map_flat: cute.Tensor,
+        fc1_trellis_lut_addr: Int64,
+        fc2_trellis_lut_addr: Int64,
         weight_num_experts: Int32,
         route_num_experts: Int32,
         smem_base: Int32,
@@ -6026,6 +6858,16 @@ class W4A16FusedMoeKernel:
         # barrier, FC2. The emit hooks delegate per-tile expert resolution and
         # dispatch (used by the hybrid route map); None keeps the single-tier
         # resolution inside _run_persistent_gemm.
+        # The trellis LUT parameters carry the raw global address unless the
+        # single-tier entry staged the T12 staircase in shared memory.
+        fc1_phase_lut = fc1_trellis_lut_addr
+        fc2_phase_lut = fc2_trellis_lut_addr
+        if cutlass.const_expr(self.sqg_xor_cheb_t12_smem):
+            table_addr = Int64(
+                smem_base + Int32(self.sqg_xor_cheb_t12_smem_off)
+            )
+            fc1_phase_lut = table_addr
+            fc2_phase_lut = table_addr
         if cutlass.const_expr(self.full_rotation):
             self._run_input_rotation(
                 rotation_input_flat,
@@ -6088,6 +6930,7 @@ class W4A16FusedMoeKernel:
                 topk_weights_flat,
                 fc1_c_tmp_f32_flat,
                 locks_i32_flat,
+                fc1_phase_lut,
                 smem_base,
                 tid,
                 cta,
@@ -6136,6 +6979,7 @@ class W4A16FusedMoeKernel:
                 topk_weights_flat,
                 fc1_c_tmp_f32_flat,
                 locks_i32_flat,
+                fc1_phase_lut,
                 smem_base,
                 tid,
                 cta,
@@ -6175,6 +7019,7 @@ class W4A16FusedMoeKernel:
             topk_weights_flat,
             fc2_c_tmp_f32_flat,
             locks_i32_flat,
+            fc2_phase_lut,
             smem_base,
             tid,
             cta,
@@ -6182,6 +7027,21 @@ class W4A16FusedMoeKernel:
             active_m * Int32(self.top_k),
             fc2_emit_tile,
         )
+
+    @cute.jit
+    def _sqg_smem_copy(
+        self,
+        src_addr: Int64,
+        dst_off: Int32,
+        nbytes: cutlass.Constexpr[int],
+        tid: Int32,
+    ):
+        chunks = Int32(int(nbytes) // 16)
+        i = tid
+        while i < chunks:
+            v0, v1, v2, v3 = ld_global_nc_v4_u32(src_addr + Int64(i) * Int64(16))
+            st_shared_v4_u32(dst_off + i * Int32(16), v0, v1, v2, v3)
+            i += Int32(self.cta_threads)
 
     @cute.jit
     def _grid_barrier(
@@ -6771,474 +7631,6 @@ class W4A16FusedMoeKernel:
             idx += stride
 
 
-class W4A16FusedMoeHybridKernel:
-    """Two-tier heterogeneous-quantization fused MoE entry.
-
-    Composition over W4A16FusedMoeKernel: each tier's fused kernel supplies
-    its FC1/FC2 children and the shared phase machinery (_moe_body, grid
-    barrier, activation). This entry only widens the launch ABI to carry both
-    tiers' weights plus a global-expert descriptor map, and installs the
-    route-map emit hooks that resolve tier + local expert per mn-tile. Tier 0
-    drives scheduling; both tiers are validated to identical geometry, so the
-    schedule constants agree by construction.
-
-    Route contract: the routes tensor carries GLOBAL expert ids (one per
-    size_m*top_k slot, -1 for inactive). tier_local_map holds one int32
-    descriptor per global expert id: (tier << 8) | local_expert_id, negative
-    for unmapped. Unmapped or out-of-range ids skip the tile, matching the
-    -1-route behavior of the single-tier direct path.
-    """
-
-    ABI_VERSION = 1
-
-    def __init__(
-        self,
-        *,
-        tier0: W4A16FusedMoeKernel,
-        tier1: W4A16FusedMoeKernel,
-        map_slots: int,
-    ):
-        for name, moe in (("tier0", tier0), ("tier1", tier1)):
-            if not moe.direct_topk_routes:
-                raise ValueError(f"hybrid W4A16 {name} requires direct_topk_routes")
-            if not moe.tc_decode_fused_sum:
-                raise ValueError(f"hybrid W4A16 {name} requires tc_decode_fused_sum")
-            if not moe.activation_is_gated:
-                raise ValueError(f"hybrid W4A16 {name} requires a gated activation")
-            if moe.collect_activation_amax:
-                raise ValueError(
-                    f"hybrid W4A16 {name} is incompatible with activation amax"
-                )
-            if moe.intermediate_rotation or moe.dual_a or moe.full_rotation:
-                raise ValueError(
-                    f"hybrid W4A16 {name} forbids trellis rotation features"
-                )
-            if moe.zero_fc2_output:
-                raise ValueError(f"hybrid W4A16 {name} forbids zero_fc2_output")
-            if not moe.tc_zero_output:
-                raise ValueError(f"hybrid W4A16 {name} requires tc_zero_output")
-        for attr in (
-            "size_m",
-            "hidden_size",
-            "intermediate_size",
-            "fc1_cols",
-            "top_k",
-            "moe_block_size",
-            "activation",
-            "activation_is_swigluoai",
-            "has_swiglu_limit",
-            "swiglu_limit",
-            "swiglu_alpha",
-            "swiglu_beta",
-            "element_dtype",
-            "is_fp16",
-            "fast_math",
-            "apply_router_weight_on_input",
-            "cta_threads",
-            "sms",
-            "blocks_per_sm",
-            "barrier_count_off",
-            "barrier_sense_off",
-            "schedule_whole_tiles",
-        ):
-            if getattr(tier0, attr) != getattr(tier1, attr):
-                raise ValueError(
-                    f"hybrid W4A16 tiers disagree on {attr}: "
-                    f"{getattr(tier0, attr)!r} != {getattr(tier1, attr)!r}"
-                )
-        for phase in ("fc1", "fc2"):
-            gemm0 = getattr(tier0, phase)
-            gemm1 = getattr(tier1, phase)
-            if (gemm0.n_tiles, gemm0.k_tiles, gemm0.tile_n, gemm0.tile_k) != (
-                gemm1.n_tiles,
-                gemm1.k_tiles,
-                gemm1.tile_n,
-                gemm1.tile_k,
-            ):
-                raise ValueError(f"hybrid W4A16 tiers disagree on {phase} tiling")
-            if (
-                gemm0.top_k,
-                gemm0.mul_topk_weights,
-                gemm0.fused_topk_sum,
-                gemm0.fused_sum_topk,
-                gemm0.moe_block_size,
-                gemm0.cta_threads,
-                gemm0.schedule_whole_tiles,
-            ) != (
-                gemm1.top_k,
-                gemm1.mul_topk_weights,
-                gemm1.fused_topk_sum,
-                gemm1.fused_sum_topk,
-                gemm1.moe_block_size,
-                gemm1.cta_threads,
-                gemm1.schedule_whole_tiles,
-            ):
-                raise ValueError(f"hybrid W4A16 tiers disagree on {phase} semantics")
-        if int(map_slots) < tier0.num_experts + tier1.num_experts:
-            raise ValueError(
-                "hybrid W4A16 map_slots must cover both tiers' expert counts"
-            )
-        if tier0.num_experts > 256 or tier1.num_experts > 256:
-            raise ValueError(
-                "hybrid W4A16 local expert ids must fit the 8-bit descriptor field"
-            )
-        self.tier0 = tier0
-        self.tier1 = tier1
-        self.map_slots = int(map_slots)
-        self.size_m = tier0.size_m
-        self.hidden_size = tier0.hidden_size
-        self.intermediate_size = tier0.intermediate_size
-        self.top_k = tier0.top_k
-        self.element_dtype = tier0.element_dtype
-        self.cta_threads = tier0.cta_threads
-        self.sms = tier0.sms
-        self.blocks_per_sm = tier0.blocks_per_sm
-        self.shared_words = max(tier0.shared_words, tier1.shared_words)
-
-    @property
-    def __cache_key__(self) -> tuple[object, ...]:
-        return (
-            "w4a16_fused_moe_hybrid",
-            self.ABI_VERSION,
-            self.map_slots,
-            self.tier0.__cache_key__,
-            self.tier1.__cache_key__,
-            self.shared_words,
-        )
-
-    @cute.jit
-    def _emit_route_map_tile(
-        self,
-        is_fc1: cutlass.Constexpr,
-        a_bf16_flat: cute.Tensor,
-        t0_b_i32_flat: cute.Tensor,
-        t0_scales_i32_flat: cute.Tensor,
-        t0_global_scale: cute.Tensor,
-        t1_b_i32_flat: cute.Tensor,
-        t1_scales_i32_flat: cute.Tensor,
-        t1_global_scale: cute.Tensor,
-        c_bf16_flat: cute.Tensor,
-        global_topk_ids_i32_flat: cute.Tensor,
-        tier_local_map_i32_flat: cute.Tensor,
-        topk_weights_flat: cute.Tensor,
-        c_tmp_f32_flat: cute.Tensor,
-        locks_i32_flat: cute.Tensor,
-        smem_base: Int32,
-        tid: Int32,
-        active_size_m: Int32,
-        route_block_idx: Int32,
-        output_n_tile: Int32,
-        reduce_k_tile: Int32,
-        reduce_tile_count: Int32,
-        reduce_slice_count: Int32,
-        reduce_slice_idx: Int32,
-        lock_slot: Int32,
-    ):
-        gid = global_topk_ids_i32_flat[route_block_idx].to(Int32)
-        if gid >= Int32(0) and gid < Int32(self.map_slots):
-            descriptor = tier_local_map_i32_flat[gid].to(Int32)
-            if descriptor >= Int32(0):
-                tier = descriptor >> Int32(8)
-                local_expert = descriptor & Int32(0xFF)
-                if tier == Int32(0):
-                    if local_expert < Int32(self.tier0.num_experts):
-                        if cutlass.const_expr(is_fc1):
-                            self.tier0.fc1._run_tile(
-                                a_bf16_flat,
-                                a_bf16_flat,
-                                t0_b_i32_flat,
-                                c_bf16_flat,
-                                t0_scales_i32_flat,
-                                t0_global_scale,
-                                global_topk_ids_i32_flat,
-                                topk_weights_flat,
-                                c_tmp_f32_flat,
-                                locks_i32_flat,
-                                smem_base,
-                                tid,
-                                route_block_idx,
-                                local_expert,
-                                output_n_tile,
-                                reduce_k_tile,
-                                reduce_tile_count,
-                                reduce_slice_count,
-                                reduce_slice_idx,
-                                lock_slot,
-                                active_size_m,
-                            )
-                        else:
-                            self.tier0.fc2._run_tile(
-                                a_bf16_flat,
-                                a_bf16_flat,
-                                t0_b_i32_flat,
-                                c_bf16_flat,
-                                t0_scales_i32_flat,
-                                t0_global_scale,
-                                global_topk_ids_i32_flat,
-                                topk_weights_flat,
-                                c_tmp_f32_flat,
-                                locks_i32_flat,
-                                smem_base,
-                                tid,
-                                route_block_idx,
-                                local_expert,
-                                output_n_tile,
-                                reduce_k_tile,
-                                reduce_tile_count,
-                                reduce_slice_count,
-                                reduce_slice_idx,
-                                lock_slot,
-                                active_size_m,
-                            )
-                else:
-                    if tier == Int32(1):
-                        if local_expert < Int32(self.tier1.num_experts):
-                            if cutlass.const_expr(is_fc1):
-                                self.tier1.fc1._run_tile(
-                                    a_bf16_flat,
-                                    a_bf16_flat,
-                                    t1_b_i32_flat,
-                                    c_bf16_flat,
-                                    t1_scales_i32_flat,
-                                    t1_global_scale,
-                                    global_topk_ids_i32_flat,
-                                    topk_weights_flat,
-                                    c_tmp_f32_flat,
-                                    locks_i32_flat,
-                                    smem_base,
-                                    tid,
-                                    route_block_idx,
-                                    local_expert,
-                                    output_n_tile,
-                                    reduce_k_tile,
-                                    reduce_tile_count,
-                                    reduce_slice_count,
-                                    reduce_slice_idx,
-                                    lock_slot,
-                                    active_size_m,
-                                )
-                            else:
-                                self.tier1.fc2._run_tile(
-                                    a_bf16_flat,
-                                    a_bf16_flat,
-                                    t1_b_i32_flat,
-                                    c_bf16_flat,
-                                    t1_scales_i32_flat,
-                                    t1_global_scale,
-                                    global_topk_ids_i32_flat,
-                                    topk_weights_flat,
-                                    c_tmp_f32_flat,
-                                    locks_i32_flat,
-                                    smem_base,
-                                    tid,
-                                    route_block_idx,
-                                    local_expert,
-                                    output_n_tile,
-                                    reduce_k_tile,
-                                    reduce_tile_count,
-                                    reduce_slice_count,
-                                    reduce_slice_idx,
-                                    lock_slot,
-                                    active_size_m,
-                                )
-
-    @cute.jit
-    def __call__(
-        self,
-        a_bf16_ptr: cute.Pointer,
-        t0_w13_i32_flat: cute.Tensor,
-        t0_w2_i32_flat: cute.Tensor,
-        t0_w13_scales_i32_flat: cute.Tensor,
-        t0_w2_scales_i32_flat: cute.Tensor,
-        t0_w13_global_scale: cute.Tensor,
-        t0_w2_global_scale: cute.Tensor,
-        t1_w13_i32_flat: cute.Tensor,
-        t1_w2_i32_flat: cute.Tensor,
-        t1_w13_scales_i32_flat: cute.Tensor,
-        t1_w2_scales_i32_flat: cute.Tensor,
-        t1_w13_global_scale: cute.Tensor,
-        t1_w2_global_scale: cute.Tensor,
-        global_topk_ids_i32_flat: cute.Tensor,
-        tier_local_map_i32_flat: cute.Tensor,
-        fc1_bf16_flat: cute.Tensor,
-        activated_bf16_flat: cute.Tensor,
-        output_bf16_flat: cute.Tensor,
-        topk_weights_ptr: cute.Pointer,
-        fc1_c_tmp_f32_flat: cute.Tensor,
-        fc2_c_tmp_f32_flat: cute.Tensor,
-        locks_i32_flat: cute.Tensor,
-        active_m: cutlass.Int32,
-        grid_x: cutlass.Int32,
-        stream: cuda.CUstream,
-    ):
-        a_bf16_flat = cute.make_tensor(
-            a_bf16_ptr,
-            layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
-        )
-        topk_weights_flat = cute.make_tensor(
-            topk_weights_ptr,
-            layout=cute.make_layout((active_m * Int32(self.top_k),), stride=(1,)),
-        )
-        self.kernel(
-            a_bf16_flat,
-            t0_w13_i32_flat,
-            t0_w2_i32_flat,
-            t0_w13_scales_i32_flat,
-            t0_w2_scales_i32_flat,
-            t0_w13_global_scale,
-            t0_w2_global_scale,
-            t1_w13_i32_flat,
-            t1_w2_i32_flat,
-            t1_w13_scales_i32_flat,
-            t1_w2_scales_i32_flat,
-            t1_w13_global_scale,
-            t1_w2_global_scale,
-            global_topk_ids_i32_flat,
-            tier_local_map_i32_flat,
-            fc1_bf16_flat,
-            activated_bf16_flat,
-            output_bf16_flat,
-            topk_weights_flat,
-            fc1_c_tmp_f32_flat,
-            fc2_c_tmp_f32_flat,
-            locks_i32_flat,
-            active_m,
-        ).launch(
-            grid=(grid_x, 1, 1),
-            block=[self.cta_threads, 1, 1],
-            min_blocks_per_mp=self.blocks_per_sm,
-            # This fused two-tier body uses the same software all-CTA barriers
-            # as W4A16FusedMoeKernel and therefore has the same whole-grid
-            # residency requirement.
-            cooperative=True,
-            stream=stream,
-        )
-
-    @cute.kernel
-    def kernel(
-        self,
-        a_bf16_flat: cute.Tensor,
-        t0_w13_i32_flat: cute.Tensor,
-        t0_w2_i32_flat: cute.Tensor,
-        t0_w13_scales_i32_flat: cute.Tensor,
-        t0_w2_scales_i32_flat: cute.Tensor,
-        t0_w13_global_scale: cute.Tensor,
-        t0_w2_global_scale: cute.Tensor,
-        t1_w13_i32_flat: cute.Tensor,
-        t1_w2_i32_flat: cute.Tensor,
-        t1_w13_scales_i32_flat: cute.Tensor,
-        t1_w2_scales_i32_flat: cute.Tensor,
-        t1_w13_global_scale: cute.Tensor,
-        t1_w2_global_scale: cute.Tensor,
-        global_topk_ids_i32_flat: cute.Tensor,
-        tier_local_map_i32_flat: cute.Tensor,
-        fc1_bf16_flat: cute.Tensor,
-        activated_bf16_flat: cute.Tensor,
-        output_bf16_flat: cute.Tensor,
-        topk_weights_flat: cute.Tensor,
-        fc1_c_tmp_f32_flat: cute.Tensor,
-        fc2_c_tmp_f32_flat: cute.Tensor,
-        locks_i32_flat: cute.Tensor,
-        active_m: cutlass.Int32,
-    ):
-        tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        grid_x_raw, _, _ = cute.arch.grid_dim()
-        tid = Int32(tidx)
-        cta = Int32(bidx)
-        grid_x = Int32(grid_x_raw)
-
-        smem = cutlass.utils.SmemAllocator()
-
-        @cute.struct
-        class Storage:
-            words: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint32, self.shared_words],
-                1024,
-            ]
-
-        storage = smem.allocate(Storage)
-        smem_base = shared_ptr_to_u32(storage.words.data_ptr())
-
-        fc1_emit_tile = partial(
-            self._emit_route_map_tile,
-            True,
-            a_bf16_flat,
-            t0_w13_i32_flat,
-            t0_w13_scales_i32_flat,
-            t0_w13_global_scale,
-            t1_w13_i32_flat,
-            t1_w13_scales_i32_flat,
-            t1_w13_global_scale,
-            fc1_bf16_flat,
-            global_topk_ids_i32_flat,
-            tier_local_map_i32_flat,
-            topk_weights_flat,
-            fc1_c_tmp_f32_flat,
-            locks_i32_flat,
-            smem_base,
-            tid,
-            active_m,
-        )
-        fc2_emit_tile = partial(
-            self._emit_route_map_tile,
-            False,
-            activated_bf16_flat,
-            t0_w2_i32_flat,
-            t0_w2_scales_i32_flat,
-            t0_w2_global_scale,
-            t1_w2_i32_flat,
-            t1_w2_scales_i32_flat,
-            t1_w2_global_scale,
-            output_bf16_flat,
-            global_topk_ids_i32_flat,
-            tier_local_map_i32_flat,
-            topk_weights_flat,
-            fc2_c_tmp_f32_flat,
-            locks_i32_flat,
-            smem_base,
-            tid,
-            active_m * Int32(self.top_k),
-        )
-        # Tier 0 drives the shared phase assembly; the unused single-tier
-        # route/amax parameters receive placeholder tensors that the direct
-        # route + no-amax const_expr configuration never reads.
-        self.tier0._moe_body(
-            a_bf16_flat,
-            a_bf16_flat,
-            a_bf16_flat,
-            t0_w13_i32_flat,
-            t0_w2_i32_flat,
-            fc1_bf16_flat,
-            activated_bf16_flat,
-            output_bf16_flat,
-            t0_w13_scales_i32_flat,
-            t0_w2_scales_i32_flat,
-            t0_w13_global_scale,
-            t0_w2_global_scale,
-            global_topk_ids_i32_flat,
-            global_topk_ids_i32_flat,
-            global_topk_ids_i32_flat,
-            global_topk_ids_i32_flat,
-            Int32(0),
-            topk_weights_flat,
-            fc1_c_tmp_f32_flat,
-            fc2_c_tmp_f32_flat,
-            locks_i32_flat,
-            global_topk_ids_i32_flat,
-            global_topk_ids_i32_flat,
-            global_topk_ids_i32_flat,
-            global_topk_ids_i32_flat,
-            Int32(self.tier0.num_experts),
-            Int32(self.map_slots),
-            smem_base,
-            tid,
-            cta,
-            grid_x,
-            active_m,
-            fc1_emit_tile,
-            fc2_emit_tile,
-        )
 
 
 class W4A16ActivationKernel:
@@ -7839,6 +8231,7 @@ _ACTIVATION_CACHE: dict[tuple, W4A16ActivationCompileResult] = {}
 _SUM_CACHE: dict[tuple, W4A16TopKSumCompileResult] = {}
 _DENSE_HAD128_CACHE: dict[tuple, object] = {}
 _SMALL_M_DIRECT_CACHE: dict[tuple, _W4A16SmallMDirectLaunch] = {}
+_FC2_DIRECT_CACHE: dict[tuple, _W4A16FC2DirectLaunch] = {}
 
 
 def _normalize_element_dtype(dtype: torch.dtype) -> str:
@@ -8097,6 +8490,130 @@ def _compile_w4a16_small_m_direct(
     return launch
 
 
+def _w4a16_fc2_direct_expert_capacity(num_experts: int) -> int:
+    """Return the compile-time capacity bucket for FC2-only X4T endpoints.
+
+    The resident endpoint count is runtime artifact data. Keeping a bounded
+    power-of-two capacity in the CuTe tensor type avoids one compilation per
+    layer without changing route-ID based address arithmetic.
+    """
+
+    num_experts = int(num_experts)
+    if num_experts < 1:
+        raise ValueError("W4A16 FC2-only execution requires at least one expert")
+    return max(
+        _FC2_DIRECT_MIN_EXPERT_CAPACITY,
+        1 << (num_experts - 1).bit_length(),
+    )
+
+
+def _compile_w4a16_fc2_direct(
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk_ids_dtype: torch.dtype,
+    device: torch.device,
+) -> _W4A16FC2DirectLaunch:
+    """Compile the runtime-M native-MXFP4 FC2-only microkernel."""
+
+    if topk_ids_dtype not in (torch.int32, torch.int64):
+        raise TypeError("W4A16 FC2-only route IDs must be int32 or int64")
+    # Expert count changes the fake tensor extent used by CuTe, but it does
+    # not change the FC2 address arithmetic: every access is based on the
+    # runtime route ID and fixed per-expert strides.  Compiling the exact
+    # resident count made a model with matrix-granular endpoints JIT one
+    # otherwise-identical kernel per layer.  Use a capacity bucket instead;
+    # route validation still guarantees IDs are within the actual tensors.
+    expert_capacity = _w4a16_fc2_direct_expert_capacity(num_experts)
+    cache_key = (
+        "w4a16_fc2_direct",
+        int(device.index or 0),
+        int(hidden_size),
+        int(intermediate_size),
+        int(expert_capacity),
+        topk_ids_dtype,
+    )
+    cached = _FC2_DIRECT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    kernel = MoEMicroKernelW4A16SmallMDirect(
+        activation="silu",
+        fast_math=False,
+        share_input_across_experts=False,
+        share_expert_scales=True,
+        single_token=False,
+        scale_format="e8m0_k32",
+        compile_time_phase=2,
+    )
+    # m=2 selects the runtime-M body. FC2 does not retain token activations in
+    # registers, so the compiled loop remains valid above the fused kernel's
+    # ordinary eight-token ceiling.
+    kernel.configure(
+        2,
+        int(hidden_size),
+        int(intermediate_size),
+        1,
+        int(expert_capacity),
+        device=device,
+    )
+
+    def dummy(dt):
+        return make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=16)
+
+    ids_dtype = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
+    barrier_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
+    )
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=cache_key
+    )
+    compiled = b12x_compile(
+        kernel,
+        dummy(cutlass.BFloat16),
+        dummy(cutlass.Uint8),
+        dummy(cutlass.Uint8),
+        dummy(cutlass.Float32),
+        dummy(cutlass.Float32),
+        dummy(cutlass.Float32),
+        dummy(cutlass.Uint32),
+        dummy(cutlass.Uint8),
+        dummy(cutlass.Uint8),
+        dummy(cutlass.Float32),
+        dummy(ids_dtype),
+        dummy(cutlass.Float32),
+        dummy(cutlass.BFloat16),
+        barrier_fake,
+        barrier_fake,
+        Int32(2),
+        Int32(kernel.grid_x),
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_facts(
+            "moe.w4a16.fc2_direct",
+            3,
+            ("device_index", int(device.index or 0)),
+            ("hidden_size", int(hidden_size)),
+            ("intermediate_size", int(intermediate_size)),
+            ("expert_capacity", int(expert_capacity)),
+            ("topk_ids_dtype", str(topk_ids_dtype)),
+            ("grid_x", int(kernel.grid_x)),
+        ),
+    )
+    launch = _W4A16FC2DirectLaunch(
+        compiled=compiled,
+        grid_x=int(kernel.grid_x),
+        hidden_size=int(hidden_size),
+        intermediate_size=int(intermediate_size),
+        num_experts=int(expert_capacity),
+        topk_ids_dtype=topk_ids_dtype,
+    )
+    _FC2_DIRECT_CACHE[cache_key] = launch
+    return launch
+
+
 def compile_w4a16_gemm(
     *,
     size_m: int,
@@ -8114,6 +8631,9 @@ def compile_w4a16_gemm(
     scale_format: str = "e4m3_k16",
     w13_layout: str = "packed",
     trellis_bits: int = 3,
+    trellis_codebook: str = "sqg_xor_cheb_t12",
+    trellis_pair_kind: str | None = None,
+    trellis_rate_axis: str | None = None,
     dense_route_fast_path: bool = False,
 ) -> W4A16GemmCompileResult:
     scale_format = _normalize_scale_format(scale_format)
@@ -8138,6 +8658,9 @@ def compile_w4a16_gemm(
         scale_format=scale_format,
         w13_layout=w13_layout,
         trellis_bits=trellis_bits,
+        trellis_codebook=trellis_codebook,
+        trellis_pair_kind=trellis_pair_kind,
+        trellis_rate_axis=trellis_rate_axis,
         dense_route_fast_path=bool(dense_route_fast_path),
         schedule_whole_tiles=weight_layout == "trellis3_t256",
     )
@@ -8222,6 +8745,11 @@ def compile_w4a16_gemm(
         (4 * 256,),
         assumed_align=16,
     )
+    trellis_lut_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8,
+        (_SQG_XOR_CHEB_T12_LUT_ENTRIES,),
+        assumed_align=16,
+    )
 
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -8240,6 +8768,7 @@ def compile_w4a16_gemm(
         topk_fake,
         c_tmp_fake,
         locks_fake,
+        trellis_lut_fake,
         Int32(compile_size_m),
         Int32(1),
         current_cuda_stream(),
@@ -8261,6 +8790,9 @@ def compile_w4a16_gemm(
         w13_layout=w13_layout,
         dense_route_fast_path=bool(dense_route_fast_path),
         trellis_bits=int(trellis_bits),
+        trellis_codebook=str(trellis_codebook).lower(),
+        trellis_pair_kind=trellis_pair_kind,
+        trellis_rate_axis=trellis_rate_axis,
     )
     _CACHE[cache_key] = result
     return result
@@ -8289,6 +8821,9 @@ def compile_w4a16_fused_moe(
     scale_format: str = "e4m3_k16",
     w13_layout: str = "w13",
     trellis_bits: int = 3,
+    trellis_codebook: str = "sqg_xor_cheb_t12",
+    fc1_trellis_pair_kind: str | None = None,
+    fc2_trellis_pair_kind: str | None = None,
     direct_topk_routes: bool = False,
     use_expert_map: bool = False,
     tc_decode_fused_sum: bool = False,
@@ -8386,7 +8921,7 @@ def compile_w4a16_fused_moe(
         if tc_decode_fused_sum or use_expert_map
         else _MAX_DIRECT_TOPK_ROUTE_M
     )
-    direct_weight_layout_ok = weight_layout in ("packed", "nf3_2p1") or (
+    direct_weight_layout_ok = weight_layout == "packed" or (
         full_rotation and weight_layout == "trellis3_t256"
     )
     if direct_topk_routes and (
@@ -8601,7 +9136,7 @@ def compile_w4a16_fused_moe(
             fc2_cta_threads = 256
     if force_tile_config is not None:
         # Explicit (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) pin. The
-        # NF3 ("nf3_2p1") flat-span weight layout is packed for a specific CTA
+        # Some weight layouts are packed for a specific CTA
         # N-tile, so hybrid deployments pin ONE tile config across every m
         # regime instead of the m-dependent auto selection (and TC-decode
         # wide-N overrides) above. Overrides whatever was selected; the tiles
@@ -8663,6 +9198,9 @@ def compile_w4a16_fused_moe(
         scale_format=scale_format,
         w13_layout=w13_layout,
         trellis_bits=trellis_bits,
+        trellis_codebook=trellis_codebook,
+        fc1_trellis_pair_kind=fc1_trellis_pair_kind,
+        fc2_trellis_pair_kind=fc2_trellis_pair_kind,
         direct_topk_routes=direct_topk_routes,
         use_expert_map=use_expert_map,
         tc_decode_fused_sum=tc_decode_fused_sum,
@@ -8840,6 +9378,9 @@ def compile_w4a16_fused_moe(
     expert_map_fake = make_ptr(
         cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
+    trellis_lut_fake = make_ptr(
+        cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
+    )
 
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -8871,6 +9412,8 @@ def compile_w4a16_fused_moe(
         suh_gate_fake,
         suh_up_fake,
         expert_map_fake,
+        trellis_lut_fake,
+        trellis_lut_fake,
         Int32(num_experts),
         Int32(num_experts),
         1,
@@ -8883,6 +9426,12 @@ def compile_w4a16_fused_moe(
         ),
         dsl_compile_options=OptLevel(2),
     )
+    resources = _query_w4a16_kernel_resources(compiled)
+    kernel_symbol = None
+    registers_per_thread = -1
+    local_memory_bytes = -1
+    if resources is not None:
+        kernel_symbol, registers_per_thread, local_memory_bytes = resources
     result = W4A16FusedMoeCompileResult(
         compiled=compiled,
         size_m=size_m,
@@ -8916,50 +9465,21 @@ def compile_w4a16_fused_moe(
         intermediate_rotation=intermediate_rotation,
         dual_a=kernel.dual_a,
         trellis_bits=trellis_bits,
+        trellis_codebook=kernel.trellis_codebook,
+        fc1_trellis_pair_kind=kernel.fc1_trellis_pair_kind,
+        fc2_trellis_pair_kind=kernel.fc2_trellis_pair_kind,
         full_rotation=full_rotation,
         rotation_input_dtype=rotation_input_dtype,
+        kernel_symbol=kernel_symbol,
+        registers_per_thread=registers_per_thread,
+        local_memory_bytes=local_memory_bytes,
+        cta_threads=kernel.cta_threads,
+        shared_memory_bytes=kernel.shared_words * 4,
     )
     _FUSED_CACHE[cache_key] = result
     return result
 
 
-@dataclass(frozen=True)
-class W4A16FusedMoeHybridCompileResult:
-    compiled: object
-    size_m: int
-    hidden_size: int
-    intermediate_size: int
-    top_k: int
-    activation: str
-    element_dtype: str
-    fast_math: bool
-    map_slots: int
-    tier0_num_experts: int
-    tier0_weight_layout: str
-    tier0_scale_format: str
-    tier0_w13_layout: str
-    tier1_num_experts: int
-    tier1_weight_layout: str
-    tier1_scale_format: str
-    tier1_w13_layout: str
-    fc1_tile_n: int
-    fc1_tile_k: int
-    fc2_tile_n: int
-    fc2_tile_k: int
-    moe_block_size: int
-    max_m_blocks: int
-    cta_threads: int
-    blocks_per_sm: int
-    shared_memory_bytes: int
-    schedule_whole_tiles: bool
-    direct_topk_routes: bool
-    tc_decode_fused_sum: bool
-    # -1 when the compiled object came from the on-disk object cache, whose
-    # loader does not expose CUDA-dialect introspection; a fresh compile of the
-    # identical source/toolchain state ran the spill admission below at least
-    # once before the entry could exist.
-    registers_per_thread: int
-    local_memory_bytes: int
 
 
 def _query_w4a16_kernel_resources(compiled: object) -> tuple[str, int, int] | None:
@@ -9012,266 +9532,9 @@ def _w4a16_weight_flat_elements(
 
     if weight_layout == "modelopt":
         return int(num_experts) * int(size_n) * (int(size_k) // 2)
-    if weight_layout == "nf3_2p1":
-        return int(num_experts) * (int(size_k) // 16) * (int(size_n) // 2) * 3
     return int(num_experts) * (int(size_k) // 16) * (int(size_n) // 16 * 32)
 
 
-def compile_w4a16_fused_moe_hybrid(
-    *,
-    size_m: int,
-    hidden_size: int,
-    intermediate_size: int,
-    tier0_num_experts: int,
-    tier1_num_experts: int,
-    top_k: int,
-    activation: str,
-    map_slots: int,
-    moe_block_size: int = 8,
-    element_dtype: str = "bf16",
-    fast_math: bool = True,
-    sms: int,
-    max_shared_mem: int,
-    tier0_weight_layout: str = "packed",
-    tier0_scale_format: str = "e4m3_k16",
-    tier0_w13_layout: str = "packed",
-    tier1_weight_layout: str = "nf3_2p1",
-    tier1_scale_format: str = "e4m3_k32",
-    tier1_w13_layout: str = "w13",
-    force_tile_config: tuple[int, int, int, int],
-    schedule_whole_tiles: bool = True,
-) -> W4A16FusedMoeHybridCompileResult:
-    """Compile the two-tier heterogeneous-quantization fused MoE kernel.
-
-    v1 contract: TC-decode direct-topk geometry (gated activation, fused FC2
-    top-k sum) with an explicitly pinned tile config shared by both tiers.
-    Spill admission is fail-closed on every fresh compile: nonzero local
-    memory raises before the result can be cached or launched.
-    """
-
-    activation = normalize_moe_activation(activation)
-    if not validate_activation(activation):
-        raise ValueError("hybrid W4A16 requires a gated activation")
-    cutlass_dtype = _cutlass_element_dtype(element_dtype)
-    device = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
-    fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (int(v) for v in force_tile_config)
-    max_m_blocks = int(size_m) * int(top_k)
-
-    def _tier_kernel(
-        num_experts: int, weight_layout: str, scale_format: str, w13_layout: str
-    ) -> W4A16FusedMoeKernel:
-        return W4A16FusedMoeKernel(
-            size_m=size_m,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=num_experts,
-            top_k=top_k,
-            activation=activation,
-            apply_router_weight_on_input=False,
-            zero_fc2_output=False,
-            fc1_tile_n=fc1_tile_n,
-            fc1_tile_k=fc1_tile_k,
-            fc2_tile_n=fc2_tile_n,
-            fc2_tile_k=fc2_tile_k,
-            moe_block_size=moe_block_size,
-            max_m_blocks=max_m_blocks,
-            element_dtype=element_dtype,
-            fast_math=fast_math,
-            weight_layout=weight_layout,
-            scale_format=scale_format,
-            w13_layout=w13_layout,
-            direct_topk_routes=True,
-            tc_decode_fused_sum=True,
-            schedule_whole_tiles=bool(schedule_whole_tiles),
-        )
-
-    kernel = W4A16FusedMoeHybridKernel(
-        tier0=_tier_kernel(
-            int(tier0_num_experts),
-            tier0_weight_layout,
-            _normalize_scale_format(tier0_scale_format),
-            tier0_w13_layout,
-        ),
-        tier1=_tier_kernel(
-            int(tier1_num_experts),
-            tier1_weight_layout,
-            _normalize_scale_format(tier1_scale_format),
-            tier1_w13_layout,
-        ),
-        map_slots=int(map_slots),
-    )
-    if kernel.shared_words * 4 > int(max_shared_mem) - 512:
-        raise ValueError(
-            "hybrid W4A16 shared memory exceeds the device limit: "
-            f"{kernel.shared_words * 4} > {int(max_shared_mem) - 512}"
-        )
-
-    cache_key = (
-        "w4a16_fused_moe_hybrid",
-        device,
-        kernel.__cache_key__,
-    )
-    cached = _FUSED_CACHE.get(cache_key)
-    if cached is not None:
-        return replace(cached, size_m=size_m, max_m_blocks=max_m_blocks)
-
-    fc1_cols = kernel.tier0.fc1_cols
-    compile_size_m = _fake_m_for_specialization(size_m)
-    compile_routed_rows = int(compile_size_m) * int(top_k)
-
-    def _weight_fake(num_experts: int, size_n: int, size_k: int, weight_layout: str):
-        elements = _w4a16_weight_flat_elements(
-            num_experts=num_experts,
-            size_n=size_n,
-            size_k=size_k,
-            weight_layout=weight_layout,
-        )
-        fake_dtype = cutlass.Uint8 if weight_layout == "modelopt" else cutlass.Int32
-        return cute.runtime.make_fake_compact_tensor(
-            fake_dtype, (elements,), assumed_align=16
-        )
-
-    def _scales_fake(num_experts: int, size_n: int, size_k: int, scale_format: str):
-        return cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32,
-            (
-                _scale_fake_int32_elements(
-                    num_experts=num_experts,
-                    size_k=size_k,
-                    size_n=size_n,
-                    scale_format=scale_format,
-                ),
-            ),
-            assumed_align=16,
-        )
-
-    def _global_fake(num_experts: int):
-        return cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32, (num_experts,), assumed_align=16
-        )
-
-    a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    topk_fake = make_ptr(cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4)
-    tier0 = kernel.tier0
-    tier1 = kernel.tier1
-    scratch_elements = max(
-        fc1_cols * compile_routed_rows,
-        hidden_size * compile_routed_rows,
-        4 * 256 * moe_block_size * 256,
-    )
-    compile_args = (
-        a_fake,
-        _weight_fake(tier0.num_experts, fc1_cols, hidden_size, tier0.weight_layout),
-        _weight_fake(
-            tier0.num_experts, hidden_size, intermediate_size, tier0.weight_layout
-        ),
-        _scales_fake(tier0.num_experts, fc1_cols, hidden_size, tier0.scale_format),
-        _scales_fake(
-            tier0.num_experts, hidden_size, intermediate_size, tier0.scale_format
-        ),
-        _global_fake(tier0.num_experts),
-        _global_fake(tier0.num_experts),
-        _weight_fake(tier1.num_experts, fc1_cols, hidden_size, tier1.weight_layout),
-        _weight_fake(
-            tier1.num_experts, hidden_size, intermediate_size, tier1.weight_layout
-        ),
-        _scales_fake(tier1.num_experts, fc1_cols, hidden_size, tier1.scale_format),
-        _scales_fake(
-            tier1.num_experts, hidden_size, intermediate_size, tier1.scale_format
-        ),
-        _global_fake(tier1.num_experts),
-        _global_fake(tier1.num_experts),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (compile_routed_rows,), assumed_align=16
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (int(map_slots),), assumed_align=16
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass_dtype, (compile_routed_rows * fc1_cols,), assumed_align=16
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass_dtype,
-            (compile_routed_rows * intermediate_size,),
-            assumed_align=16,
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass_dtype, (compile_size_m * hidden_size,), assumed_align=16
-        ),
-        topk_fake,
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32, (scratch_elements,), assumed_align=16
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32, (scratch_elements,), assumed_align=16
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (4 * 256 + 2,), assumed_align=16
-        ),
-        1,
-        1,
-        current_cuda_stream(),
-    )
-
-    raise_if_kernel_resolution_frozen(
-        "cute.compile", target=kernel, cache_key=cache_key
-    )
-    compiled = b12x_compile(
-        kernel,
-        *compile_args,
-        compile_spec=KernelCompileSpec.from_key(
-            "moe.w4a16.fused_moe_hybrid",
-            W4A16FusedMoeHybridKernel.ABI_VERSION,
-            cache_key,
-        ),
-    )
-    registers_per_thread = -1
-    local_memory_bytes = -1
-    resources = _query_w4a16_kernel_resources(compiled)
-    if resources is not None:
-        _, registers_per_thread, local_memory_bytes = resources
-        if local_memory_bytes != 0:
-            raise RuntimeError(
-                "hybrid W4A16 codegen spills to local memory "
-                f"({local_memory_bytes} bytes/thread); refusing to admit the "
-                "kernel for the latency-critical decode path"
-            )
-
-    result = W4A16FusedMoeHybridCompileResult(
-        compiled=compiled,
-        size_m=size_m,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        top_k=top_k,
-        activation=activation,
-        element_dtype=element_dtype,
-        fast_math=bool(fast_math),
-        map_slots=int(map_slots),
-        tier0_num_experts=tier0.num_experts,
-        tier0_weight_layout=tier0.weight_layout,
-        tier0_scale_format=tier0.scale_format,
-        tier0_w13_layout=tier0.w13_layout,
-        tier1_num_experts=tier1.num_experts,
-        tier1_weight_layout=tier1.weight_layout,
-        tier1_scale_format=tier1.scale_format,
-        tier1_w13_layout=tier1.w13_layout,
-        fc1_tile_n=fc1_tile_n,
-        fc1_tile_k=fc1_tile_k,
-        fc2_tile_n=fc2_tile_n,
-        fc2_tile_k=fc2_tile_k,
-        moe_block_size=moe_block_size,
-        max_m_blocks=max_m_blocks,
-        cta_threads=kernel.cta_threads,
-        blocks_per_sm=kernel.blocks_per_sm,
-        shared_memory_bytes=kernel.shared_words * 4,
-        schedule_whole_tiles=bool(schedule_whole_tiles),
-        direct_topk_routes=True,
-        tc_decode_fused_sum=True,
-        registers_per_thread=registers_per_thread,
-        local_memory_bytes=local_memory_bytes,
-    )
-    _FUSED_CACHE[cache_key] = result
-    return result
 
 
 def clear_w4a16_kernel_cache() -> None:
@@ -9280,6 +9543,7 @@ def clear_w4a16_kernel_cache() -> None:
     _ACTIVATION_CACHE.clear()
     _SUM_CACHE.clear()
     _SMALL_M_DIRECT_CACHE.clear()
+    _FC2_DIRECT_CACHE.clear()
 
 
 def compile_w4a16_activation(
@@ -9632,6 +9896,114 @@ def _w4a16_small_m_direct_launch_fake(
     return None
 
 
+def _w4a16_fc2_direct_launch_flat(
+    intermediate: torch.Tensor,
+    w2_u8: torch.Tensor,
+    w2_scale_u8: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    route_ids: torch.Tensor,
+    route_weights: torch.Tensor,
+    output: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    stream_int: int,
+) -> None:
+    launch = _compile_w4a16_fc2_direct(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk_ids_dtype=route_ids.dtype,
+        device=intermediate.device,
+    )
+
+    def ptr(dt, tensor: torch.Tensor):
+        return make_ptr(dt, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+
+    ids_dtype = cutlass.Int64 if route_ids.dtype == torch.int64 else cutlass.Int32
+    launch.compiled(
+        ptr(cutlass.BFloat16, intermediate),
+        ptr(cutlass.Uint8, w2_u8),
+        ptr(cutlass.Uint8, w2_scale_u8.view(torch.uint8)),
+        ptr(cutlass.Float32, w2_global_scale),
+        ptr(cutlass.Float32, w2_global_scale),
+        ptr(cutlass.Float32, w2_global_scale),
+        ptr(cutlass.Uint32, intermediate.view(torch.uint32)),
+        ptr(cutlass.Uint8, w2_u8),
+        ptr(cutlass.Uint8, w2_scale_u8.view(torch.uint8)),
+        ptr(cutlass.Float32, w2_global_scale),
+        ptr(ids_dtype, route_ids),
+        ptr(cutlass.Float32, route_weights),
+        ptr(cutlass.BFloat16, output),
+        barrier_count,
+        barrier_epoch,
+        Int32(m),
+        Int32(launch.grid_x),
+        cuda.CUstream(stream_int),
+    )
+
+
+@torch.library.custom_op(
+    "b12x::w4a16_fc2_direct_launch",
+    mutates_args="unknown",
+)
+def _w4a16_fc2_direct_launch_op(
+    intermediate: torch.Tensor,
+    w2_u8: torch.Tensor,
+    w2_scale_u8: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    route_ids: torch.Tensor,
+    route_weights: torch.Tensor,
+    output: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    stream_int: int,
+) -> None:
+    _w4a16_fc2_direct_launch_flat(
+        intermediate=intermediate,
+        w2_u8=w2_u8,
+        w2_scale_u8=w2_scale_u8,
+        w2_global_scale=w2_global_scale,
+        route_ids=route_ids,
+        route_weights=route_weights,
+        output=output,
+        barrier_count=barrier_count,
+        barrier_epoch=barrier_epoch,
+        m=m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        stream_int=stream_int,
+    )
+
+
+@_w4a16_fc2_direct_launch_op.register_fake
+def _w4a16_fc2_direct_launch_fake(
+    intermediate: torch.Tensor,
+    w2_u8: torch.Tensor,
+    w2_scale_u8: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    route_ids: torch.Tensor,
+    route_weights: torch.Tensor,
+    output: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    stream_int: int,
+) -> None:
+    return None
+
+
 _ROT_SCALES_DUMMY: dict[object, torch.Tensor] = {}
 
 
@@ -9706,6 +10078,9 @@ def _w4a16_fused_moe_launch_flat(
     intermediate_rotation: bool = False,
     a_input_up: torch.Tensor | None = None,
     trellis_bits: int = 3,
+    trellis_codebook: str = "sqg_xor_cheb_t12",
+    fc1_trellis_pair_kind: str | None = None,
+    fc2_trellis_pair_kind: str | None = None,
     full_rotation: bool = False,
     rotation_input: torch.Tensor | None = None,
     suh_gate_table: torch.Tensor | None = None,
@@ -9788,12 +10163,15 @@ def _w4a16_fused_moe_launch_flat(
         scale_format=scale_format,
         w13_layout=w13_layout,
         trellis_bits=trellis_bits,
+        trellis_codebook=trellis_codebook,
+        fc1_trellis_pair_kind=fc1_trellis_pair_kind,
+        fc2_trellis_pair_kind=fc2_trellis_pair_kind,
         direct_topk_routes=bool(direct_topk_routes),
         use_expert_map=use_expert_map,
         tc_decode_fused_sum=bool(tc_decode_fused_sum),
         collect_activation_amax=collect_activation_amax,
         # The custom-op boundary cannot carry the compiled launch object. Re-pin
-        # its selected geometry so tile-specific packs (notably NF3) resolve the
+        # its selected geometry so tile-specific packs resolve the
         # identical cache entry instead of silently recompiling with auto tiles.
         force_tile_config=(fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n),
         intermediate_rotation=intermediate_rotation,
@@ -9808,6 +10186,14 @@ def _w4a16_fused_moe_launch_flat(
         packed_route_indices.data_ptr() if expert_map is None else expert_map.data_ptr()
     )
     route_num_experts = 0 if expert_map is None else int(expert_map.numel())
+    if weight_layout == "trellis3_t256":
+        trellis_rank_lut = sqg_xor_cheb_t12_lut(a_input.device)
+        fc1_trellis_lut_addr = trellis_rank_lut.data_ptr()
+        fc2_trellis_lut_addr = trellis_rank_lut.data_ptr()
+    else:
+        # Non-trellis kernels never dereference this ABI slot.
+        fc1_trellis_lut_addr = w13_scale_i32.data_ptr()
+        fc2_trellis_lut_addr = w13_scale_i32.data_ptr()
     fused.compiled(
         make_ptr(
             _cutlass_element_dtype(element_dtype),
@@ -9904,6 +10290,18 @@ def _w4a16_fused_moe_launch_flat(
             cute.AddressSpace.gmem,
             assumed_align=4,
         ),
+        make_ptr(
+            cutlass.Uint8,
+            fc1_trellis_lut_addr,
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Uint8,
+            fc2_trellis_lut_addr,
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
         Int32(num_experts),
         Int32(route_num_experts),
         m,
@@ -9945,6 +10343,12 @@ def _w4a16_fused_persistent_grid_x(
     where the host cannot know route_blocks ahead of the launch.
     """
     cap = int(sms) * int(fused.blocks_per_sm)
+    if _w4a16_small_m_splitk_enabled():
+        # Stripe split-K wants the full persistent grid: each small-M FC1
+        # column's K range is fanned across many CTAs, so right-sizing the
+        # grid to the mn-tile count would recreate the serialization the
+        # flag exists to remove.
+        return max(cap, 1)
     if not direct_topk_routes or m <= 0:
         return max(cap, 1)
     is_gated = is_gated_moe_activation(activation)
@@ -10553,6 +10957,9 @@ def _compile_w4a16_gemm_launch(
     scale_format: str = "e4m3_k16",
     w13_layout: str = "packed",
     trellis_bits: int = 3,
+    trellis_codebook: str = "sqg_xor_cheb_t12",
+    trellis_pair_kind: str | None = None,
+    trellis_rate_axis: str | None = None,
     dense_route_fast_path: bool = False,
     route_slots: int | None = None,
     force_tile_config: tuple[int, int] | None = None,
@@ -10608,6 +11015,9 @@ def _compile_w4a16_gemm_launch(
         scale_format=scale_format,
         w13_layout=w13_layout,
         trellis_bits=trellis_bits,
+        trellis_codebook=trellis_codebook,
+        trellis_pair_kind=trellis_pair_kind,
+        trellis_rate_axis=trellis_rate_axis,
         dense_route_fast_path=bool(dense_route_fast_path),
     )
     if route_slots is None:
@@ -10853,23 +11263,29 @@ def _run_trellis256_dense_current_device(
     This is a true dense entry: E=1 and contiguous row identities are synthesized
     inside the kernel, so no top-k tensors or route-packing kernels are created.
     Outer rotations follow EXL3 order exactly: fp16 ``suh`` multiply before the
-    input H128, and fp16 ``svh`` multiply after the output H128.  The current
-    device decode is MCG-only and rejects other codebook metadata fail-closed.
+    input H128, and fp16 ``svh`` multiply after the output H128.
     """
     if getattr(prepared_dense, "weight_layout", None) != "trellis3_t256":
         raise ValueError("run_trellis256_dense requires prepared trellis3_t256 weights")
     if int(getattr(prepared_dense, "num_experts", 0)) != 1:
         raise ValueError("run_trellis256_dense requires an honest E=1 prepared weight")
-    if getattr(prepared_dense, "trellis_codebook", None) != "mcg":
+    trellis_codebook = str(
+        getattr(prepared_dense, "trellis_codebook", "")
+    ).lower()
+    if trellis_codebook not in _TRELLIS256_CODEBOOKS:
         raise NotImplementedError(
-            "run_trellis256_dense currently decodes only the MCG codebook; "
-            f"got {getattr(prepared_dense, 'trellis_codebook', None)!r}"
+            "run_trellis256_dense has no decoder for codebook "
+            f"{trellis_codebook!r}"
         )
     trellis_bits = int(getattr(prepared_dense, "trellis_bits", 0))
     if trellis_bits not in _TRELLIS256_BITS:
         raise ValueError(
             f"prepared dense weight has invalid trellis_bits={trellis_bits}"
         )
+    trellis_pair_kind = getattr(prepared_dense, "trellis_pair_kind", None)
+    trellis_rate_axis = getattr(prepared_dense, "trellis_rate_axis", None)
+    if (trellis_pair_kind is None) != (trellis_rate_axis is None):
+        raise ValueError("prepared pair weight has incomplete pair metadata")
     compute_dtype = getattr(prepared_dense, "params_dtype", None)
     if compute_dtype not in (torch.float16, torch.bfloat16):
         raise TypeError(
@@ -10907,66 +11323,6 @@ def _run_trellis256_dense_current_device(
     external_hadamard_128 = (
         None if hadamard_128 is None else _resolve_exl3_hadamard_128(hadamard_128)
     )
-
-    # Decode and small batches use one cooperative K6 kernel that owns both
-    # H128 rotations. This avoids three launches and the generic routed-GEMM
-    # scheduler while retaining the checkpoint-native Trellis representation.
-    use_k6_small = (
-        m <= 128
-        and trellis_bits == 6
-        and compute_dtype == torch.float16
-        and external_hadamard_128 is None
-    )
-    if use_k6_small:
-        if x.dtype == torch.float16:
-            x_f16 = x
-        else:
-            input_f16 = _trellis_dense_buffer(
-                "input_f16",
-                input_f16,
-                shape=(m, size_k),
-                dtype=torch.float16,
-                device=x.device,
-            )
-            input_f16.copy_(x)
-            x_f16 = input_f16
-        rotated_f16 = _trellis_dense_buffer(
-            "rotated_f16",
-            rotated_f16,
-            shape=(m, size_k),
-            dtype=torch.float16,
-            device=x.device,
-        )
-        if output.dtype == torch.float16:
-            small_output = output
-        else:
-            output_f16 = _trellis_dense_buffer(
-                "output_f16",
-                output_f16,
-                shape=(m, size_n),
-                dtype=torch.float16,
-                device=x.device,
-            )
-            small_output = output_f16
-        from b12x.gemm.trellis_linear._small_m import run_k6_mcg
-
-        trellis_i16 = prepared_dense.trellis.view(torch.int16).view(
-            size_k // 16,
-            size_n // 16,
-            96,
-        )
-        run_k6_mcg(
-            x_f16,
-            trellis_i16,
-            small_output,
-            prepared_dense.suh,
-            rotated_f16,
-            prepared_dense.svh,
-            prepared_dense.workspace,
-        )
-        if output.dtype != torch.float16:
-            output.copy_(small_output)
-        return output
 
     gemm_output = _trellis_dense_buffer(
         "gemm_output",
@@ -11057,6 +11413,9 @@ def _run_trellis256_dense_current_device(
         scale_format="e4m3_k32",
         w13_layout="packed",
         trellis_bits=trellis_bits,
+        trellis_codebook=trellis_codebook,
+        trellis_pair_kind=trellis_pair_kind,
+        trellis_rate_axis=trellis_rate_axis,
         dense_route_fast_path=True,
         route_slots=route_slots,
         force_tile_config=(tile_k, tile_n),
@@ -11096,6 +11455,7 @@ def _run_trellis256_dense_current_device(
         prepared_dense.global_scale,
         launch.c_tmp,
         prepared_dense.workspace,
+        sqg_xor_cheb_t12_lut(x.device),
         m,
         grid_x,
         stream,
@@ -11161,7 +11521,7 @@ def run_trellis256_dense(
     _moe_block_size: int = 64,
     _force_tile_config: tuple[int, int] | None = None,
 ) -> torch.Tensor:
-    """Run one native 3/4/5/6-bpw EXL3 linear through the fused t256 GEMM.
+    """Run one native or compact P24/P33 EXL3 linear through the t256 GEMM.
 
     The whole input-rotation -> GEMM -> output-rotation chain is device-guarded
     and runs on the current Torch stream for ``x.device``.  To use a non-default
@@ -11308,23 +11668,59 @@ def run_w4a16_moe(
     if weight_layout not in _WEIGHT_LAYOUTS:
         raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
     trellis_bits = int(getattr(prepared, "trellis_bits", 3))
+    trellis_codebook = str(
+        getattr(prepared, "trellis_codebook", "sqg_xor_cheb_t12")
+    ).lower()
+    fc1_trellis_pair_kind = getattr(prepared, "fc1_trellis_pair_kind", None)
+    fc2_trellis_pair_kind = getattr(prepared, "fc2_trellis_pair_kind", None)
+    fc1_trellis_pair_modes = getattr(prepared, "fc1_trellis_pair_modes", None)
+    fc2_trellis_pair_modes = getattr(prepared, "fc2_trellis_pair_modes", None)
+    prepared_tile_config = getattr(prepared, "tile_config", None)
+    if (fc1_trellis_pair_kind is None) != (fc2_trellis_pair_kind is None):
+        raise ValueError("prepared trellis pair weights have incomplete pair metadata")
     if weight_layout == "trellis3_t256":
         if trellis_bits not in _TRELLIS256_BITS:
             raise ValueError(
                 f"prepared trellis3_t256 bitrate must be in {_TRELLIS256_BITS}, "
                 f"got {trellis_bits}"
             )
-        if getattr(prepared, "trellis_codebook", None) != "mcg":
+        if trellis_codebook not in _TRELLIS256_CODEBOOKS:
             raise NotImplementedError(
-                "trellis3_t256 execution currently requires the MCG codebook"
+                "trellis3_t256 execution has no decoder for codebook "
+                f"{trellis_codebook!r}"
             )
+        if fc1_trellis_pair_kind is not None:
+            fc1_trellis_pair_kind = str(fc1_trellis_pair_kind).upper()
+            fc2_trellis_pair_kind = str(fc2_trellis_pair_kind).upper()
+            if (
+                fc1_trellis_pair_kind != "PDYNAMIC"
+                or fc2_trellis_pair_kind != "PDYNAMIC"
+            ):
+                raise ValueError(
+                    "prepared fused trellis pair kinds must both be PDYNAMIC"
+                )
+            if trellis_bits != 3:
+                raise ValueError("prepared trellis pairs must average three bits")
+            for name, modes in (
+                ("fc1", fc1_trellis_pair_modes),
+                ("fc2", fc2_trellis_pair_modes),
+            ):
+                if (
+                    modes is None
+                    or modes.dtype != torch.int32
+                    or modes.device != a_input.device
+                    or tuple(modes.shape) != (int(prepared.num_experts),)
+                    or not modes.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"prepared dynamic {name} trellis pair modes must be "
+                        "contiguous int32[num_experts] on the input device"
+                    )
         if activation_amax is not None:
             raise NotImplementedError(
                 "trellis3_t256 activation-amax collection is not exposed through "
                 "the registered launch ABI"
             )
-    elif trellis_bits != 3:
-        raise ValueError("trellis_bits is only valid for trellis3_t256 weights")
     scale_format = _normalize_scale_format(
         getattr(prepared, "scale_format", None)
         or (
@@ -11333,6 +11729,17 @@ def run_w4a16_moe(
             else "e4m3_k16"
         )
     )
+    x4t_w13_scale = getattr(prepared, "x4t_w13_scale", None)
+    x4t_w2_scale = getattr(prepared, "x4t_w2_scale", None)
+    if (x4t_w13_scale is None) != (x4t_w2_scale is None):
+        raise ValueError("prepared X4T weights have incomplete scale metadata")
+    use_x4t_scale_predecode = x4t_w13_scale is not None
+    if use_x4t_scale_predecode and (
+        weight_layout != "packed" or scale_format != "e8m0_k32"
+    ):
+        raise ValueError(
+            "X4T scale predecode requires packed FP4 weights with E8M0 K/32 scales"
+        )
     w13_layout = getattr(
         prepared,
         "w13_layout",
@@ -11606,7 +12013,7 @@ def run_w4a16_moe(
     use_tc_decode = bool(
         (not collect_activation_amax)
         and (fused_launch is None or preplanned_tc_decode)
-        and weight_layout in ("packed", "nf3_2p1")
+        and weight_layout == "packed"
         and is_gated
         and element_dtype == "bf16"
         and topk_ids.dtype in (torch.int32, torch.int64)
@@ -11621,7 +12028,7 @@ def run_w4a16_moe(
     direct_m_cap = (
         _W4A16_SMALL_M_DIRECT_MAX_M if mapped_direct else _MAX_DIRECT_TOPK_ROUTE_M
     )
-    direct_layout_ok = weight_layout in ("packed", "nf3_2p1") or (
+    direct_layout_ok = weight_layout == "packed" or (
         mapped_direct and full_rotation and weight_layout == "trellis3_t256"
     )
     direct_topk_eligible = (
@@ -11711,6 +12118,33 @@ def run_w4a16_moe(
         route_slots_for_scratch = int(packed_route_indices.numel())
         required_m_blocks = int(block_expert_ids.numel())
 
+    if use_x4t_scale_predecode:
+        # X4T keeps the exact nibble weights resident and expands only the
+        # scale planes of experts touched by this routed call. The scratch is
+        # caller-owned and may be shared across all layers on this stream.
+        from b12x._lib.quant.x4t_scales import (
+            decode_x4t_tp12_w4a16_scales,
+        )
+
+        assert x4t_w13_scale is not None and x4t_w2_scale is not None
+        x4t_expert_ids = (
+            packed_route_indices if use_direct_topk_routes else block_expert_ids
+        )
+        assert x4t_expert_ids is not None
+        decode_x4t_tp12_w4a16_scales(
+            x4t_w13_scale,
+            x4t_w2_scale,
+            x4t_expert_ids,
+            prepared.w13_scale,
+            prepared.w2_scale,
+            expert_map=expert_map if use_direct_topk_routes else None,
+            w13_row_rotation=int(
+                getattr(prepared, "x4t_w13_row_rotation", 0)
+            ),
+            expert_ids_unique=bool(use_direct_topk_routes and m == 1),
+            stream=stream,
+        )
+
     props = torch.cuda.get_device_properties(a_input.device)
     sms = int(props.multi_processor_count)
     max_shared_mem = int(
@@ -11783,6 +12217,9 @@ def run_w4a16_moe(
             scale_format=scale_format,
             w13_layout=w13_layout,
             trellis_bits=trellis_bits,
+            trellis_codebook=trellis_codebook,
+            fc1_trellis_pair_kind=fc1_trellis_pair_kind,
+            fc2_trellis_pair_kind=fc2_trellis_pair_kind,
             direct_topk_routes=use_direct_topk_routes,
             use_expert_map=mapped_direct and use_direct_topk_routes,
             tc_decode_fused_sum=use_tc_decode,
@@ -11790,6 +12227,7 @@ def run_w4a16_moe(
             intermediate_rotation=intermediate_rotation_scales is not None,
             full_rotation=full_rotation,
             rotation_input_dtype=rotation_input_dtype,
+            force_tile_config=prepared_tile_config,
             _require_cached=_w4a16_stream_is_capturing(
                 stream,
                 current_stream=current_stream,
@@ -11822,6 +12260,9 @@ def run_w4a16_moe(
             scale_format,
             w13_layout,
             trellis_bits,
+            trellis_codebook,
+            fc1_trellis_pair_kind,
+            fc2_trellis_pair_kind,
             bool(use_direct_topk_routes),
             mapped_direct and use_direct_topk_routes,
             bool(collect_activation_amax),
@@ -11854,6 +12295,15 @@ def run_w4a16_moe(
                 else "packed",
             ),
             int(getattr(fused_launch, "trellis_bits", 3)),
+            str(
+                getattr(
+                    fused_launch,
+                    "trellis_codebook",
+                    "sqg_xor_cheb_t12",
+                )
+            ).lower(),
+            getattr(fused_launch, "fc1_trellis_pair_kind", None),
+            getattr(fused_launch, "fc2_trellis_pair_kind", None),
             bool(getattr(fused_launch, "direct_topk_routes", False)),
             bool(getattr(fused_launch, "use_expert_map", False)),
             bool(getattr(fused_launch, "collect_activation_amax", False)),
@@ -11872,19 +12322,6 @@ def run_w4a16_moe(
                 f"planned={actual_fused + (int(fused_launch.max_m_blocks),)}"
             )
         fused = fused_launch
-    if weight_layout == "nf3_2p1":
-        prepared_tiles = (
-            int(getattr(prepared, "fc1_tile_n", 0)),
-            int(getattr(prepared, "fc2_tile_n", 0)),
-        )
-        compiled_tiles = (int(fused.fc1_tile_n), int(fused.fc2_tile_n))
-        if prepared_tiles != compiled_tiles:
-            raise RuntimeError(
-                "prepared NF3 packing geometry does not match the compiled "
-                "W4A16 launch: "
-                f"prepared_fc1_fc2_tile_n={prepared_tiles}, "
-                f"compiled_fc1_fc2_tile_n={compiled_tiles}"
-            )
     capacity_m = int(fused.size_m)
     capacity_routed_rows = capacity_m * topk
     if intermediate_cache13_flat.numel() < capacity_routed_rows * max(
@@ -11938,6 +12375,18 @@ def run_w4a16_moe(
     else:
         w13_arg = prepared.w13.view(torch.int32).view(-1)
         w2_arg = prepared.w2.view(torch.int32).view(-1)
+    w13_scale_or_pair_modes = (
+        fc1_trellis_pair_modes
+        if fc1_trellis_pair_kind == "PDYNAMIC"
+        else prepared.w13_scale.view(torch.uint8).view(torch.int32).view(-1)
+    )
+    w2_scale_or_pair_modes = (
+        fc2_trellis_pair_modes
+        if fc2_trellis_pair_kind == "PDYNAMIC"
+        else prepared.w2_scale.view(torch.uint8).view(torch.int32).view(-1)
+    )
+    assert w13_scale_or_pair_modes is not None
+    assert w2_scale_or_pair_modes is not None
     launch_common = (
         a_input,
         w13_arg,
@@ -11945,8 +12394,8 @@ def run_w4a16_moe(
         fc1_out,
         activated,
         fc2_out,
-        prepared.w13_scale.view(torch.uint8).view(torch.int32).view(-1),
-        prepared.w2_scale.view(torch.uint8).view(torch.int32).view(-1),
+        w13_scale_or_pair_modes,
+        w2_scale_or_pair_modes,
         prepared.w13_global_scale,
         prepared.w2_global_scale,
         packed_route_indices,
@@ -12136,6 +12585,9 @@ def run_w4a16_moe(
             intermediate_rotation=_intermediate_rotation,
             a_input_up=launch_a_up,
             trellis_bits=trellis_bits,
+            trellis_codebook=trellis_codebook,
+            fc1_trellis_pair_kind=fc1_trellis_pair_kind,
+            fc2_trellis_pair_kind=fc2_trellis_pair_kind,
             full_rotation=full_rotation,
             rotation_input=_rc_a,
             suh_gate_table=suh_gate_table,
@@ -12252,702 +12704,24 @@ def build_w4a16_tier_local_map(
     return table.contiguous()
 
 
-def _w4a16_hybrid_validate_tensor(
-    name: str,
-    tensor: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-    elements: int,
-    assumed_align: int,
-    exact: bool,
-) -> None:
-    if tensor.dtype != dtype:
-        raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
-    if not tensor.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
-    actual = int(tensor.numel())
-    if (exact and actual != int(elements)) or (not exact and actual < int(elements)):
-        relation = "exactly" if exact else "at least"
-        raise ValueError(
-            f"{name} must contain {relation} {int(elements)} elements, got {actual}"
-        )
-    address = int(tensor.data_ptr())
-    if address == 0 or address % int(assumed_align) != 0:
-        raise ValueError(
-            f"{name} address {address:#x} violates assumed_align={int(assumed_align)}"
-        )
 
 
-def _w4a16_hybrid_validate_aliases(
-    tensors: tuple[tuple[str, torch.Tensor, bool], ...],
-) -> None:
-    """Reject byte overlaps involving a mutable tensor or a route-map input."""
-
-    protected = {"global_topk_ids", "tier_local_map"}
-    ranges = tuple(
-        (
-            name,
-            int(tensor.data_ptr()),
-            int(tensor.data_ptr()) + int(tensor.numel()) * int(tensor.element_size()),
-            bool(mutable),
-        )
-        for name, tensor, mutable in tensors
-    )
-    for left_idx in range(len(ranges)):
-        left_name, left_start, left_stop, left_mutable = ranges[left_idx]
-        for right_idx in range(left_idx + 1, len(ranges)):
-            right_name, right_start, right_stop, right_mutable = ranges[right_idx]
-            overlap_matters = (
-                left_mutable
-                or right_mutable
-                or left_name in protected
-                or right_name in protected
-            )
-            if not overlap_matters:
-                continue
-            if left_start < right_stop and right_start < left_stop:
-                raise ValueError(
-                    "hybrid W4A16 unsafe storage alias: "
-                    f"{left_name} overlaps {right_name}"
-                )
 
 
-def _w4a16_fused_moe_hybrid_launch_flat(
-    a_input: torch.Tensor,
-    t0_w13: torch.Tensor,
-    t0_w2: torch.Tensor,
-    t0_w13_scale_i32: torch.Tensor,
-    t0_w2_scale_i32: torch.Tensor,
-    t0_w13_global: torch.Tensor,
-    t0_w2_global: torch.Tensor,
-    t1_w13: torch.Tensor,
-    t1_w2: torch.Tensor,
-    t1_w13_scale_i32: torch.Tensor,
-    t1_w2_scale_i32: torch.Tensor,
-    t1_w13_global: torch.Tensor,
-    t1_w2_global: torch.Tensor,
-    global_topk_ids: torch.Tensor,
-    tier_local_map: torch.Tensor,
-    fc1_out: torch.Tensor,
-    activated: torch.Tensor,
-    output_out: torch.Tensor,
-    topk_weights: torch.Tensor,
-    fc1_scratch: torch.Tensor,
-    fc2_scratch: torch.Tensor,
-    workspace: torch.Tensor,
-    m: int,
-    size_m: int,
-    hidden_size: int,
-    intermediate_size: int,
-    t0_num_experts: int,
-    t1_num_experts: int,
-    topk: int,
-    activation: str,
-    map_slots: int,
-    moe_block_size: int,
-    element_dtype: str,
-    fast_math: bool,
-    sms: int,
-    max_shared_mem: int,
-    t0_weight_layout: str,
-    t0_scale_format: str,
-    t0_w13_layout: str,
-    t1_weight_layout: str,
-    t1_scale_format: str,
-    t1_w13_layout: str,
-    fc1_tile_k: int,
-    fc1_tile_n: int,
-    fc2_tile_k: int,
-    fc2_tile_n: int,
-    schedule_whole_tiles: bool,
-    stream_int: int,
-) -> None:
-    if not a_input.is_cuda:
-        raise ValueError("hybrid W4A16 input must be a CUDA tensor")
-    device_index = a_input.device.index
-    current_device = int(torch.cuda.current_device())
-    if device_index is None or int(device_index) != current_device:
-        raise ValueError(
-            "hybrid W4A16 input must be on the current CUDA device: "
-            f"cuda:{device_index} != cuda:{current_device}"
-        )
-    current_stream_int = int(torch.cuda.current_stream(a_input.device).cuda_stream)
-    if int(stream_int) != current_stream_int:
-        raise ValueError(
-            "hybrid W4A16 stream must be the current input-device stream: "
-            f"{int(stream_int)} != {current_stream_int}"
-        )
-    if int(m) < 1 or int(m) > int(size_m):
-        raise ValueError(f"hybrid W4A16 requires 1 <= m <= size_m, got m={m}")
-
-    hybrid = compile_w4a16_fused_moe_hybrid(
-        size_m=size_m,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        tier0_num_experts=t0_num_experts,
-        tier1_num_experts=t1_num_experts,
-        top_k=topk,
-        activation=activation,
-        map_slots=map_slots,
-        moe_block_size=moe_block_size,
-        element_dtype=element_dtype,
-        fast_math=bool(fast_math),
-        sms=sms,
-        max_shared_mem=max_shared_mem,
-        tier0_weight_layout=t0_weight_layout,
-        tier0_scale_format=t0_scale_format,
-        tier0_w13_layout=t0_w13_layout,
-        tier1_weight_layout=t1_weight_layout,
-        tier1_scale_format=t1_scale_format,
-        tier1_w13_layout=t1_w13_layout,
-        force_tile_config=(fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n),
-        schedule_whole_tiles=bool(schedule_whole_tiles),
-    )
-
-    element_torch_dtype = torch.float16 if element_dtype == "fp16" else torch.bfloat16
-    fc1_cols = int(intermediate_size) * 2
-    routed_rows = int(m) * int(topk)
-    weight_dtypes = {
-        "modelopt": torch.uint8,
-    }
-    tensor_contracts = (
-        ("a_input", a_input, element_torch_dtype, m * hidden_size, 16, False, False),
-        (
-            "t0_w13",
-            t0_w13,
-            weight_dtypes.get(t0_weight_layout, torch.int32),
-            _w4a16_weight_flat_elements(
-                num_experts=t0_num_experts,
-                size_n=fc1_cols,
-                size_k=hidden_size,
-                weight_layout=t0_weight_layout,
-            ),
-            16,
-            True,
-            False,
-        ),
-        (
-            "t0_w2",
-            t0_w2,
-            weight_dtypes.get(t0_weight_layout, torch.int32),
-            _w4a16_weight_flat_elements(
-                num_experts=t0_num_experts,
-                size_n=hidden_size,
-                size_k=intermediate_size,
-                weight_layout=t0_weight_layout,
-            ),
-            16,
-            True,
-            False,
-        ),
-        (
-            "t1_w13",
-            t1_w13,
-            weight_dtypes.get(t1_weight_layout, torch.int32),
-            _w4a16_weight_flat_elements(
-                num_experts=t1_num_experts,
-                size_n=fc1_cols,
-                size_k=hidden_size,
-                weight_layout=t1_weight_layout,
-            ),
-            16,
-            True,
-            False,
-        ),
-        (
-            "t1_w2",
-            t1_w2,
-            weight_dtypes.get(t1_weight_layout, torch.int32),
-            _w4a16_weight_flat_elements(
-                num_experts=t1_num_experts,
-                size_n=hidden_size,
-                size_k=intermediate_size,
-                weight_layout=t1_weight_layout,
-            ),
-            16,
-            True,
-            False,
-        ),
-        ("t0_w13_scale_i32", t0_w13_scale_i32, torch.int32, 1, 16, False, False),
-        ("t0_w2_scale_i32", t0_w2_scale_i32, torch.int32, 1, 16, False, False),
-        ("t1_w13_scale_i32", t1_w13_scale_i32, torch.int32, 1, 16, False, False),
-        ("t1_w2_scale_i32", t1_w2_scale_i32, torch.int32, 1, 16, False, False),
-        (
-            "t0_w13_global",
-            t0_w13_global,
-            torch.float32,
-            t0_num_experts,
-            16,
-            True,
-            False,
-        ),
-        ("t0_w2_global", t0_w2_global, torch.float32, t0_num_experts, 16, True, False),
-        (
-            "t1_w13_global",
-            t1_w13_global,
-            torch.float32,
-            t1_num_experts,
-            16,
-            True,
-            False,
-        ),
-        ("t1_w2_global", t1_w2_global, torch.float32, t1_num_experts, 16, True, False),
-        (
-            "global_topk_ids",
-            global_topk_ids,
-            torch.int32,
-            routed_rows,
-            16,
-            False,
-            False,
-        ),
-        ("tier_local_map", tier_local_map, torch.int32, map_slots, 16, True, False),
-        (
-            "fc1_out",
-            fc1_out,
-            element_torch_dtype,
-            routed_rows * fc1_cols,
-            16,
-            False,
-            True,
-        ),
-        (
-            "activated",
-            activated,
-            element_torch_dtype,
-            routed_rows * intermediate_size,
-            16,
-            False,
-            True,
-        ),
-        (
-            "output_out",
-            output_out,
-            element_torch_dtype,
-            m * hidden_size,
-            16,
-            False,
-            True,
-        ),
-        ("topk_weights", topk_weights, torch.float32, routed_rows, 4, False, False),
-        ("fc1_scratch", fc1_scratch, torch.float32, 1, 16, False, True),
-        ("fc2_scratch", fc2_scratch, torch.float32, 1, 16, False, True),
-        (
-            "workspace",
-            workspace,
-            torch.int32,
-            int(sms) * 4 + 2,
-            16,
-            False,
-            True,
-        ),
-    )
-    for name, tensor, dtype, elements, align, exact, _ in tensor_contracts:
-        _w4a16_hybrid_validate_tensor(
-            name,
-            tensor,
-            dtype=dtype,
-            elements=elements,
-            assumed_align=align,
-            exact=exact,
-        )
-        if tensor.device != a_input.device:
-            raise ValueError(
-                f"{name} device {tensor.device} does not match input "
-                f"device {a_input.device}"
-            )
-    _w4a16_hybrid_validate_aliases(
-        tuple(
-            (name, tensor, mutable)
-            for name, tensor, _, _, _, _, mutable in tensor_contracts
-        )
-    )
-
-    grid_x = _w4a16_fused_persistent_grid_x(
-        fused=hybrid,
-        m=m,
-        topk=topk,
-        intermediate_size=intermediate_size,
-        activation=activation,
-        direct_topk_routes=True,
-        sms=sms,
-    )
-    hybrid.compiled(
-        make_ptr(
-            _cutlass_element_dtype(element_dtype),
-            a_input.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        t0_w13,
-        t0_w2,
-        t0_w13_scale_i32,
-        t0_w2_scale_i32,
-        t0_w13_global,
-        t0_w2_global,
-        t1_w13,
-        t1_w2,
-        t1_w13_scale_i32,
-        t1_w2_scale_i32,
-        t1_w13_global,
-        t1_w2_global,
-        global_topk_ids,
-        tier_local_map,
-        fc1_out,
-        activated,
-        output_out,
-        make_ptr(
-            cutlass.Float32,
-            topk_weights.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=4,
-        ),
-        fc1_scratch,
-        fc2_scratch,
-        workspace,
-        m,
-        grid_x,
-        cuda.CUstream(stream_int),
-    )
 
 
-@torch.library.custom_op(
-    "b12x::w4a16_fused_moe_hybrid_launch",
-    mutates_args="unknown",
-    device_types="cuda",
-)
-def _w4a16_fused_moe_hybrid_launch_op(
-    a_input: torch.Tensor,
-    t0_w13: torch.Tensor,
-    t0_w2: torch.Tensor,
-    t0_w13_scale_i32: torch.Tensor,
-    t0_w2_scale_i32: torch.Tensor,
-    t0_w13_global: torch.Tensor,
-    t0_w2_global: torch.Tensor,
-    t1_w13: torch.Tensor,
-    t1_w2: torch.Tensor,
-    t1_w13_scale_i32: torch.Tensor,
-    t1_w2_scale_i32: torch.Tensor,
-    t1_w13_global: torch.Tensor,
-    t1_w2_global: torch.Tensor,
-    global_topk_ids: torch.Tensor,
-    tier_local_map: torch.Tensor,
-    fc1_out: torch.Tensor,
-    activated: torch.Tensor,
-    output_out: torch.Tensor,
-    topk_weights: torch.Tensor,
-    fc1_scratch: torch.Tensor,
-    fc2_scratch: torch.Tensor,
-    workspace: torch.Tensor,
-    m: int,
-    size_m: int,
-    hidden_size: int,
-    intermediate_size: int,
-    t0_num_experts: int,
-    t1_num_experts: int,
-    topk: int,
-    activation: str,
-    map_slots: int,
-    moe_block_size: int,
-    element_dtype: str,
-    fast_math: bool,
-    sms: int,
-    max_shared_mem: int,
-    t0_weight_layout: str,
-    t0_scale_format: str,
-    t0_w13_layout: str,
-    t1_weight_layout: str,
-    t1_scale_format: str,
-    t1_w13_layout: str,
-    fc1_tile_k: int,
-    fc1_tile_n: int,
-    fc2_tile_k: int,
-    fc2_tile_n: int,
-    schedule_whole_tiles: bool,
-    stream_int: int,
-) -> None:
-    _w4a16_fused_moe_hybrid_launch_flat(
-        a_input,
-        t0_w13,
-        t0_w2,
-        t0_w13_scale_i32,
-        t0_w2_scale_i32,
-        t0_w13_global,
-        t0_w2_global,
-        t1_w13,
-        t1_w2,
-        t1_w13_scale_i32,
-        t1_w2_scale_i32,
-        t1_w13_global,
-        t1_w2_global,
-        global_topk_ids,
-        tier_local_map,
-        fc1_out,
-        activated,
-        output_out,
-        topk_weights,
-        fc1_scratch,
-        fc2_scratch,
-        workspace,
-        m,
-        size_m,
-        hidden_size,
-        intermediate_size,
-        t0_num_experts,
-        t1_num_experts,
-        topk,
-        activation,
-        map_slots,
-        moe_block_size,
-        element_dtype,
-        fast_math,
-        sms,
-        max_shared_mem,
-        t0_weight_layout,
-        t0_scale_format,
-        t0_w13_layout,
-        t1_weight_layout,
-        t1_scale_format,
-        t1_w13_layout,
-        fc1_tile_k,
-        fc1_tile_n,
-        fc2_tile_k,
-        fc2_tile_n,
-        schedule_whole_tiles,
-        stream_int,
-    )
 
 
-@_w4a16_fused_moe_hybrid_launch_op.register_fake
-def _w4a16_fused_moe_hybrid_launch_fake(
-    a_input: torch.Tensor,
-    t0_w13: torch.Tensor,
-    t0_w2: torch.Tensor,
-    t0_w13_scale_i32: torch.Tensor,
-    t0_w2_scale_i32: torch.Tensor,
-    t0_w13_global: torch.Tensor,
-    t0_w2_global: torch.Tensor,
-    t1_w13: torch.Tensor,
-    t1_w2: torch.Tensor,
-    t1_w13_scale_i32: torch.Tensor,
-    t1_w2_scale_i32: torch.Tensor,
-    t1_w13_global: torch.Tensor,
-    t1_w2_global: torch.Tensor,
-    global_topk_ids: torch.Tensor,
-    tier_local_map: torch.Tensor,
-    fc1_out: torch.Tensor,
-    activated: torch.Tensor,
-    output_out: torch.Tensor,
-    topk_weights: torch.Tensor,
-    fc1_scratch: torch.Tensor,
-    fc2_scratch: torch.Tensor,
-    workspace: torch.Tensor,
-    m: int,
-    size_m: int,
-    hidden_size: int,
-    intermediate_size: int,
-    t0_num_experts: int,
-    t1_num_experts: int,
-    topk: int,
-    activation: str,
-    map_slots: int,
-    moe_block_size: int,
-    element_dtype: str,
-    fast_math: bool,
-    sms: int,
-    max_shared_mem: int,
-    t0_weight_layout: str,
-    t0_scale_format: str,
-    t0_w13_layout: str,
-    t1_weight_layout: str,
-    t1_scale_format: str,
-    t1_w13_layout: str,
-    fc1_tile_k: int,
-    fc1_tile_n: int,
-    fc2_tile_k: int,
-    fc2_tile_n: int,
-    schedule_whole_tiles: bool,
-    stream_int: int,
-) -> None:
-    return None
 
 
-def run_w4a16_moe_hybrid(
-    a_input: torch.Tensor,
-    prepared_tier0,
-    prepared_tier1,
-    topk_weights: torch.Tensor,
-    global_topk_ids: torch.Tensor,
-    tier_local_map: torch.Tensor,
-    *,
-    activation: str,
-    intermediate_cache13: torch.Tensor,
-    intermediate_cache2: torch.Tensor,
-    output: torch.Tensor,
-    force_tile_config: tuple[int, int, int, int],
-    size_m: int | None = None,
-    fc1_c_tmp: torch.Tensor | None = None,
-    fc2_c_tmp: torch.Tensor | None = None,
-    fast_math: bool = True,
-    schedule_whole_tiles: bool = True,
-    stream: cuda.CUstream | None = None,
-) -> torch.Tensor:
-    """Run one hybrid two-tier W4A16 fused MoE layer.
-
-    global_topk_ids carries GLOBAL expert ids ([m, topk] int32, -1 inactive);
-    tier_local_map is the descriptor table from build_w4a16_tier_local_map.
-    prepared_tier0/prepared_tier1 are per-tier prepared weight bundles whose
-    packing tile config must match force_tile_config.
-    """
-
-    activation = normalize_moe_activation(activation)
-    if not validate_activation(activation):
-        raise ValueError("hybrid W4A16 requires a gated activation")
-    element_dtype = _normalize_element_dtype(a_input.dtype)
-    m, hidden_size = a_input.shape
-    capacity_m = int(size_m) if size_m is not None else int(m)
-    topk = int(topk_weights.shape[-1])
-    if topk_weights.dtype != torch.float32:
-        raise TypeError("topk_weights must be torch.float32")
-    if global_topk_ids.dtype != torch.int32:
-        raise TypeError("global_topk_ids must be torch.int32")
-    if global_topk_ids.shape != (m, topk) and global_topk_ids.numel() != m * topk:
-        raise ValueError(
-            f"global_topk_ids must have m*topk={m * topk} elements, got "
-            f"{tuple(global_topk_ids.shape)}"
-        )
-
-    for name, prepared in (("tier0", prepared_tier0), ("tier1", prepared_tier1)):
-        prepared_dtype = getattr(prepared, "params_dtype", a_input.dtype)
-        if prepared_dtype != a_input.dtype:
-            raise TypeError(
-                f"{name} prepared weights were built for {prepared_dtype}, "
-                f"but a_input has dtype {a_input.dtype}"
-            )
-        if int(prepared.hidden_size) != int(hidden_size):
-            raise ValueError(f"{name} hidden_size mismatch")
-    intermediate_size = int(prepared_tier0.intermediate_size)
-    if int(prepared_tier1.intermediate_size) != intermediate_size:
-        raise ValueError("hybrid tiers disagree on intermediate_size")
-    fc1_cols = intermediate_size * 2
-
-    def _tier_layouts(prepared) -> tuple[str, str, str]:
-        weight_layout = getattr(prepared, "weight_layout", "packed")
-        scale_format = _normalize_scale_format(
-            getattr(prepared, "scale_format", None) or "e4m3_k16"
-        )
-        if weight_layout == "modelopt":
-            w13_layout = getattr(prepared, "w13_layout", "w13")
-        else:
-            w13_layout = "packed"
-        return weight_layout, scale_format, w13_layout
-
-    t0_layouts = _tier_layouts(prepared_tier0)
-    t1_layouts = _tier_layouts(prepared_tier1)
-
-    def _weight_args(prepared) -> tuple[torch.Tensor, torch.Tensor]:
-        if getattr(prepared, "weight_layout", "packed") == "modelopt":
-            return (
-                prepared.w13.view(torch.uint8).view(-1),
-                prepared.w2.view(torch.uint8).view(-1),
-            )
-        return (
-            prepared.w13.view(torch.int32).view(-1),
-            prepared.w2.view(torch.int32).view(-1),
-        )
-
-    t0_w13, t0_w2 = _weight_args(prepared_tier0)
-    t1_w13, t1_w2 = _weight_args(prepared_tier1)
-
-    props = torch.cuda.get_device_properties(a_input.device)
-    sms = int(props.multi_processor_count)
-    max_shared_mem = int(
-        getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
-    )
-
-    capacity_routed_rows = capacity_m * topk
-    intermediate_cache13_flat = intermediate_cache13.view(-1)
-    intermediate_cache2_flat = intermediate_cache2.view(-1)
-    if intermediate_cache13_flat.numel() < capacity_routed_rows * fc1_cols:
-        raise ValueError("intermediate_cache13 is smaller than launch capacity")
-    if intermediate_cache2_flat.numel() < capacity_routed_rows * intermediate_size:
-        raise ValueError("intermediate_cache2 is smaller than launch capacity")
-    fc1_out = intermediate_cache13_flat[: capacity_routed_rows * fc1_cols]
-    activated = intermediate_cache2_flat[: capacity_routed_rows * intermediate_size]
-
-    scratch_elements = packed_gemm_scratch_elements(
-        size_n=max(fc1_cols, hidden_size),
-        route_slots=capacity_routed_rows,
-        moe_block_size=8,
-        sms=sms,
-    )
-    fc1_scratch = _get_c_tmp(scratch_elements, device=a_input.device, scratch=fc1_c_tmp)
-    fc2_scratch = _get_c_tmp(scratch_elements, device=a_input.device, scratch=fc2_c_tmp)
-    workspace = prepared_tier0.workspace
-    stream = current_cuda_stream() if stream is None else stream
-
-    fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (int(v) for v in force_tile_config)
-    torch.ops.b12x.w4a16_fused_moe_hybrid_launch(
-        a_input,
-        t0_w13,
-        t0_w2,
-        prepared_tier0.w13_scale.view(torch.uint8).view(torch.int32).view(-1),
-        prepared_tier0.w2_scale.view(torch.uint8).view(torch.int32).view(-1),
-        prepared_tier0.w13_global_scale,
-        prepared_tier0.w2_global_scale,
-        t1_w13,
-        t1_w2,
-        prepared_tier1.w13_scale.view(torch.uint8).view(torch.int32).view(-1),
-        prepared_tier1.w2_scale.view(torch.uint8).view(torch.int32).view(-1),
-        prepared_tier1.w13_global_scale,
-        prepared_tier1.w2_global_scale,
-        global_topk_ids.view(-1),
-        tier_local_map,
-        fc1_out,
-        activated,
-        output.view(-1),
-        topk_weights,
-        fc1_scratch,
-        fc2_scratch,
-        workspace,
-        int(m),
-        capacity_m,
-        int(hidden_size),
-        intermediate_size,
-        int(prepared_tier0.num_experts),
-        int(prepared_tier1.num_experts),
-        topk,
-        activation,
-        int(tier_local_map.numel()),
-        8,
-        element_dtype,
-        bool(fast_math),
-        sms,
-        max_shared_mem,
-        t0_layouts[0],
-        t0_layouts[1],
-        t0_layouts[2],
-        t1_layouts[0],
-        t1_layouts[1],
-        t1_layouts[2],
-        fc1_tile_k,
-        fc1_tile_n,
-        fc2_tile_k,
-        fc2_tile_n,
-        bool(schedule_whole_tiles),
-        int(stream),
-    )
-    return output
 
 
 __all__ = [
     "W4A16ActivationCompileResult",
     "W4A16FusedMoeCompileResult",
-    "W4A16FusedMoeHybridCompileResult",
     "W4A16GemmCompileResult",
     "W4A16TopKSumCompileResult",
     "W4A16FusedMoeKernel",
-    "W4A16FusedMoeHybridKernel",
     "W4A16ActivationKernel",
     "W4A16GemmKernel",
     "W4A16TopKSumKernel",
@@ -12955,11 +12729,9 @@ __all__ = [
     "clear_w4a16_kernel_cache",
     "compile_w4a16_activation",
     "compile_w4a16_fused_moe",
-    "compile_w4a16_fused_moe_hybrid",
     "compile_w4a16_gemm",
     "compile_w4a16_topk_sum",
     "pack_topk_routes_by_expert",
     "run_trellis256_dense",
     "run_w4a16_moe",
-    "run_w4a16_moe_hybrid",
 ]

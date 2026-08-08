@@ -21,6 +21,7 @@ from b12x._lib.utils import (
 )
 from b12x._lib.intrinsics import (
     atomic_add_global_i32,
+    bfloat2_to_float2_scaled,
     cvt_e4m3_to_f32_via_f16,
     cvt_e4m3x4_to_f32x4,
     cvt_e8m0_to_f32,
@@ -28,6 +29,8 @@ from b12x._lib.intrinsics import (
     cvt_f32_to_e4m3,
     cvt_w4a16_packed_e4m3_scale_to_f32,
     fmax_f32,
+    f16x2_to_f32x2,
+    fp4_decode_4bytes,
     fp4_dot4_sum_f32acc,
     fp4_dot8_sum_f32acc,
     get_ptr_as_int64,
@@ -473,6 +476,30 @@ class MoEMicroKernelBackend:
         x2: Uint32,
         x3: Uint32,
     ) -> Float32:
+        if cutlass.const_expr(self.compile_time_phase == 2):
+            # Fused FC1 stores its internal activation pairs as FP16 bits.
+            # The standalone FC2 API intentionally accepts ordinary BF16
+            # tensors, so decode the two operands according to their actual
+            # formats before accumulating in FP32.
+            h0, h1, h2, h3 = fp4_decode_4bytes(u_packed)
+            w00, w01 = f16x2_to_f32x2(h0)
+            w10, w11 = f16x2_to_f32x2(h1)
+            w20, w21 = f16x2_to_f32x2(h2)
+            w30, w31 = f16x2_to_f32x2(h3)
+            x00, x01 = bfloat2_to_float2_scaled(x0, Float32(1.0))
+            x10, x11 = bfloat2_to_float2_scaled(x1, Float32(1.0))
+            x20, x21 = bfloat2_to_float2_scaled(x2, Float32(1.0))
+            x30, x31 = bfloat2_to_float2_scaled(x3, Float32(1.0))
+            return (
+                w00 * x00
+                + w01 * x01
+                + w10 * x10
+                + w11 * x11
+                + w20 * x20
+                + w21 * x21
+                + w30 * x30
+                + w31 * x31
+            )
         return fp4_dot4_sum_f32acc(u_packed, x0, x1, x2, x3)
 
     @cute.jit
@@ -1357,10 +1384,20 @@ class MoEMicroKernelBackend:
             ebase_sf = Int64(eid) * Int64(cfg.w2_sf_rows * cfg.w2_sf_cols)
 
             kk_off = token_inter_base + Int32(kk) * Int32(128)
-            xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
-            xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
-            xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
-            xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+            if cutlass.const_expr(self.compile_time_phase == 2):
+                # The public FC2-only entry receives ordinary contiguous BF16
+                # rows.  The fused body instead consumes FC1's internal
+                # pair-swizzled layout, where the four adjacent BF16 pairs are
+                # split across four 32-word bands.
+                xh0 = Uint32(intermediate[kk_off + lane * Int32(4) + Int32(0)])
+                xh1 = Uint32(intermediate[kk_off + lane * Int32(4) + Int32(1)])
+                xh2 = Uint32(intermediate[kk_off + lane * Int32(4) + Int32(2)])
+                xh3 = Uint32(intermediate[kk_off + lane * Int32(4) + Int32(3)])
+            else:
+                xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
 
             u_packed0 = (
                 ld_global_nc_u32(
@@ -1576,7 +1613,12 @@ class MoEMicroKernelBackend:
             ebase_sf_packed_e4m3 = Int64(eid) * Int64((cfg.n // 16) * cfg.k_dim)
 
             kk_off = token_inter_base + Int32(kk) * Int32(128)
-            if cutlass.const_expr(cfg.n < 256):
+            if cutlass.const_expr(self.compile_time_phase == 2):
+                xh0 = Uint32(intermediate[kk_off + lane * Int32(4) + Int32(0)])
+                xh1 = Uint32(intermediate[kk_off + lane * Int32(4) + Int32(1)])
+                xh2 = Uint32(intermediate[kk_off + lane * Int32(4) + Int32(2)])
+                xh3 = Uint32(intermediate[kk_off + lane * Int32(4) + Int32(3)])
+            elif cutlass.const_expr(cfg.n < 256):
                 # Match the m==1 path above: the packed 128-u32 swizzle has
                 # unwritten padding whenever the logical intermediate is
                 # narrower than 256 values.

@@ -1168,7 +1168,7 @@ def _validate_mixed_trellis_tier_storage(
         ),
         # Native Trellis decodes its codebook tiles directly. These scale
         # pointers retain the prepared four-byte dummy ABI and are not the
-        # per-expert K/32 scale grids used by packed/NF3 weights.
+        # per-expert K/32 scale grids used by packed weights.
         ("w13_scale", tier.w13_scale, torch.uint8, 4),
         ("w2_scale", tier.w2_scale, torch.uint8, 4),
         (

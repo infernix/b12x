@@ -15,7 +15,7 @@ import cutlass
 import cutlass.cute as cute
 import pytest
 import torch
-from cutlass import Float32, Int32, Uint32
+from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import from_dlpack
 
 from b12x._lib.intrinsics import (
@@ -201,6 +201,25 @@ def _bytes_of_pair(lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
 def _e2m1_lut_f32(device: torch.device) -> torch.Tensor:
     mags = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=device)
     return torch.cat([mags, -mags])
+
+
+def _native_trellis_tile(edges: torch.Tensor, bits: int) -> torch.Tensor:
+    """Pack 256 cyclic edge symbols with EXL's native SWAP16 ordering."""
+    values = edges.to(torch.int64) & ((1 << bits) - 1)
+    spans = values.reshape(16, 16)
+    symbol_shifts = torch.arange(bits - 1, -1, -1, device=edges.device)
+    bitstream = ((spans[..., None] >> symbol_shifts) & 1).reshape(16, bits * 16)
+    word_shifts = torch.arange(15, -1, -1, device=edges.device)
+    words = (bitstream.reshape(16, bits, 16) << word_shifts).sum(dim=-1)
+    flat = words.reshape(16 * bits)
+    return flat.reshape(-1, 2).flip(-1).reshape(-1).to(torch.int16).contiguous()
+
+
+def _cyclic_trellis_states(edges: torch.Tensor, bits: int) -> torch.Tensor:
+    states = torch.zeros_like(edges, dtype=torch.int64)
+    for lag in range((16 + bits - 1) // bits):
+        states |= torch.roll(edges.to(torch.int64), shifts=lag) << (lag * bits)
+    return (states & 0xFFFF).to(torch.int32)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
