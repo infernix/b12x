@@ -458,9 +458,28 @@ class TrellisW4A8FC1RoutesKernel(_NativeTrellisDecode):
             acc[nt].fill(0.0)
 
         warp = tid >> Int32(5)
-        k32_slice = Int32(self.hidden_size // 32 // (self.threads // 32))
-        k32 = warp * k32_slice
-        k32_end = k32 + k32_slice
+        # Keep every K32 tile live when the hidden dimension provides fewer
+        # tiles than the eight reduction warps.  Production Kimi dimensions
+        # divide evenly, while the smaller correctness geometries leave the
+        # excess warps idle.
+        k32_count = Int32(self.hidden_size // 32)
+        if cutlass.const_expr(
+            (self.hidden_size // 32) % (self.threads // 32) == 0
+        ):
+            k32_slice = Int32(
+                (self.hidden_size // 32) // (self.threads // 32)
+            )
+            k32 = warp * k32_slice
+            k32_end = k32 + k32_slice
+        else:
+            k32_slice = Int32(
+                (self.hidden_size // 32 + self.threads // 32 - 1)
+                // (self.threads // 32)
+            )
+            k32 = warp * k32_slice
+            k32_end = k32 + k32_slice
+            if k32_end > k32_count:
+                k32_end = k32_count
         if selected == Int32(0):
             k32 = k32_end
         while k32 < k32_end:
@@ -1132,7 +1151,7 @@ def run_trellis_w4a8_fc1_routes(
     sqg_direct_lut: bool = False,
     pair_mode_filter: int = -1,
 ) -> None:
-    """Launch route-major FC1 against prepared TP12 pair weights."""
+    """Launch route-major FC1 against prepared paired-rate weights."""
     routes = int(route_experts.numel())
     trellis_codebook = str(getattr(prepared, "trellis_codebook", "")).lower()
     if trellis_codebook not in _W4A8_CODEBOOKS:
@@ -1183,7 +1202,7 @@ def run_trellis_w4a8_fc2_routes(
     sqg_direct_lut: bool = False,
     pair_mode_filter: int = -1,
 ) -> None:
-    """Launch route-major FC2 against prepared TP12 pair weights."""
+    """Launch route-major FC2 against prepared paired-rate weights."""
     routes = int(route_experts.numel())
     trellis_codebook = str(getattr(prepared, "trellis_codebook", "")).lower()
     if trellis_codebook not in _W4A8_CODEBOOKS:

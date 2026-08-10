@@ -1,4 +1,4 @@
-"""Exact EXL outer transforms for the route-major QSRT W4A8 path."""
+"""Activation transforms and MXFP8 quantization for QSRT W4A8 MoE."""
 
 from __future__ import annotations
 
@@ -28,6 +28,8 @@ from b12x.moe._shared.kernels.activations import (
 
 
 _THREADS = 256
+_COUPLED_INPUT_THREADS = 128
+_COUPLED_ACTIVATION_THREADS = 64
 
 
 class _Hadamard128:
@@ -66,6 +68,22 @@ class _Hadamard128:
                 h3 = p3 + h3
         scale = Float32(0.088388347648)
         return h0 * scale, h1 * scale, h2 * scale, h3 * scale
+
+    @cute.jit
+    def _had4_normalized(
+        self, a: Float32, b: Float32, c: Float32, d: Float32
+    ):
+        ab0 = a + b
+        ab1 = a - b
+        cd0 = c + d
+        cd1 = c - d
+        scale = Float32(0.5)
+        return (
+            (ab0 + cd0) * scale,
+            (ab1 + cd1) * scale,
+            (ab0 - cd0) * scale,
+            (ab1 - cd1) * scale,
+        )
 
 
 class _NativeMXFP8:
@@ -546,12 +564,152 @@ class TrellisW4A8InputRotationQuantKernel(_Hadamard128, _NativeMXFP8):
                 )
 
 
+class TrellisW4A8CoupledInputQuantKernel(_Hadamard128, _NativeMXFP8):
+    """Apply the shared H512 boundary and ordinary H128 transform once."""
+
+    threads = _COUPLED_INPUT_THREADS
+
+    def __init__(
+        self, *, hidden_size: int, source_type: type[cutlass.Numeric]
+    ) -> None:
+        self.hidden_size = int(hidden_size)
+        self.source_type = source_type
+        self.groups_k = self.hidden_size // 32
+        if self.hidden_size <= 0 or self.hidden_size % 512:
+            raise ValueError("coupled W4A8 input requires hidden_size % 512 == 0")
+
+    @cute.jit
+    def __call__(
+        self,
+        source_ptr: cute.Pointer,
+        suh_ptr: cute.Pointer,
+        values_ptr: cute.Pointer,
+        scale_rows_ptr: cute.Pointer,
+        scale_mma_ptr: cute.Pointer,
+        tokens: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        source = cute.make_tensor(
+            source_ptr,
+            cute.make_ordered_layout((tokens, self.hidden_size), order=(1, 0)),
+        )
+        suh = cute.make_tensor(
+            suh_ptr,
+            cute.make_ordered_layout((Int32(1), self.hidden_size), order=(1, 0)),
+        )
+        values = cute.make_tensor(
+            values_ptr,
+            cute.make_ordered_layout(
+                (tokens, self.hidden_size // 4), order=(1, 0)
+            ),
+        )
+        scale_rows = cute.make_tensor(
+            scale_rows_ptr,
+            cute.make_ordered_layout((tokens, self.groups_k), order=(1, 0)),
+        )
+        scale_mma = cute.make_tensor(
+            scale_mma_ptr,
+            cute.make_layout((max(512, ((self.groups_k + 3) // 4) * 512),)),
+        )
+        warps = self.threads // 32
+        units = tokens * Int32(self.hidden_size // 512)
+        self.kernel(
+            source, suh, values, scale_rows, scale_mma, tokens
+        ).launch(
+            grid=(cute.ceil_div(units, warps), 1, 1),
+            block=[self.threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        source: cute.Tensor,
+        suh: cute.Tensor,
+        values: cute.Tensor,
+        scale_rows: cute.Tensor,
+        scale_mma: cute.Tensor,
+        tokens: Int32,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        tid = Int32(tidx)
+        lane = tid & Int32(31)
+        warp = tid >> Int32(5)
+        unit = Int32(bidx) * Int32(self.threads // 32) + warp
+        blocks = Int32(self.hidden_size // 512)
+        if unit < tokens * blocks:
+            token = unit // blocks
+            blk = unit - token * blocks
+            col0 = blk * Int32(512) + lane * Int32(4)
+            x00 = cutlass.Float16(source[token, col0]).to(Float32)
+            x01 = cutlass.Float16(source[token, col0 + Int32(1)]).to(Float32)
+            x02 = cutlass.Float16(source[token, col0 + Int32(2)]).to(Float32)
+            x03 = cutlass.Float16(source[token, col0 + Int32(3)]).to(Float32)
+            x10 = cutlass.Float16(source[token, col0 + Int32(128)]).to(Float32)
+            x11 = cutlass.Float16(source[token, col0 + Int32(129)]).to(Float32)
+            x12 = cutlass.Float16(source[token, col0 + Int32(130)]).to(Float32)
+            x13 = cutlass.Float16(source[token, col0 + Int32(131)]).to(Float32)
+            x20 = cutlass.Float16(source[token, col0 + Int32(256)]).to(Float32)
+            x21 = cutlass.Float16(source[token, col0 + Int32(257)]).to(Float32)
+            x22 = cutlass.Float16(source[token, col0 + Int32(258)]).to(Float32)
+            x23 = cutlass.Float16(source[token, col0 + Int32(259)]).to(Float32)
+            x30 = cutlass.Float16(source[token, col0 + Int32(384)]).to(Float32)
+            x31 = cutlass.Float16(source[token, col0 + Int32(385)]).to(Float32)
+            x32 = cutlass.Float16(source[token, col0 + Int32(386)]).to(Float32)
+            x33 = cutlass.Float16(source[token, col0 + Int32(387)]).to(Float32)
+            h00, h01, h02, h03 = self._had128_quad(x00, x01, x02, x03, lane)
+            h10, h11, h12, h13 = self._had128_quad(x10, x11, x12, x13, lane)
+            h20, h21, h22, h23 = self._had128_quad(x20, x21, x22, x23, lane)
+            h30, h31, h32, h33 = self._had128_quad(x30, x31, x32, x33, lane)
+            c00, c10, c20, c30 = self._had4_normalized(h00, h10, h20, h30)
+            c01, c11, c21, c31 = self._had4_normalized(h01, h11, h21, h31)
+            c02, c12, c22, c32 = self._had4_normalized(h02, h12, h22, h32)
+            c03, c13, c23, c33 = self._had4_normalized(h03, h13, h23, h33)
+            for group in cutlass.range_constexpr(4):
+                col = col0 + Int32(group * 128)
+                if cutlass.const_expr(group == 0):
+                    c0, c1, c2, c3 = c00, c01, c02, c03
+                elif cutlass.const_expr(group == 1):
+                    c0, c1, c2, c3 = c10, c11, c12, c13
+                elif cutlass.const_expr(group == 2):
+                    c0, c1, c2, c3 = c20, c21, c22, c23
+                else:
+                    c0, c1, c2, c3 = c30, c31, c32, c33
+                c0 *= suh[Int32(0), col].to(Float32)
+                c1 *= suh[Int32(0), col + Int32(1)].to(Float32)
+                c2 *= suh[Int32(0), col + Int32(2)].to(Float32)
+                c3 *= suh[Int32(0), col + Int32(3)].to(Float32)
+                o0, o1, o2, o3 = self._had128_quad(c0, c1, c2, c3, lane)
+                payload, scale_byte = self._pack_native_mxfp8(
+                    o0, o1, o2, o3, lane
+                )
+                subgroup = lane >> Int32(3)
+                lane8 = lane & Int32(7)
+                scale_group = blk * Int32(16) + Int32(group * 4) + subgroup
+                values[token, scale_group * Int32(8) + lane8] = payload
+                if lane8 == Int32(0):
+                    self._store_native_scale(
+                        scale_rows,
+                        scale_mma,
+                        token,
+                        scale_group,
+                        scale_byte,
+                        self.groups_k,
+                    )
+
+
 class TrellisW4A8ActivationRotationKernel(_Hadamard128):
     """Undo FC1 output rotations, apply SiTU, then apply down SUH/H128."""
 
     threads = _THREADS
 
-    def __init__(self, *, fast_math: bool = False) -> None:
+    def __init__(
+        self, *, intermediate_size: int, fast_math: bool = False
+    ) -> None:
+        self.intermediate_size = int(intermediate_size)
+        if self.intermediate_size <= 0 or self.intermediate_size % 128:
+            raise ValueError("W4A8 activation width must be divisible by 128")
         self.fast_math = bool(fast_math)
 
     @cute.jit
@@ -572,23 +730,34 @@ class TrellisW4A8ActivationRotationKernel(_Hadamard128):
         stream: cuda.CUstream,
     ) -> None:
         gate = cute.make_tensor(
-            gate_ptr, cute.make_ordered_layout((routes, 256), order=(1, 0))
+            gate_ptr,
+            cute.make_ordered_layout(
+                (routes, self.intermediate_size), order=(1, 0)
+            ),
         )
         up = cute.make_tensor(
-            up_ptr, cute.make_ordered_layout((routes, 256), order=(1, 0))
+            up_ptr,
+            cute.make_ordered_layout(
+                (routes, self.intermediate_size), order=(1, 0)
+            ),
         )
         rotations = cute.make_tensor(
             rotations_ptr,
-            cute.make_ordered_layout((num_experts, 3 * 256), order=(1, 0)),
+            cute.make_ordered_layout(
+                (num_experts, 3 * self.intermediate_size), order=(1, 0)
+            ),
         )
         route_experts = cute.make_tensor(
             route_experts_ptr, cute.make_layout((routes,))
         )
         output = cute.make_tensor(
-            output_ptr, cute.make_ordered_layout((routes, 256), order=(1, 0))
+            output_ptr,
+            cute.make_ordered_layout(
+                (routes, self.intermediate_size), order=(1, 0)
+            ),
         )
         warps = self.threads // 32
-        units = routes * Int32(2)
+        units = routes * Int32(self.intermediate_size // 128)
         self.kernel(
             gate, up, rotations, route_experts, output, routes, num_experts
         ).launch(
@@ -614,10 +783,11 @@ class TrellisW4A8ActivationRotationKernel(_Hadamard128):
         lane = tid & Int32(31)
         warp = tid >> Int32(5)
         unit = Int32(bidx) * Int32(self.threads // 32) + warp
-        total = routes * Int32(2)
+        blocks = Int32(self.intermediate_size // 128)
+        total = routes * blocks
         if unit < total:
-            route = unit >> Int32(1)
-            blk = unit & Int32(1)
+            route = unit // blocks
+            blk = unit - route * blocks
             expert = route_experts[route].to(Int32)
             valid = Int32(0)
             if expert >= Int32(0) and expert < num_experts:
@@ -640,14 +810,15 @@ class TrellisW4A8ActivationRotationKernel(_Hadamard128):
             ig1 = gh1 * rotations[scale_expert, col + Int32(1)].to(Float32)
             ig2 = gh2 * rotations[scale_expert, col + Int32(2)].to(Float32)
             ig3 = gh3 * rotations[scale_expert, col + Int32(3)].to(Float32)
-            iu0 = uh0 * rotations[scale_expert, 256 + col].to(Float32)
-            iu1 = uh1 * rotations[scale_expert, 256 + col + Int32(1)].to(Float32)
-            iu2 = uh2 * rotations[scale_expert, 256 + col + Int32(2)].to(Float32)
-            iu3 = uh3 * rotations[scale_expert, 256 + col + Int32(3)].to(Float32)
-            sd0 = rotations[scale_expert, 512 + col].to(Float32)
-            sd1 = rotations[scale_expert, 512 + col + Int32(1)].to(Float32)
-            sd2 = rotations[scale_expert, 512 + col + Int32(2)].to(Float32)
-            sd3 = rotations[scale_expert, 512 + col + Int32(3)].to(Float32)
+            isz = Int32(self.intermediate_size)
+            iu0 = uh0 * rotations[scale_expert, isz + col].to(Float32)
+            iu1 = uh1 * rotations[scale_expert, isz + col + Int32(1)].to(Float32)
+            iu2 = uh2 * rotations[scale_expert, isz + col + Int32(2)].to(Float32)
+            iu3 = uh3 * rotations[scale_expert, isz + col + Int32(3)].to(Float32)
+            sd0 = rotations[scale_expert, Int32(2) * isz + col].to(Float32)
+            sd1 = rotations[scale_expert, Int32(2) * isz + col + Int32(1)].to(Float32)
+            sd2 = rotations[scale_expert, Int32(2) * isz + col + Int32(2)].to(Float32)
+            sd3 = rotations[scale_expert, Int32(2) * isz + col + Int32(3)].to(Float32)
             beta = Float32(SITU_DEFAULT_BETA)
             linear_beta = Float32(SITU_DEFAULT_LINEAR_BETA)
             a0 = (
@@ -699,8 +870,6 @@ class TrellisW4A8ActivationRotationQuantKernel(
 ):
     """Fuse inverse FC1 rotation, SiTU, down rotation, and MXFP8 quantization."""
 
-    groups_k = 8
-
     @cute.jit
     def __call__(
         self,
@@ -716,31 +885,51 @@ class TrellisW4A8ActivationRotationQuantKernel(
         stream: cuda.CUstream,
     ) -> None:
         gate = cute.make_tensor(
-            gate_ptr, cute.make_ordered_layout((routes, 256), order=(1, 0))
+            gate_ptr,
+            cute.make_ordered_layout(
+                (routes, self.intermediate_size), order=(1, 0)
+            ),
         )
         up = cute.make_tensor(
-            up_ptr, cute.make_ordered_layout((routes, 256), order=(1, 0))
+            up_ptr,
+            cute.make_ordered_layout(
+                (routes, self.intermediate_size), order=(1, 0)
+            ),
         )
         rotations = cute.make_tensor(
             rotations_ptr,
-            cute.make_ordered_layout((num_experts, 3 * 256), order=(1, 0)),
+            cute.make_ordered_layout(
+                (num_experts, 3 * self.intermediate_size), order=(1, 0)
+            ),
         )
         route_experts = cute.make_tensor(
             route_experts_ptr, cute.make_layout((routes,))
         )
         values = cute.make_tensor(
-            values_ptr, cute.make_ordered_layout((routes, 256 // 4), order=(1, 0))
+            values_ptr,
+            cute.make_ordered_layout(
+                (routes, self.intermediate_size // 4), order=(1, 0)
+            ),
         )
         scale_rows = cute.make_tensor(
             scale_rows_ptr,
-            cute.make_ordered_layout((routes, self.groups_k), order=(1, 0)),
+            cute.make_ordered_layout(
+                (routes, self.intermediate_size // 32), order=(1, 0)
+            ),
         )
         scale_mma = cute.make_tensor(
             scale_mma_ptr,
-            cute.make_layout((max(512, ((self.groups_k + 3) // 4) * 512),)),
+            cute.make_layout(
+                (
+                    max(
+                        512,
+                        ((self.intermediate_size // 32 + 3) // 4) * 512,
+                    ),
+                )
+            ),
         )
         warps = self.threads // 32
-        units = routes * Int32(2)
+        units = routes * Int32(self.intermediate_size // 128)
         self.kernel_quantized(
             gate,
             up,
@@ -776,10 +965,11 @@ class TrellisW4A8ActivationRotationQuantKernel(
         lane = tid & Int32(31)
         warp = tid >> Int32(5)
         unit = Int32(bidx) * Int32(self.threads // 32) + warp
-        total = routes * Int32(2)
+        blocks = Int32(self.intermediate_size // 128)
+        total = routes * blocks
         if unit < total:
-            route = unit >> Int32(1)
-            blk = unit & Int32(1)
+            route = unit // blocks
+            blk = unit - route * blocks
             expert = route_experts[route].to(Int32)
             valid = Int32(0)
             if expert >= Int32(0) and expert < num_experts:
@@ -802,14 +992,15 @@ class TrellisW4A8ActivationRotationQuantKernel(
             ig1 = gh1 * rotations[scale_expert, col + Int32(1)].to(Float32)
             ig2 = gh2 * rotations[scale_expert, col + Int32(2)].to(Float32)
             ig3 = gh3 * rotations[scale_expert, col + Int32(3)].to(Float32)
-            iu0 = uh0 * rotations[scale_expert, 256 + col].to(Float32)
-            iu1 = uh1 * rotations[scale_expert, 256 + col + Int32(1)].to(Float32)
-            iu2 = uh2 * rotations[scale_expert, 256 + col + Int32(2)].to(Float32)
-            iu3 = uh3 * rotations[scale_expert, 256 + col + Int32(3)].to(Float32)
-            sd0 = rotations[scale_expert, 512 + col].to(Float32)
-            sd1 = rotations[scale_expert, 512 + col + Int32(1)].to(Float32)
-            sd2 = rotations[scale_expert, 512 + col + Int32(2)].to(Float32)
-            sd3 = rotations[scale_expert, 512 + col + Int32(3)].to(Float32)
+            isz = Int32(self.intermediate_size)
+            iu0 = uh0 * rotations[scale_expert, isz + col].to(Float32)
+            iu1 = uh1 * rotations[scale_expert, isz + col + Int32(1)].to(Float32)
+            iu2 = uh2 * rotations[scale_expert, isz + col + Int32(2)].to(Float32)
+            iu3 = uh3 * rotations[scale_expert, isz + col + Int32(3)].to(Float32)
+            sd0 = rotations[scale_expert, Int32(2) * isz + col].to(Float32)
+            sd1 = rotations[scale_expert, Int32(2) * isz + col + Int32(1)].to(Float32)
+            sd2 = rotations[scale_expert, Int32(2) * isz + col + Int32(2)].to(Float32)
+            sd3 = rotations[scale_expert, Int32(2) * isz + col + Int32(3)].to(Float32)
             beta = Float32(SITU_DEFAULT_BETA)
             linear_beta = Float32(SITU_DEFAULT_LINEAR_BETA)
             a0 = (
@@ -864,7 +1055,238 @@ class TrellisW4A8ActivationRotationQuantKernel(
                     route,
                     group,
                     scale_byte,
-                    self.groups_k,
+                    self.intermediate_size // 32,
+                )
+
+
+class TrellisW4A8CoupledActivationQuantKernel(
+    TrellisW4A8ActivationRotationKernel, _NativeMXFP8
+):
+    """Recover interleaved gate/up neurons and quantize the FC2 operand."""
+
+    threads = _COUPLED_ACTIVATION_THREADS
+
+    @cute.jit
+    def __call__(
+        self,
+        slot0_ptr: cute.Pointer,
+        slot1_ptr: cute.Pointer,
+        rotations_ptr: cute.Pointer,
+        route_experts_ptr: cute.Pointer,
+        values_ptr: cute.Pointer,
+        scale_rows_ptr: cute.Pointer,
+        scale_mma_ptr: cute.Pointer,
+        routes: Int32,
+        num_experts: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        slot0 = cute.make_tensor(
+            slot0_ptr,
+            cute.make_ordered_layout(
+                (routes, self.intermediate_size), order=(1, 0)
+            ),
+        )
+        slot1 = cute.make_tensor(
+            slot1_ptr,
+            cute.make_ordered_layout(
+                (routes, self.intermediate_size), order=(1, 0)
+            ),
+        )
+        rotations = cute.make_tensor(
+            rotations_ptr,
+            cute.make_ordered_layout(
+                (num_experts, 6 * self.intermediate_size), order=(1, 0)
+            ),
+        )
+        route_experts = cute.make_tensor(
+            route_experts_ptr, cute.make_layout((routes,))
+        )
+        values = cute.make_tensor(
+            values_ptr,
+            cute.make_ordered_layout(
+                (routes, self.intermediate_size // 4), order=(1, 0)
+            ),
+        )
+        groups_k = self.intermediate_size // 32
+        scale_rows = cute.make_tensor(
+            scale_rows_ptr,
+            cute.make_ordered_layout((routes, groups_k), order=(1, 0)),
+        )
+        scale_mma = cute.make_tensor(
+            scale_mma_ptr,
+            cute.make_layout((max(512, ((groups_k + 3) // 4) * 512),)),
+        )
+        warps = self.threads // 32
+        units = routes * Int32(self.intermediate_size // 128)
+        self.kernel_coupled(
+            slot0,
+            slot1,
+            rotations,
+            route_experts,
+            values,
+            scale_rows,
+            scale_mma,
+            routes,
+            num_experts,
+        ).launch(
+            grid=(cute.ceil_div(units, warps), 1, 1),
+            block=[self.threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.jit
+    def _load_pre_quad(
+        self,
+        slot0: cute.Tensor,
+        slot1: cute.Tensor,
+        rotations: cute.Tensor,
+        route: Int32,
+        expert: Int32,
+        pre_block: Int32,
+        lane: Int32,
+    ):
+        chunk = lane >> Int32(3)
+        chunk_lane = lane & Int32(7)
+        atom = pre_block * Int32(2) + (chunk >> Int32(1))
+        slot = chunk & Int32(1)
+        coord = atom * Int32(32) + chunk_lane * Int32(4)
+        v0 = slot0[route, coord].to(Float32)
+        v1 = slot0[route, coord + Int32(1)].to(Float32)
+        v2 = slot0[route, coord + Int32(2)].to(Float32)
+        v3 = slot0[route, coord + Int32(3)].to(Float32)
+        if slot != Int32(0):
+            v0 = slot1[route, coord].to(Float32)
+            v1 = slot1[route, coord + Int32(1)].to(Float32)
+            v2 = slot1[route, coord + Int32(2)].to(Float32)
+            v3 = slot1[route, coord + Int32(3)].to(Float32)
+        h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
+        isz = Int32(self.intermediate_size)
+        scale_base = slot * isz + coord
+        h0 *= rotations[expert, scale_base].to(Float32)
+        h1 *= rotations[expert, scale_base + Int32(1)].to(Float32)
+        h2 *= rotations[expert, scale_base + Int32(2)].to(Float32)
+        h3 *= rotations[expert, scale_base + Int32(3)].to(Float32)
+        h0, h1, h2, h3 = self._had128_quad(h0, h1, h2, h3, lane)
+        sign_base = Int32(3) * isz + pre_block * Int32(128) + lane * Int32(4)
+        h0 *= rotations[expert, sign_base].to(Float32)
+        h1 *= rotations[expert, sign_base + Int32(1)].to(Float32)
+        h2 *= rotations[expert, sign_base + Int32(2)].to(Float32)
+        h3 *= rotations[expert, sign_base + Int32(3)].to(Float32)
+        return h0, h1, h2, h3
+
+    @cute.kernel
+    def kernel_coupled(
+        self,
+        slot0: cute.Tensor,
+        slot1: cute.Tensor,
+        rotations: cute.Tensor,
+        route_experts: cute.Tensor,
+        values: cute.Tensor,
+        scale_rows: cute.Tensor,
+        scale_mma: cute.Tensor,
+        routes: Int32,
+        num_experts: Int32,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        tid = Int32(tidx)
+        lane = tid & Int32(31)
+        warp = tid >> Int32(5)
+        unit = Int32(bidx) * Int32(self.threads // 32) + warp
+        blocks = Int32(self.intermediate_size // 128)
+        if unit < routes * blocks:
+            route = unit // blocks
+            post_block = unit - route * blocks
+            raw_expert = route_experts[route].to(Int32)
+            valid = Int32(0)
+            expert = Int32(0)
+            if raw_expert >= Int32(0) and raw_expert < num_experts:
+                valid = Int32(1)
+                expert = raw_expert
+            p0 = post_block * Int32(2)
+            a0, a1, a2, a3 = self._load_pre_quad(
+                slot0, slot1, rotations, route, expert, p0, lane
+            )
+            b0, b1, b2, b3 = self._load_pre_quad(
+                slot0, slot1, rotations, route, expert, p0 + Int32(1), lane
+            )
+            beta = Float32(SITU_DEFAULT_BETA)
+            linear_beta = Float32(SITU_DEFAULT_LINEAR_BETA)
+            aa0 = (
+                beta
+                * cute.math.tanh(a0 / beta, fastmath=self.fast_math)
+                * self._sigmoid(a0)
+                * linear_beta
+                * cute.math.tanh(a1 / linear_beta, fastmath=self.fast_math)
+            )
+            aa1 = (
+                beta
+                * cute.math.tanh(a2 / beta, fastmath=self.fast_math)
+                * self._sigmoid(a2)
+                * linear_beta
+                * cute.math.tanh(a3 / linear_beta, fastmath=self.fast_math)
+            )
+            bb0 = (
+                beta
+                * cute.math.tanh(b0 / beta, fastmath=self.fast_math)
+                * self._sigmoid(b0)
+                * linear_beta
+                * cute.math.tanh(b1 / linear_beta, fastmath=self.fast_math)
+            )
+            bb1 = (
+                beta
+                * cute.math.tanh(b2 / beta, fastmath=self.fast_math)
+                * self._sigmoid(b2)
+                * linear_beta
+                * cute.math.tanh(b3 / linear_beta, fastmath=self.fast_math)
+            )
+            source0 = (lane & Int32(15)) << Int32(1)
+            source1 = source0 + Int32(1)
+            av0 = cute.arch.shuffle_sync(aa0, source0)
+            av1 = cute.arch.shuffle_sync(aa1, source0)
+            av2 = cute.arch.shuffle_sync(aa0, source1)
+            av3 = cute.arch.shuffle_sync(aa1, source1)
+            bv0 = cute.arch.shuffle_sync(bb0, source0)
+            bv1 = cute.arch.shuffle_sync(bb1, source0)
+            bv2 = cute.arch.shuffle_sync(bb0, source1)
+            bv3 = cute.arch.shuffle_sync(bb1, source1)
+            v0, v1, v2, v3 = av0, av1, av2, av3
+            if lane >= Int32(16):
+                v0, v1, v2, v3 = bv0, bv1, bv2, bv3
+            col = post_block * Int32(128) + lane * Int32(4)
+            isz = Int32(self.intermediate_size)
+            sign_base = Int32(5) * isz + col
+            v0 *= rotations[expert, sign_base].to(Float32)
+            v1 *= rotations[expert, sign_base + Int32(1)].to(Float32)
+            v2 *= rotations[expert, sign_base + Int32(2)].to(Float32)
+            v3 *= rotations[expert, sign_base + Int32(3)].to(Float32)
+            v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
+            down_base = Int32(2) * isz + col
+            v0 *= rotations[expert, down_base].to(Float32)
+            v1 *= rotations[expert, down_base + Int32(1)].to(Float32)
+            v2 *= rotations[expert, down_base + Int32(2)].to(Float32)
+            v3 *= rotations[expert, down_base + Int32(3)].to(Float32)
+            v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
+            if valid == Int32(0):
+                v0 = Float32(0.0)
+                v1 = Float32(0.0)
+                v2 = Float32(0.0)
+                v3 = Float32(0.0)
+            payload, scale_byte = self._pack_native_mxfp8(
+                v0, v1, v2, v3, lane
+            )
+            subgroup = lane >> Int32(3)
+            lane8 = lane & Int32(7)
+            group = post_block * Int32(4) + subgroup
+            values[route, group * Int32(8) + lane8] = payload
+            if lane8 == Int32(0):
+                self._store_native_scale(
+                    scale_rows,
+                    scale_mma,
+                    route,
+                    group,
+                    scale_byte,
+                    self.intermediate_size // 32,
                 )
 
 
@@ -967,9 +1389,45 @@ def _compile_input_rotation_quant(
 
 
 @functools.cache
-def _compile_activation_rotation(fast_math: bool, device_index: int):
-    launch = TrellisW4A8ActivationRotationKernel(fast_math=fast_math)
-    key = (bool(fast_math), int(device_index))
+def _compile_coupled_input_quant(
+    hidden_size: int,
+    source_dtype: torch.dtype,
+    device_index: int,
+):
+    if source_dtype == torch.bfloat16:
+        source_type = cutlass.BFloat16
+    elif source_dtype == torch.float16:
+        source_type = cutlass.Float16
+    else:
+        raise TypeError(f"trellis W4A8 input must be bf16/fp16, got {source_dtype}")
+    launch = TrellisW4A8CoupledInputQuantKernel(
+        hidden_size=hidden_size, source_type=source_type
+    )
+    key = (int(hidden_size), str(source_dtype), int(device_index))
+    raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
+    return b12x_compile(
+        launch,
+        _ptr(source_type, 16),
+        _ptr(cutlass.Float16, 16),
+        _ptr(cutlass.Uint32, 16),
+        _ptr(cutlass.Uint8, 16),
+        _ptr(cutlass.Uint8, 16),
+        1,
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "moe.trellis_w4a8_coupled_input_quant", 1, key
+        ),
+    )
+
+
+@functools.cache
+def _compile_activation_rotation(
+    intermediate_size: int, fast_math: bool, device_index: int
+):
+    launch = TrellisW4A8ActivationRotationKernel(
+        intermediate_size=intermediate_size, fast_math=fast_math
+    )
+    key = (int(intermediate_size), bool(fast_math), int(device_index))
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     return b12x_compile(
         launch,
@@ -988,9 +1446,13 @@ def _compile_activation_rotation(fast_math: bool, device_index: int):
 
 
 @functools.cache
-def _compile_activation_rotation_quant(fast_math: bool, device_index: int):
-    launch = TrellisW4A8ActivationRotationQuantKernel(fast_math=fast_math)
-    key = (bool(fast_math), int(device_index))
+def _compile_activation_rotation_quant(
+    intermediate_size: int, fast_math: bool, device_index: int
+):
+    launch = TrellisW4A8ActivationRotationQuantKernel(
+        intermediate_size=intermediate_size, fast_math=fast_math
+    )
+    key = (int(intermediate_size), bool(fast_math), int(device_index))
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     return b12x_compile(
         launch,
@@ -1006,6 +1468,33 @@ def _compile_activation_rotation_quant(fast_math: bool, device_index: int):
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.trellis_w4a8_activation_rotation_quant", 1, key
+        ),
+    )
+
+
+@functools.cache
+def _compile_coupled_activation_quant(
+    intermediate_size: int, fast_math: bool, device_index: int
+):
+    launch = TrellisW4A8CoupledActivationQuantKernel(
+        intermediate_size=intermediate_size, fast_math=fast_math
+    )
+    key = (int(intermediate_size), bool(fast_math), int(device_index))
+    raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
+    return b12x_compile(
+        launch,
+        _ptr(cutlass.Float16, 16),
+        _ptr(cutlass.Float16, 16),
+        _ptr(cutlass.Float16, 16),
+        _ptr(cutlass.Int32, 16),
+        _ptr(cutlass.Uint32, 16),
+        _ptr(cutlass.Uint8, 16),
+        _ptr(cutlass.Uint8, 16),
+        1,
+        1,
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "moe.trellis_w4a8_coupled_activation_quant", 1, key
         ),
     )
 
@@ -1083,6 +1572,34 @@ def run_trellis_w4a8_input_rotation_quant(
     )
 
 
+def run_trellis_w4a8_coupled_input_quant(
+    source: torch.Tensor,
+    prepared,
+    output,
+) -> None:
+    """Quantize the shared coupled input once for both FC1 projections."""
+
+    if int(prepared.gate_suh.shape[0]) != 1:
+        raise ValueError("coupled W4A8 requires a broadcast input scale")
+    if prepared.gate_suh.data_ptr() != prepared.up_suh.data_ptr():
+        raise ValueError("coupled W4A8 gate/up must share one input scale tensor")
+    compiled = _compile_coupled_input_quant(
+        int(prepared.hidden_size), source.dtype, _device_index(source.device)
+    )
+    source_type = (
+        cutlass.BFloat16 if source.dtype == torch.bfloat16 else cutlass.Float16
+    )
+    compiled(
+        _ptr(source_type, source.data_ptr()),
+        _ptr(cutlass.Float16, prepared.gate_suh.data_ptr()),
+        _ptr(cutlass.Uint32, output.values.data_ptr()),
+        _ptr(cutlass.Uint8, output.scale_rows.data_ptr()),
+        _ptr(cutlass.Uint8, output.scale_mma.data_ptr()),
+        int(source.shape[0]),
+        current_cuda_stream(),
+    )
+
+
 def run_trellis_w4a8_activation_rotation(
     gate: torch.Tensor,
     up: torch.Tensor,
@@ -1093,7 +1610,9 @@ def run_trellis_w4a8_activation_rotation(
     fast_math: bool = False,
 ) -> None:
     compiled = _compile_activation_rotation(
-        bool(fast_math), _device_index(gate.device)
+        int(gate.shape[1]),
+        bool(fast_math),
+        _device_index(gate.device),
     )
     compiled(
         _ptr(cutlass.Float16, gate.data_ptr()),
@@ -1119,7 +1638,9 @@ def run_trellis_w4a8_activation_rotation_quant(
     """Apply SiTU/rotation directly into native-order MXFP8 rows."""
 
     compiled = _compile_activation_rotation_quant(
-        bool(fast_math), _device_index(gate.device)
+        int(prepared.intermediate_size),
+        bool(fast_math),
+        _device_index(gate.device),
     )
     compiled(
         _ptr(cutlass.Float16, gate.data_ptr()),
@@ -1135,9 +1656,41 @@ def run_trellis_w4a8_activation_rotation_quant(
     )
 
 
+def run_trellis_w4a8_coupled_activation_quant(
+    slot0: torch.Tensor,
+    slot1: torch.Tensor,
+    route_experts: torch.Tensor,
+    prepared,
+    output,
+    *,
+    fast_math: bool = False,
+) -> None:
+    """Apply the coupled activation boundary into native MXFP8 rows."""
+
+    compiled = _compile_coupled_activation_quant(
+        int(prepared.intermediate_size),
+        bool(fast_math),
+        _device_index(slot0.device),
+    )
+    compiled(
+        _ptr(cutlass.Float16, slot0.data_ptr()),
+        _ptr(cutlass.Float16, slot1.data_ptr()),
+        _ptr(cutlass.Float16, prepared.intermediate_rotations.data_ptr()),
+        _ptr(cutlass.Int32, route_experts.data_ptr()),
+        _ptr(cutlass.Uint32, output.values.data_ptr()),
+        _ptr(cutlass.Uint8, output.scale_rows.data_ptr()),
+        _ptr(cutlass.Uint8, output.scale_mma.data_ptr()),
+        int(route_experts.numel()),
+        int(prepared.num_experts),
+        current_cuda_stream(),
+    )
+
+
 __all__ = [
     "run_trellis_w4a8_activation_rotation",
     "run_trellis_w4a8_activation_rotation_quant",
+    "run_trellis_w4a8_coupled_activation_quant",
+    "run_trellis_w4a8_coupled_input_quant",
     "run_trellis_w4a8_input_rotation",
     "run_trellis_w4a8_input_rotation_quant",
 ]

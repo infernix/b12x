@@ -6381,6 +6381,162 @@ def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
 
 
 @dsl_user_op
+def packed_decode_sqg_fp16_d3l_to_half2x4(
+    win_a,
+    win_b,
+    descriptor_addr,
+    bits: int,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Decode eight K5/K6 SQG windows through the frozen FP16-D3L law.
+
+    The carry-mixed graph produces a global 16-bit rank.  Its sign-symmetric
+    magnitude is mapped to one of 104 dyadic segments, followed by one native
+    FP16 FMA using the interleaved ``(base, slope)`` descriptor pair.
+    """
+
+    bits = int(bits)
+    if bits not in (5, 6):
+        raise ValueError(f"SQG FP16-D3L supports only K5/K6, got K{bits}")
+    width = 16 - bits
+    history_mask = (1 << width) - 1
+    decode_blocks: list[str] = []
+    for pair in range(4):
+        extract_lines: list[str] = []
+        graph_lines: list[str] = []
+        coordinate_lines: list[str] = []
+        decode_lines: list[str] = []
+        for slot, index in enumerate((2 * pair, 2 * pair + 1)):
+            if bits == 6:
+                stream_shift = (7 - index) * bits
+                if stream_shift < 32:
+                    extract_lines.append(
+                        f"shf.r.wrap.b32 w{slot}, $4, $5, {stream_shift}; "
+                        f"and.b32 w{slot}, w{slot}, 0xffff;"
+                    )
+                else:
+                    extract_lines.append(
+                        f"shr.u32 w{slot}, $5, {stream_shift - 32}; "
+                        f"and.b32 w{slot}, w{slot}, 0xffff;"
+                    )
+            else:
+                source = "$5" if index < 4 else "$4"
+                bit_shift = (3 - (index & 3)) * bits
+                extract_lines.append(
+                    f"bfe.u32 w{slot}, {source}, {bit_shift}, 16;"
+                )
+            graph_lines.append(
+                f"""
+                shr.u32 p{slot}, w{slot}, {bits};
+                mad.lo.u32 p{slot}, p{slot}, 0x3fa7d929, 0xc928fd8e;
+                brev.b32 t{slot}, w{slot};
+                xor.b32 t{slot}, t{slot}, p{slot};
+                shr.u32 t{slot}, t{slot}, {32 - bits};
+                and.b32 rank{slot}, p{slot}, {history_mask:#x};
+                shl.b32 t{slot}, t{slot}, {width};
+                or.b32 rank{slot}, rank{slot}, t{slot};
+                """
+            )
+            coordinate_lines.append(
+                f"""
+                and.b32 m{slot}, rank{slot}, 0x7fff;
+                xor.b32 t{slot}, m{slot}, 0x7fff;
+                setp.lt.u32 neg{slot}, rank{slot}, 0x8000;
+                selp.u32 m{slot}, t{slot}, m{slot}, neg{slot};
+                shl.b32 t{slot}, m{slot}, 1;
+                sub.u32 v{slot}, 65535, t{slot};
+                bfind.u32 e{slot}, v{slot};
+                shl.b32 pow{slot}, 1, e{slot};
+                sub.u32 delta{slot}, v{slot}, pow{slot};
+
+                sub.s32 shift{slot}, e{slot}, 3;
+                max.s32 shift{slot}, shift{slot}, 0;
+                shr.u32 sub{slot}, delta{slot}, shift{slot};
+                shl.b32 idxf{slot}, shift{slot}, 3;
+                add.u32 idxf{slot}, idxf{slot}, sub{slot};
+                shl.b32 max{slot}, sub{slot}, shift{slot};
+                add.u32 max{slot}, max{slot}, pow{slot};
+                shl.b32 t{slot}, 1, shift{slot};
+                add.u32 max{slot}, max{slot}, t{slot};
+                sub.u32 max{slot}, max{slot}, 1;
+                sub.u32 xf{slot}, max{slot}, v{slot};
+                shr.u32 xf{slot}, xf{slot}, 1;
+
+                sub.s32 em1{slot}, e{slot}, 1;
+                max.s32 em1{slot}, em1{slot}, 0;
+                shl.b32 idxe{slot}, 1, em1{slot};
+                sub.s32 t{slot}, delta{slot}, 1;
+                shr.s32 t{slot}, t{slot}, 1;
+                add.s32 idxe{slot}, idxe{slot}, t{slot};
+                setp.le.u32 exact{slot}, e{slot}, 3;
+                selp.u32 idx{slot}, idxe{slot}, idxf{slot}, exact{slot};
+                selp.u32 x{slot}, 0, xf{slot}, exact{slot};
+                """
+            )
+            decode_lines.append(
+                f"""
+                mul.wide.u32 addr{slot}, idx{slot}, 4;
+                add.u64 addr{slot}, addr{slot}, $6;
+                ld.global.nc.u32 d{slot}, [addr{slot}];
+                mov.b32 {{base{slot}, slope{slot}}}, d{slot};
+                cvt.rn.f16.u32 hx{slot}, x{slot};
+                fma.rn.f16 hval{slot}, slope{slot}, hx{slot}, base{slot};
+                xor.b32 sign{slot}, rank{slot}, 0x8000;
+                and.b32 sign{slot}, sign{slot}, 0x8000;
+                cvt.u16.u32 hsign{slot}, sign{slot};
+                xor.b16 hval{slot}, hval{slot}, hsign{slot};
+                """
+            )
+        decode_blocks.append(
+            "\n".join(
+                extract_lines
+                + graph_lines
+                + coordinate_lines
+                + decode_lines
+                + [f"mov.b32 ${pair}, {{hval0, hval1}};"]
+            )
+        )
+
+    asm = (
+        """
+        {
+            .reg .pred neg0,neg1,exact0,exact1;
+            .reg .b16 base0,base1,slope0,slope1,hx0,hx1;
+            .reg .b16 hval0,hval1,hsign0,hsign1;
+            .reg .b32 w0,w1,p0,p1,t0,t1,rank0,rank1;
+            .reg .b32 m0,m1,v0,v1,e0,e1,pow0,pow1,delta0,delta1;
+            .reg .b32 shift0,shift1,sub0,sub1,idxf0,idxf1,max0,max1;
+            .reg .b32 xf0,xf1,em10,em11,idxe0,idxe1,idx0,idx1,x0,x1;
+            .reg .b32 d0,d1,sign0,sign1;
+            .reg .b64 addr0,addr1;
+        """
+        + "\n".join(decode_blocks)
+        + "\n}"
+    )
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [
+            Uint32(win_a).ir_value(loc=loc, ip=ip),
+            Uint32(win_b).ir_value(loc=loc, ip=ip),
+            Int64(descriptor_addr).ir_value(loc=loc, ip=ip),
+        ],
+        asm,
+        "=r,=r,=r,=r,r,r,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Uint32(llvm.extractvalue(T.i32(), result, [index], loc=loc, ip=ip))
+        for index in range(4)
+    )
+
+
+@dsl_user_op
 def packed_decode_trellis_sqg_cheb_normal_e4m3_rank_lut_to_e4m3x8(
     win_a,
     win_b,
@@ -7220,6 +7376,28 @@ def _f16x2_to_bf16x2(p, *, loc=None, ip=None):
         ip=ip,
     )
     return Uint32(llvm.extractvalue(T.i32(), r, [0], loc=loc, ip=ip))
+
+
+@dsl_user_op
+def packed_decode_sqg_fp16_d3l_to_bfloat2x4(
+    win_a, win_b, descriptor_addr, bits: int, *, loc=None, ip=None
+):
+    """Decode K5/K6 FP16-D3L values and convert them to BF16 pairs."""
+
+    h0, h1, h2, h3 = packed_decode_sqg_fp16_d3l_to_half2x4(
+        win_a,
+        win_b,
+        descriptor_addr,
+        bits,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        _f16x2_to_bf16x2(h0, loc=loc, ip=ip),
+        _f16x2_to_bf16x2(h1, loc=loc, ip=ip),
+        _f16x2_to_bf16x2(h2, loc=loc, ip=ip),
+        _f16x2_to_bf16x2(h3, loc=loc, ip=ip),
+    )
 
 
 @dsl_user_op

@@ -25,6 +25,10 @@ from b12x.moe._shared.kernels.trellis_w4a8_pair import (
     run_trellis_w4a8_fc1_routes,
     run_trellis_w4a8_fc2_routes,
 )
+from b12x.moe._shared.kernels.trellis_w4a8_uniform import (
+    run_trellis_w4a8_uniform_fc1,
+    run_trellis_w4a8_uniform_fc2,
+)
 from b12x.moe._shared.kernels.trellis_w4a8 import (
     make_trellis_w4a8_moe_scratch,
     run_trellis_w4a8_moe,
@@ -236,6 +240,153 @@ def _reference_mxfp8_rows(source: torch.Tensor) -> torch.Tensor:
         .mul(scale)
         .reshape(m, k)
     )
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("bits", [2, 3, 4])
+def test_uniform_sqg_w4a8_matches_quantized_reference_and_captures(
+    bits: int,
+) -> None:
+    """Close native fixed-rate K2/K3/K4 FC1 and FC2 through MXFP8 MMA."""
+
+    torch.manual_seed(20260810 + bits)
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts = routes = 2
+    hidden = intermediate = 128
+    w13 = torch.randint(
+        -32768,
+        32767,
+        (2, experts, hidden // 16, intermediate // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    w2 = torch.randint(
+        -32768,
+        32767,
+        (experts, intermediate // 16, hidden // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    prepared = SimpleNamespace(
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_experts=experts,
+        trellis_bits=bits,
+        trellis_codebook="sqg_xor_cheb_t12",
+        w13=w13,
+        w2=w2,
+    )
+    route_experts = torch.arange(experts, dtype=torch.int32, device=device)
+
+    source = (torch.randn((routes, hidden), device=device) * 0.25).half()
+    source_q = empty_mxfp8_rows_for_dense_gemm(routes, hidden, device=device)
+    quantize_mxfp8_rows_cute(
+        source,
+        source_q.values,
+        source_q.scale_rows,
+        source_q.scale_mma,
+        value_order="trellis_native_mma",
+    )
+    gate = torch.empty((routes, intermediate), dtype=torch.float16, device=device)
+    up = torch.empty_like(gate)
+    run_trellis_w4a8_uniform_fc1(
+        source_q,
+        source_q,
+        prepared,
+        route_experts,
+        gate,
+        up,
+        topk=1,
+        shared_input=False,
+    )
+
+    source_reference = _reference_mxfp8_rows(source)
+    gate_weights = torch.stack(
+        [
+            _reconstruct_native(w13[0, expert], codebook="sqg_xor_cheb_t12")
+            for expert in range(experts)
+        ]
+    ).to(device)
+    up_weights = torch.stack(
+        [
+            _reconstruct_native(w13[1, expert], codebook="sqg_xor_cheb_t12")
+            for expert in range(experts)
+        ]
+    ).to(device)
+    expected_gate = torch.stack(
+        [
+            source_reference[expert] @ gate_weights[expert].float()
+            for expert in range(experts)
+        ]
+    ).half()
+    expected_up = torch.stack(
+        [
+            source_reference[expert] @ up_weights[expert].float()
+            for expert in range(experts)
+        ]
+    ).half()
+    torch.testing.assert_close(gate, expected_gate, rtol=2.0e-3, atol=2.0e-2)
+    torch.testing.assert_close(up, expected_up, rtol=2.0e-3, atol=2.0e-2)
+
+    activated = (torch.randn((routes, intermediate), device=device) * 0.25).half()
+    activated_q = empty_mxfp8_rows_for_dense_gemm(
+        routes, intermediate, device=device
+    )
+    quantize_mxfp8_rows_cute(
+        activated,
+        activated_q.values,
+        activated_q.scale_rows,
+        activated_q.scale_mma,
+        value_order="trellis_native_mma",
+    )
+    output = torch.empty((routes, hidden), dtype=torch.float16, device=device)
+    run_trellis_w4a8_uniform_fc2(
+        activated_q,
+        prepared,
+        route_experts,
+        output,
+    )
+    activated_reference = _reference_mxfp8_rows(activated)
+    down_weights = torch.stack(
+        [
+            _reconstruct_native(w2[expert], codebook="sqg_xor_cheb_t12")
+            for expert in range(experts)
+        ]
+    ).to(device)
+    expected_output = torch.stack(
+        [
+            activated_reference[expert] @ down_weights[expert].float()
+            for expert in range(experts)
+        ]
+    ).half()
+    torch.testing.assert_close(output, expected_output, rtol=2.0e-3, atol=2.0e-2)
+
+    gate_before = gate.clone()
+    up_before = up.clone()
+    output_before = output.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_trellis_w4a8_uniform_fc1(
+            source_q,
+            source_q,
+            prepared,
+            route_experts,
+            gate,
+            up,
+            topk=1,
+            shared_input=False,
+        )
+        run_trellis_w4a8_uniform_fc2(
+            activated_q,
+            prepared,
+            route_experts,
+            output,
+        )
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.equal(gate, gate_before)
+    assert torch.equal(up, up_before)
+    assert torch.equal(output, output_before)
 
 
 def test_prepare_weight_delegates_without_copy(monkeypatch) -> None:
@@ -545,8 +696,15 @@ def test_k6_small_m_cuda_graph_replay_is_stable() -> None:
     )
     x = torch.randn((m, features), dtype=torch.float16, device=device)
     output = torch.empty_like(x)
+    gemm_output = torch.empty_like(x)
     rotated_f16 = torch.empty_like(x)
-    kwargs = {"output": output, "rotated_f16": rotated_f16}
+    c_tmp = torch.empty((1 << 20,), dtype=torch.float32, device=device)
+    kwargs = {
+        "output": output,
+        "gemm_output": gemm_output,
+        "rotated_f16": rotated_f16,
+        "c_tmp": c_tmp,
+    }
 
     expected = trellis_linear.run(x, weight, **kwargs).clone()
     torch.cuda.synchronize(device)
@@ -625,71 +783,8 @@ def test_dense_bf16_reuses_all_scratch_during_cuda_graph_capture(bits: int) -> N
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("bits", [2, 3, 4])
-def test_dense_mul1_e4m3_matches_reference(bits: int) -> None:
-    torch.manual_seed(0xE4A3 + bits)
-    device = torch.device("cuda", torch.cuda.current_device())
-    m = 2
-    features = 128
-    trellis = torch.randint(
-        -32768,
-        32767,
-        (features // 16, features // 16, 16 * bits),
-        dtype=torch.int16,
-        device=device,
-    )
-    scale = torch.ones(features, dtype=torch.float16, device=device)
-    weight = trellis_linear.prepare_weight(
-        trellis,
-        scale,
-        scale.clone(),
-        mul1_e4m3=torch.tensor(
-            0x83DCD12D, dtype=torch.uint32, device=device
-        ),
-        params_dtype=torch.float16,
-    )
-    assert weight.trellis_codebook == "mul1-e4m3"
-    reference_weight = _reconstruct_native(
-        trellis, codebook="mul1-e4m3"
-    ).to(device)
-    x = (torch.randn((m, features), device=device) * 1.0e-3).to(torch.float16)
-
-    def identity_hadamard(
-        source: torch.Tensor,
-        destination: torch.Tensor,
-        _left_scale,
-        _right_scale,
-        _scale: float,
-    ) -> None:
-        destination.copy_(source)
-
-    output = torch.empty_like(x)
-    gemm_output = torch.empty_like(x)
-    rotated_f16 = torch.empty_like(x)
-    c_tmp = torch.empty((1 << 20,), dtype=torch.float32, device=device)
-    actual = trellis_linear.run(
-        x,
-        weight,
-        output=output,
-        gemm_output=gemm_output,
-        rotated_f16=rotated_f16,
-        c_tmp=c_tmp,
-        hadamard_128=identity_hadamard,
-    ).clone()
-    torch.cuda.synchronize(device)
-
-    expected = (x.float() @ reference_weight.float()).to(torch.float16)
-    relative_error = (actual - expected).float().norm() / expected.float().norm()
-    cosine = torch.nn.functional.cosine_similarity(
-        actual.float().flatten(), expected.float().flatten(), dim=0
-    )
-    assert float(relative_error) <= 2.0e-2
-    assert float(cosine) >= 0.999
-
-
-@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-@pytest.mark.parametrize("bits", [2, 3, 4])
-def test_dense_sqg_cheb_normal_e4m3_matches_reference(bits: int) -> None:
-    """Close the exact SQG labels through the real W4A16 GEMM fragment path."""
+def test_dense_sqg_xor_cheb_t12_matches_reference(bits: int) -> None:
+    """Close the runtime SQG labels through the W4A16 GEMM fragment path."""
 
     torch.manual_seed(0x535147 + bits)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -707,12 +802,12 @@ def test_dense_sqg_cheb_normal_e4m3_matches_reference(bits: int) -> None:
         trellis,
         scale,
         scale.clone(),
-        codebook="sqg-cheb-normal-e4m3",
+        codebook="sqg_xor_cheb_t12",
         params_dtype=torch.float16,
     )
-    assert weight.trellis_codebook == "sqg-cheb-normal-e4m3"
+    assert weight.trellis_codebook == "sqg_xor_cheb_t12"
     reference_weight = _reconstruct_native(
-        trellis, codebook="sqg-cheb-normal-e4m3"
+        trellis, codebook="sqg_xor_cheb_t12"
     ).to(device)
     x = (torch.randn((m, features), device=device) * 1.0e-3).to(torch.float16)
 
@@ -755,9 +850,9 @@ def test_dense_sqg_cheb_normal_e4m3_matches_reference(bits: int) -> None:
 @pytest.mark.parametrize(
     "orthogonal_tiles",
     [16, 224],
-    ids=["square-proof", "k3-tp12"],
+    ids=["square-proof", "wide-axis"],
 )
-@pytest.mark.parametrize("codebook", ["mcg", "sqg-cheb-normal-e4m3"])
+@pytest.mark.parametrize("codebook", ["mcg", "sqg_xor_cheb_t12"])
 def test_dense_pair_matches_independent_reference_and_captures(
     pair_kind: str,
     bits: tuple[int, int],
@@ -900,14 +995,13 @@ def test_dense_pair_matches_independent_reference_and_captures(
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize(("pair_kind", "bits"), [("P24", (2, 4)), ("P33", (3, 3))])
 @pytest.mark.parametrize("rate_axis", ["k", "n"])
-@pytest.mark.parametrize("codebook", ["mul1-e4m3", "sqg-cheb-normal-e4m3"])
 def test_dense_pair_e4m3_w4a8_matches_quantized_reference_and_captures(
     pair_kind: str,
     bits: tuple[int, int],
     rate_axis: str,
-    codebook: str,
 ) -> None:
     """Exercise compact P24/P33 addressing through the real E4M3 MMA path."""
+    codebook = "sqg_xor_cheb_t12"
     torch.manual_seed(0x4A8 + sum(bits) + (rate_axis == "n"))
     device = torch.device("cuda", torch.cuda.current_device())
     low_bits, high_bits = bits
@@ -959,15 +1053,6 @@ def test_dense_pair_e4m3_w4a8_matches_quantized_reference_and_captures(
 
     payload = torch.cat((low.reshape(-1), high.reshape(-1))).contiguous()
     size_k, size_n = reference_weight.shape
-    codebook_kwargs = (
-        {
-            "mul1_e4m3": torch.tensor(
-                0x83DCD12D, dtype=torch.uint32, device=device
-            )
-        }
-        if codebook == "mul1-e4m3"
-        else {"codebook": codebook}
-    )
     weight = trellis_linear.prepare_pair_weight(
         payload,
         torch.ones(size_k, dtype=torch.float16, device=device),
@@ -975,7 +1060,7 @@ def test_dense_pair_e4m3_w4a8_matches_quantized_reference_and_captures(
         pair_kind=pair_kind,
         rate_axis=rate_axis,
         params_dtype=torch.float16,
-        **codebook_kwargs,
+        codebook=codebook,
     )
     m = 16
     x = (torch.randn((m, size_k), device=device) * 0.125).to(torch.float16)

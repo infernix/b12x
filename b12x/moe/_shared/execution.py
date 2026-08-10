@@ -155,10 +155,13 @@ _SOURCE_FORMATS = {
     "mxfp6_e2m3",
     "exl3_trellis_mcg",
     "qsrt_sqg_e4m3",
+    "sqg_fp16_d3l",
 }
 _TRELLIS_SOURCE_FORMATS = frozenset(
-    {"exl3_trellis_mcg", "qsrt_sqg_e4m3"}
+    {"exl3_trellis_mcg", "qsrt_sqg_e4m3", "sqg_fp16_d3l"}
 )
+_QSRT_ATOMS_V2_PROFILE_H308 = "k3x22_k4x2"
+_QSRT_ATOMS_V2_PROFILE_COUPLED_K2 = "k2_coupled_h512_h128"
 _SOURCES_BY_QUANT_MODE = {
     "nvfp4": frozenset({"modelopt_nvfp4"}),
     "w4a8_nvfp4": frozenset({"modelopt_nvfp4"}),
@@ -172,6 +175,7 @@ _SOURCES_BY_QUANT_MODE = {
             "compressed_tensors",
             "exl3_trellis_mcg",
             "qsrt_sqg_e4m3",
+            "sqg_fp16_d3l",
         }
     ),
     "w6a8_mx": frozenset({"mxfp6_e2m3"}),
@@ -277,6 +281,8 @@ class MoEWeightPreparationPlan:
     trellis_bits: int | None = None
     trellis_tile_config: tuple[int, int, int, int] | None = None
     qsrt_storage_format: str | None = None
+    qsrt_profile: str | None = None
+    coupled_hadamard: bool = False
 
     def __post_init__(self) -> None:
         specs = tuple(self.specs)
@@ -304,11 +310,14 @@ class MoEWeightPreparationPlan:
         object.__setattr__(
             self, "storage_policy", WeightStoragePolicy(self.storage_policy)
         )
+        object.__setattr__(self, "coupled_hadamard", bool(self.coupled_hadamard))
         if self.source_format in _TRELLIS_SOURCE_FORMATS:
             bits = 3 if self.trellis_bits is None else int(self.trellis_bits)
             valid_bits = (
                 (2, 3, 4)
                 if self.source_format == "qsrt_sqg_e4m3"
+                else (5, 6)
+                if self.source_format == "sqg_fp16_d3l"
                 else (3, 4, 5, 6)
             )
             if bits not in valid_bits:
@@ -331,24 +340,70 @@ class MoEWeightPreparationPlan:
                 else str(self.qsrt_storage_format).lower()
             )
             if self.source_format == "qsrt_sqg_e4m3":
-                if storage_format != "qsrt_atoms_v1":
+                if storage_format not in {
+                    "qsrt_atoms_v1",
+                    "qsrt_atoms_v2",
+                }:
                     raise ValueError(
                         "QSRT MoE weights require "
-                        "qsrt_storage_format='qsrt_atoms_v1'"
+                        "qsrt_storage_format='qsrt_atoms_v1', "
+                        "or 'qsrt_atoms_v2'"
                     )
-                if bits != 3:
+                profile = self.qsrt_profile
+                if storage_format == "qsrt_atoms_v2":
+                    profile = profile or _QSRT_ATOMS_V2_PROFILE_H308
+                    if profile not in {
+                        _QSRT_ATOMS_V2_PROFILE_H308,
+                        _QSRT_ATOMS_V2_PROFILE_COUPLED_K2,
+                    }:
+                        raise ValueError(
+                            f"unsupported QSRT atoms-v2 profile {profile!r}"
+                        )
+                elif profile is not None:
                     raise ValueError(
-                        "QSRT atoms require trellis_bits=3 average rate"
+                        "qsrt_profile is valid only for qsrt_atoms_v2 storage"
                     )
-                if self.intermediate_size != 256:
-                    raise ValueError(
-                        "the current QSRT atom kernel requires "
-                        "intermediate_size=256"
-                    )
-                if tile_config[1] != 256:
-                    raise ValueError(
-                        "the current QSRT atom kernel requires FC1 tile_n=256"
-                    )
+                if profile == _QSRT_ATOMS_V2_PROFILE_COUPLED_K2:
+                    if bits != 2:
+                        raise ValueError(
+                            "the coupled pure-K2 profile requires trellis_bits=2"
+                        )
+                    if self.intermediate_size % 128:
+                        raise ValueError(
+                            "the coupled pure-K2 profile requires a local intermediate "
+                            "size divisible by 128"
+                        )
+                    if tile_config != (128, 128, 128, 128):
+                        raise ValueError(
+                            "the coupled pure-K2 profile requires tile_config="
+                            "(128, 128, 128, 128)"
+                        )
+                    if not self.coupled_hadamard:
+                        raise ValueError(
+                            "the coupled pure-K2 profile requires "
+                            "coupled_hadamard=True"
+                        )
+                else:
+                    if bits != 3:
+                        raise ValueError(
+                            "the fixed high-rate QSRT profile requires trellis_bits=3"
+                        )
+                    if self.intermediate_size != 256:
+                        raise ValueError(
+                            "the fixed high-rate QSRT pair kernel requires "
+                            "intermediate_size=256"
+                        )
+                    if tile_config[1] != 256:
+                        raise ValueError(
+                            "the fixed high-rate QSRT pair kernel requires "
+                            "FC1 tile_n=256"
+                        )
+                    if self.coupled_hadamard:
+                        raise ValueError(
+                            "the fixed high-rate QSRT profile does not store "
+                            "coupled-Hadamard metadata"
+                        )
+                object.__setattr__(self, "qsrt_profile", profile)
             elif storage_format is not None:
                 raise ValueError(
                     "qsrt_storage_format is valid only for qsrt_sqg_e4m3"
@@ -358,6 +413,8 @@ class MoEWeightPreparationPlan:
             self.trellis_bits is not None
             or self.trellis_tile_config is not None
             or self.qsrt_storage_format is not None
+            or self.qsrt_profile is not None
+            or self.coupled_hadamard
         ):
             raise ValueError(
                 "QSRT storage settings require a QSRT source format"
@@ -643,6 +700,8 @@ def plan_moe_weight_preparation(
     trellis_bits: int | None = None,
     trellis_tile_config: tuple[int, int, int, int] | None = None,
     qsrt_storage_format: str | None = None,
+    qsrt_profile: str | None = None,
+    coupled_hadamard: bool | None = None,
 ) -> MoEWeightPreparationPlan:
     """Choose the minimal representation set for the requested recipes.
 
@@ -835,6 +894,8 @@ def plan_moe_weight_preparation(
     else:
         storage_policy = WeightStoragePolicy.KEEP_SOURCE
 
+    if coupled_hadamard is None:
+        coupled_hadamard = qsrt_profile == _QSRT_ATOMS_V2_PROFILE_COUPLED_K2
     return MoEWeightPreparationPlan(
         specs=normalized_specs,
         num_experts=num_experts,
@@ -847,6 +908,8 @@ def plan_moe_weight_preparation(
         trellis_bits=trellis_bits,
         trellis_tile_config=trellis_tile_config,
         qsrt_storage_format=qsrt_storage_format,
+        qsrt_profile=qsrt_profile,
+        coupled_hadamard=coupled_hadamard,
     )
 
 
