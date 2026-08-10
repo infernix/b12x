@@ -110,6 +110,7 @@ def stage_absorbed_query(
     q_stride_row_bytes: Int64,
     q_stride_head_bytes: Int64,
     *,
+    num_heads: cutlass.Constexpr,
     query_tile: cutlass.Constexpr,
     record_bytes: cutlass.Constexpr,
     record_stride_bytes: cutlass.Constexpr,
@@ -128,9 +129,12 @@ def stage_absorbed_query(
         safe_row = query_row
         if query_row >= total_q:
             safe_row = Int32(0)
+        safe_head = head_base + local_head
+        if safe_head >= Int32(num_heads):
+            safe_head = head_base
         source_offset = (
             safe_row.to(Int64) * q_stride_row_bytes
-            + (head_base + local_head).to(Int64) * q_stride_head_bytes
+            + safe_head.to(Int64) * q_stride_head_bytes
             + byte_in_record.to(Int64)
         )
         destination = q_smem_addr + record * Int32(record_stride_bytes) + byte_in_record
@@ -713,6 +717,7 @@ def write_partial_or_final(
     value_scale: Float32,
     query_valid: Int32,
     *,
+    num_heads: cutlass.Constexpr,
     has_splits: cutlass.Constexpr,
     fp8: cutlass.Constexpr,
     ln2: cutlass.Constexpr,
@@ -738,7 +743,7 @@ def write_partial_or_final(
     if cutlass.const_expr(fp8):
         scale = scale * value_scale
 
-    if query_valid != Int32(0):
+    if query_valid != Int32(0) and head_base + gid < Int32(num_heads):
         for value_chunk in cutlass.range_constexpr(K3_VALUE_DIM // 64):
             for n_tile in cutlass.range_constexpr(2):
                 tile = value_chunk * 2 + n_tile

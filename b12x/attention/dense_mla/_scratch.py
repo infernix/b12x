@@ -79,8 +79,8 @@ class Caps:
         if int(self.v_head_dim) != K3_VALUE_DIM:
             raise ValueError(f"K3 dense MLA v_head_dim must be {K3_VALUE_DIM}")
         heads = int(self.num_q_heads)
-        if heads <= 0 or heads % 8:
-            raise ValueError("num_q_heads must be a positive multiple of 8")
+        if heads <= 0:
+            raise ValueError("num_q_heads must be positive")
         page_size = int(self.page_size)
         if page_size <= 0 or page_size % 16:
             raise ValueError("page_size must be a positive multiple of 16")

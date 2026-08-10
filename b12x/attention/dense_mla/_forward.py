@@ -64,7 +64,7 @@ class DenseMlaForwardKernel:
         self.layout = layout
         self.page_size = int(page_size)
         self.num_heads = int(num_heads)
-        self.head_tiles = self.num_heads // HEADS_PER_TILE
+        self.head_tiles = (self.num_heads + HEADS_PER_TILE - 1) // HEADS_PER_TILE
         self.num_splits = int(num_splits)
         self.chunks_per_split = int(chunks_per_split)
         self.query_tile = int(query_tile)
@@ -334,6 +334,7 @@ class DenseMlaForwardKernel:
                     lane,
                     value_scale,
                     query_valid,
+                    num_heads=self.num_heads,
                     has_splits=True,
                     fp8=self.fp8,
                     ln2=0.6931471805599453,
@@ -352,6 +353,7 @@ class DenseMlaForwardKernel:
                     lane,
                     value_scale,
                     query_valid,
+                    num_heads=self.num_heads,
                     has_splits=False,
                     fp8=self.fp8,
                     ln2=0.6931471805599453,
@@ -370,6 +372,7 @@ class DenseMlaForwardKernel:
                 lane,
                 value_scale,
                 query_valid,
+                num_heads=self.num_heads,
                 has_splits=False,
                 fp8=self.fp8,
                 ln2=0.6931471805599453,
@@ -441,7 +444,10 @@ class DenseMlaForwardKernel:
                 query_slot = entry // Int32(HEADS_PER_TILE)
                 local_head = entry - query_slot * Int32(HEADS_PER_TILE)
                 query_row = query_start + query_slot
-                if query_row < total_q:
+                if (
+                    query_row < total_q
+                    and head_base + local_head < Int32(self.num_heads)
+                ):
                     if cutlass.const_expr(self.num_splits > 1):
                         if active_splits > Int32(1):
                             partial_lse[
@@ -526,6 +532,7 @@ class DenseMlaForwardKernel:
                 tid,
                 q_stride_row_bytes,
                 q_stride_head_bytes,
+                num_heads=self.num_heads,
                 query_tile=self.query_tile,
                 record_bytes=self.layout.record_bytes,
                 record_stride_bytes=self.layout.record_stride_bytes,

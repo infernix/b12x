@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
 import torch
 
 from b12x.attention import dense_mla
@@ -119,8 +120,9 @@ def test_partial_row_budget_changes_native_split_policy() -> None:
     assert plan.chunks_per_split == 2
 
 
+@pytest.mark.parametrize("heads", [8, 12])
 @torch.inference_mode()
-def test_bf16_multi_request_decode_matches_reference() -> None:
+def test_bf16_multi_request_decode_matches_reference(heads: int) -> None:
     device = require_b12x()
     torch.manual_seed(20260730)
     batch = 4
@@ -131,7 +133,7 @@ def test_bf16_multi_request_decode_matches_reference() -> None:
             device=device,
             mode="decode",
             kv_dtype=torch.bfloat16,
-            num_q_heads=HEADS,
+            num_q_heads=heads,
             page_size=page_size,
             max_total_q=batch,
             max_batch=batch,
@@ -140,7 +142,7 @@ def test_bf16_multi_request_decode_matches_reference() -> None:
             num_cache_pages=pages,
         )
     )
-    q = (torch.randn(batch, HEADS, QK_DIM, device=device) * 0.1).to(torch.bfloat16)
+    q = (torch.randn(batch, heads, QK_DIM, device=device) * 0.1).to(torch.bfloat16)
     cache = (torch.randn(pages, page_size, QK_DIM, device=device) * 0.1).to(
         torch.bfloat16
     )
@@ -165,7 +167,7 @@ def test_bf16_multi_request_decode_matches_reference() -> None:
         device=device,
     )
     output = torch.full(
-        (batch, HEADS, VALUE_DIM),
+        (batch, heads, VALUE_DIM),
         float("nan"),
         dtype=torch.bfloat16,
         device=device,
@@ -177,7 +179,7 @@ def test_bf16_multi_request_decode_matches_reference() -> None:
     # stale tensor-layout assumptions.
     small_output = torch.empty(
         1,
-        HEADS,
+        heads,
         VALUE_DIM,
         dtype=torch.bfloat16,
         device=device,
@@ -242,8 +244,9 @@ def test_bf16_multi_request_decode_matches_reference() -> None:
     )
 
 
+@pytest.mark.parametrize("heads", [8, 12])
 @torch.inference_mode()
-def test_fp8_query_tiled_causal_extend_matches_reference() -> None:
+def test_fp8_query_tiled_causal_extend_matches_reference(heads: int) -> None:
     device = require_b12x()
     torch.manual_seed(20260731)
     query_rows = 5
@@ -254,7 +257,7 @@ def test_fp8_query_tiled_causal_extend_matches_reference() -> None:
             device=device,
             mode="extend",
             kv_dtype=FP8,
-            num_q_heads=HEADS,
+            num_q_heads=heads,
             page_size=page_size,
             max_total_q=query_rows,
             max_batch=1,
@@ -264,7 +267,7 @@ def test_fp8_query_tiled_causal_extend_matches_reference() -> None:
         )
     )
     assert plan.query_tile == 4
-    q_float = torch.randn(query_rows, HEADS, QK_DIM, device=device) * 0.14
+    q_float = torch.randn(query_rows, heads, QK_DIM, device=device) * 0.14
     cache_float = torch.randn(pages, page_size, QK_DIM, device=device) * 0.1
     q_scale = (q_float.abs().max() / 400).reshape(1).float()
     kv_scale = (cache_float.abs().max() / 400).reshape(1).float()
@@ -283,7 +286,7 @@ def test_fp8_query_tiled_causal_extend_matches_reference() -> None:
     )
     output = torch.empty(
         query_rows,
-        HEADS,
+        heads,
         VALUE_DIM,
         dtype=torch.bfloat16,
         device=device,
