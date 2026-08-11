@@ -62,6 +62,8 @@ def _run_trellis_dynamic(
     keepalive: list | None = None,
     mac: int = 4,
     recipe: str = "w4a8_trellis",
+    tile_m: int = _TILE_M,
+    split_materialized: bool = False,
 ):
     device = torch.device("cuda")
     torch.manual_seed(seed)
@@ -139,11 +141,11 @@ def _run_trellis_dynamic(
     w13_packed = torch.zeros(E, w1_n, K // 2, dtype=torch.uint8, device=device)
     w2_packed = torch.zeros(E, K, n // 2, dtype=torch.uint8, device=device)
     scale_flat = torch.zeros(
-        (E + m * top_k + 1) * _TILE_M * (K // 8), dtype=torch.uint8, device=device
+        (E + m * top_k + 1) * tile_m * (K // 8), dtype=torch.uint8, device=device
     )
 
-    phys_tiles = E + (m * top_k + _TILE_M - 1) // _TILE_M
-    rows_padded = phys_tiles * _TILE_M
+    phys_tiles = E + (m * top_k + tile_m - 1) // tile_m
+    rows_padded = phys_tiles * tile_m
     gate_tile_cnt = (w1_n // _TILE_N) // 2
     max_tasks = phys_tiles * max(gate_tile_cnt, 1)
 
@@ -177,30 +179,34 @@ def _run_trellis_dynamic(
 
     import os as _os
     _direct = _os.environ.get("BENCH_DIRECT", "0") == "1"
-    _share = _direct or _os.environ.get("BENCH_SHARE", "0") == "1"
+    _share = (
+        split_materialized
+        or _direct
+        or _os.environ.get("BENCH_SHARE", "0") == "1"
+    )
     if recipe == "w4a8_trellis":
         kernel = MoEDynamicKernelBackend(
             16,
-            (_TILE_M, _TILE_N),
+            (tile_m, _TILE_N),
             activation=activation,
             quant_recipe="w4a8_trellis",
             w4a8_repacked=True,
             num_topk=top_k,
             trellis_bits=_BITS,
             direct_routing=_direct,
-            materialize_intermediate=_direct,
+            materialize_intermediate=split_materialized or _direct,
             share_input_across_experts=_share,
         )
     else:
         kernel = MoEDynamicKernelBackend(
             16,
-            (_TILE_M, _TILE_N),
+            (tile_m, _TILE_N),
             activation=activation,
             quant_recipe=recipe,
             w4a8_repacked=True,
             num_topk=top_k,
             direct_routing=_direct,
-            materialize_intermediate=_direct,
+            materialize_intermediate=split_materialized or _direct,
             share_input_across_experts=_share,
         )
         w13_flat = torch.zeros(
@@ -270,6 +276,8 @@ def _run_trellis_dynamic(
             "tests.w4a8_dynamic.trellis",
             1,
             ("recipe", recipe),
+            ("tile_m", tile_m),
+            ("split", int(split_materialized)),
             ("direct", int(_direct)),
             ("share", int(_share)),
             ("activation", activation),
@@ -358,3 +366,27 @@ def test_dynamic_trellis_matches_scaffold(activation: str, m: int) -> None:
             got[row : row + 1], want[row : row + 1]
         ).item()
         assert row_cos > 0.998, (row, row_cos)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("m", [33, 64])
+def test_dynamic_trellis_split_materialized_matches_scaffold(m: int) -> None:
+    got, want = _run_trellis_dynamic(
+        activation="situ",
+        E=8,
+        m=m,
+        K=512,
+        n=256,
+        top_k=4,
+        seed=20260812,
+        tile_m=64,
+        split_materialized=True,
+        mac=64,
+    )
+    assert torch.isfinite(got).all()
+    cosine = torch.nn.functional.cosine_similarity(
+        got.reshape(1, -1), want.reshape(1, -1)
+    ).item()
+    assert cosine > 0.998, cosine
+    rel_l2 = ((got - want).norm() / want.norm().clamp_min(1e-9)).item()
+    assert rel_l2 < 0.06, rel_l2

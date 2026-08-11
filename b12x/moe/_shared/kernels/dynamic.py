@@ -813,9 +813,14 @@ class MoEDynamicKernelBackend:
                     "w4a8_trellis rides the repacked W4A8 pipeline; pass "
                     "w4a8_repacked=True"
                 )
-            if mma_tiler_mn[0] > 32:
+            if mma_tiler_mn[0] > 32 and not (
+                materialize_intermediate
+                and mma_tiler_mn in {(64, 128), (128, 128)}
+            ):
                 raise ValueError(
-                    "w4a8_trellis currently supports mma_tiler_mn[0] <= 32"
+                    "w4a8_trellis supports mma_tiler_mn[0] <= 32 for the "
+                    "monolithic regimes and (64, 128)/(128, 128) for the "
+                    "split-materialized phase kernels"
                 )
             if not is_gated_moe_activation(activation):
                 raise ValueError(
@@ -866,6 +871,11 @@ class MoEDynamicKernelBackend:
             source_tile_m=materialized_source_tile_m,
             deterministic_output=bool(deterministic_output),
             num_topk=self.num_topk,
+            trellis_bits=(
+                trellis_bits
+                if self.w4a8_trellis and self.w4a8_split_materialized
+                else None
+            ),
             # This helper is gated-only and is never launched unless the split
             # materialized path is active.  Use a valid inert specialization for
             # non-split activations (notably ReLU2) instead of rejecting them
@@ -875,6 +885,11 @@ class MoEDynamicKernelBackend:
         self.materialized_phase2_kernel = W4A8MaterializedPhase2Kernel(
             source_tile_m=materialized_source_tile_m,
             deterministic_output=bool(deterministic_output),
+            trellis_bits=(
+                trellis_bits
+                if self.w4a8_trellis and self.w4a8_split_materialized
+                else None
+            ),
         )
         if self.w4a8_repacked and quant_recipe not in ("w4a8_mx", "w4a8_trellis"):
             raise ValueError(
@@ -882,7 +897,13 @@ class MoEDynamicKernelBackend:
             )
         if self.materialize_intermediate and not (
             self.w4a8_repacked
-            and quant_recipe == "w4a8_mx"
+            and (
+                quant_recipe == "w4a8_mx"
+                or (
+                    quant_recipe == "w4a8_trellis"
+                    and mma_tiler_mn in {(64, 128), (128, 128)}
+                )
+            )
             and mma_tiler_mn in {(16, 128), (32, 128), (64, 128), (128, 128)}
             and work_source != _WORK_SOURCE_READY_QUEUE
         ):
@@ -2431,6 +2452,8 @@ class MoEDynamicKernelBackend:
                 expert_tile_base,
                 alpha,
                 input_global_scale,
+                trellis_lut,
+                trellis_rotations,
                 Int32(a_input.shape[1]) // Int32(128),
                 gate_tile_cnt,
                 Int32(b_w13.shape[0]) // Int32(256),
@@ -2450,6 +2473,7 @@ class MoEDynamicKernelBackend:
                 expert_tile_base,
                 down_alpha,
                 global_scale,
+                trellis_lut,
                 gate_tile_cnt,
                 Int32(b_down.shape[0]) // Int32(256),
                 max_active_clusters,
