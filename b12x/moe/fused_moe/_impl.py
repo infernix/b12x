@@ -8574,6 +8574,8 @@ class _DynamicMoEW4A8Launch:
         max_phys_tiles: cutlass.Int32,
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
+        trellis_lut_ptr: cute.Pointer | None = None,
+        trellis_rot_ptr: cute.Pointer | None = None,
     ):
         a_input = cute.make_tensor(
             a_ptr, layout=cute.make_layout((num_tokens, self._k), stride=(self._k, 1))
@@ -8642,7 +8644,31 @@ class _DynamicMoEW4A8Launch:
             ),
         )
         num_experts = row_counts.shape[0]
-        if cutlass.const_expr(self._kernel.w4a8_repacked):
+        if cutlass.const_expr(getattr(self._kernel, "w4a8_trellis", False)):
+            # Expert-major trellis payloads: w13 [E][2][K16][N16] window
+            # blocks of 8*bits u32, down [E][K16(I)][N16(K)]. SFB tensors
+            # are compile-time dead (identity UE8M0 word).
+            _tr_bits = int(self._kernel.trellis_bits)
+            _tr_w13_u32 = (
+                2 * (self._k // 16) * ((self._w1_n // 2) // 16) * 8 * _tr_bits
+            )
+            _tr_down_u32 = (self._n // 16) * (self._k // 16) * 8 * _tr_bits
+            w13_rp = cute.make_tensor(
+                w13_rp_ptr,
+                layout=cute.make_layout(
+                    (num_experts * _tr_w13_u32,), stride=(1,)
+                ),
+            )
+            down_rp = cute.make_tensor(
+                down_rp_ptr,
+                layout=cute.make_layout(
+                    (num_experts * _tr_down_u32,), stride=(1,)
+                ),
+            )
+            _tr_sentinel = cute.make_layout((1,), stride=(1,))
+            w13_sfb_rp = cute.make_tensor(w13_sfb_rp_ptr, layout=_tr_sentinel)
+            down_sfb_rp = cute.make_tensor(down_sfb_rp_ptr, layout=_tr_sentinel)
+        elif cutlass.const_expr(self._kernel.w4a8_repacked):
             w13_rp = cute.make_tensor(
                 w13_rp_ptr,
                 layout=cute.make_layout(
@@ -8755,6 +8781,24 @@ class _DynamicMoEW4A8Launch:
             w13_sfb_rp=w13_sfb_rp,
             down_rp=down_rp,
             down_sfb_rp=down_sfb_rp,
+            trellis_lut=(
+                cute.make_tensor(
+                    trellis_lut_ptr,
+                    layout=cute.make_layout((4096,), stride=(1,)),
+                )
+                if cutlass.const_expr(trellis_lut_ptr is not None)
+                else None
+            ),
+            trellis_rotations=(
+                cute.make_tensor(
+                    trellis_rot_ptr,
+                    layout=cute.make_layout(
+                        (row_counts.shape[0] * 3 * self._n,), stride=(1,)
+                    ),
+                )
+                if cutlass.const_expr(trellis_rot_ptr is not None)
+                else None
+            ),
         )
 
 
