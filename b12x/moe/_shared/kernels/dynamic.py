@@ -312,6 +312,7 @@ def _w4a8_stage_trellis_b_tile(
 
     span_chunks = 16 * bits
     transfers = 8 * span_chunks
+    limit = Int64(tr_u32.shape[0]) - Int64(4)
     for i in cutlass.range_constexpr((transfers + tcnt - 1) // tcnt):
         idx = tidx + Int32(i * tcnt)
         if idx < Int32(transfers):
@@ -322,10 +323,14 @@ def _w4a8_stage_trellis_b_tile(
                 + Int64(k16_local) * Int64(k16_stride_u32)
                 + Int64(chunk * Int32(4))
             )
-            cp_async4_shared_global(
-                smem_base + (idx << Int32(4)),
-                get_ptr_as_int64(tr_u32, src),
-            )
+            # The pipeline prefetches epochs past the final task, where the
+            # task metadata no longer addresses a real expert; predicate the
+            # copy so junk prefetches cannot leave the payload allocation.
+            if src >= Int64(0) and src <= limit:
+                cp_async4_shared_global(
+                    smem_base + (idx << Int32(4)),
+                    get_ptr_as_int64(tr_u32, src),
+                )
 
 
 # The native trellis B decode leaves each lane's bytes in t256 order; the
@@ -436,6 +441,7 @@ def _w4a8_trellis_decode_half(
         win_b,
         lut_addr,
         int(bits),
+        t12_in_shared=True,
     )
     value = lo
     if n_high != Int32(0):
@@ -2825,6 +2831,12 @@ class MoEDynamicKernelBackend:
                 cute.struct.MemRange[cutlass.BFloat16, self.sC_storage_elems],
                 self.sC_storage_align_bytes,
             ]
+            trellis_lut_smem: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Uint8, 4096 if self.w4a8_trellis else 16
+                ],
+                16,
+            ]
             reduce_scratch: cute.struct.MemRange[cutlass.Float32, 5]
 
         storage = smem.allocate(Storage)
@@ -2928,6 +2940,21 @@ class MoEDynamicKernelBackend:
             )
         sfa_base_addr = ctrl_base_addr + Int32(Storage._offsets["sSFA"])
         reduce_scratch_addr = ctrl_base_addr + Int32(Storage._offsets["reduce_scratch"])
+        if cutlass.const_expr(self.w4a8_trellis):
+            # Stage the 4 KiB T12 staircase once; every later decode gathers
+            # from shared memory. The phase-0 grid barrier orders the copy
+            # ahead of any consumer decode.
+            trellis_lut_smem_base = ctrl_base_addr + Int32(
+                Storage._offsets["trellis_lut_smem"]
+            )
+            trellis_lut_u32 = cute.recast_tensor(trellis_lut, cutlass.Uint32)
+            lut_copy_i = Int32(tidx)
+            while lut_copy_i < Int32(1024):
+                st_shared_u32(
+                    trellis_lut_smem_base + (lut_copy_i << Int32(2)),
+                    Uint32(trellis_lut_u32[lut_copy_i]),
+                )
+                lut_copy_i += Int32(self.threads_per_cta)
         if cutlass.const_expr(self.w4a8_repacked):
             route_phys_rows_addr = ctrl_base_addr + Int32(Storage._offsets["sA"])
             route_expert_ids_addr = route_phys_rows_addr + Int32(
@@ -4502,7 +4529,10 @@ class MoEDynamicKernelBackend:
                 tr_ia, tr_ib, tr_s2 = _w4a8_trellis_lane_geom(
                     Int32(tidx) & Int32(31), self.trellis_bits
                 )
-                trellis_lut_addr = get_ptr_as_int64(trellis_lut, 0)
+                trellis_lut_addr = Int64(
+                    ctrl_base_addr
+                    + Int32(Storage._offsets["trellis_lut_smem"])
+                )
 
         # w4a8 TMA-B: per-mbarrier phase bits, owned by producer warps.
         # Persist across tasks (mbarriers are init'd once; epochs reset per

@@ -177,6 +177,7 @@ def _run_trellis_dynamic(
 
     import os as _os
     _direct = _os.environ.get("BENCH_DIRECT", "0") == "1"
+    _share = _direct or _os.environ.get("BENCH_SHARE", "0") == "1"
     if recipe == "w4a8_trellis":
         kernel = MoEDynamicKernelBackend(
             16,
@@ -188,7 +189,7 @@ def _run_trellis_dynamic(
             trellis_bits=_BITS,
             direct_routing=_direct,
             materialize_intermediate=_direct,
-            share_input_across_experts=_direct,
+            share_input_across_experts=_share,
         )
     else:
         kernel = MoEDynamicKernelBackend(
@@ -200,7 +201,7 @@ def _run_trellis_dynamic(
             num_topk=top_k,
             direct_routing=_direct,
             materialize_intermediate=_direct,
-            share_input_across_experts=_direct,
+            share_input_across_experts=_share,
         )
         w13_flat = torch.zeros(
             E * (w1_n // 256) * (K // 128) * 4096,
@@ -268,6 +269,9 @@ def _run_trellis_dynamic(
         compile_spec=KernelCompileSpec.from_fields(
             "tests.w4a8_dynamic.trellis",
             1,
+            ("recipe", recipe),
+            ("direct", int(_direct)),
+            ("share", int(_share)),
             ("activation", activation),
             ("bits", _BITS),
             ("experts", E),
