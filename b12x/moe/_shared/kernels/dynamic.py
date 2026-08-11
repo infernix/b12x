@@ -704,6 +704,7 @@ class MoEDynamicKernelBackend:
         mxfp6_fmt_a: str | None = None,
         mxfp6_fmt_b: str | None = None,
         trellis_bits: int | None = None,
+        trellis_coupled: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         if quant_recipe not in {
@@ -830,6 +831,9 @@ class MoEDynamicKernelBackend:
         elif trellis_bits is not None:
             raise ValueError("trellis_bits is only valid for w4a8_trellis")
         self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
+        if trellis_coupled and not self.w4a8_trellis:
+            raise ValueError("trellis_coupled requires quant_recipe='w4a8_trellis'")
+        self.trellis_coupled = bool(trellis_coupled)
         self.w4a8_repacked = bool(w4a8_repacked)
         self.direct_routing = bool(direct_routing)
         self.materialize_intermediate = bool(materialize_intermediate)
@@ -5598,7 +5602,9 @@ class MoEDynamicKernelBackend:
                                 epi_rows = Int32(self.epi_tile[0])
                             if epi_rows < Int32(0):
                                 epi_rows = Int32(0)
-                            if cutlass.const_expr(self.w4a8_trellis):
+                            if cutlass.const_expr(
+                                self.w4a8_trellis and not self.trellis_coupled
+                            ):
                                 # Trellis activation boundary through sC:
                                 # ig = rot_g * H128(g); then restage up,
                                 # iu = rot_u * H128(u); h' = H128(sd *
@@ -5761,6 +5767,288 @@ class MoEDynamicKernelBackend:
                                         )
                                         sC[tr_row, tr_c + Int32(3), epi_buffer] = (
                                             cutlass.BFloat16(o3)
+                                        )
+                                cute.arch.fence_proxy("async.shared", space="cta")
+                                self.epilog_sync_barrier.arrive_and_wait()
+                            if cutlass.const_expr(
+                                self.w4a8_trellis and self.trellis_coupled
+                            ):
+                                # Coupled activation boundary: the slice's raw
+                                # gate sits in sC[epi_buffer]; restage raw up
+                                # into the next epilogue buffer, then per row
+                                # run the interleaved signed-Hadamard sandwich,
+                                # pairwise SiTU, warp re-gather, and the post
+                                # sandwich, writing h' back over the gate tile.
+                                tr_row_slots = (
+                                    self.epi_tile[0] + self.num_mma_warps - 1
+                                ) // self.num_mma_warps
+                                tr_lane = Int32(tidx) & Int32(31)
+                                tr_warp = Int32(tidx) >> Int32(5)
+                                tr_isz = gate_tile_cnt * Int32(128)
+                                tr_slice_col = (
+                                    task_slice_begin_idx + slice_idx
+                                ) * Int32(128)
+                                tr_chunk = tr_lane >> Int32(3)
+                                tr_chunk_lane = tr_lane & Int32(7)
+                                tr_slot = tr_chunk & Int32(1)
+                                tr_pre = cute.make_rmem_tensor(
+                                    (tr_row_slots * 8,), cutlass.Float32
+                                )
+                                for _sl in cutlass.range_constexpr(tr_row_slots):
+                                    tr_row = tr_warp + Int32(
+                                        _sl * self.num_mma_warps
+                                    )
+                                    if tr_row < epi_rows:
+                                        for _pb in cutlass.range_constexpr(2):
+                                            tr_ci = (
+                                                Int32(_pb * 64)
+                                                + (
+                                                    (tr_chunk >> Int32(1))
+                                                    << Int32(5)
+                                                )
+                                                + tr_chunk_lane * Int32(4)
+                                            )
+                                            if tr_slot == Int32(0):
+                                                for _e in cutlass.range_constexpr(
+                                                    4
+                                                ):
+                                                    tr_pre[
+                                                        _sl * 8 + _pb * 4 + _e
+                                                    ] = cutlass.Float32(
+                                                        sC[
+                                                            tr_row,
+                                                            tr_ci + Int32(_e),
+                                                            epi_buffer,
+                                                        ]
+                                                    )
+                                self.epilog_sync_barrier.arrive_and_wait()
+                                if epi_m_valid > Int32(0):
+                                    for mma_n_in_epi in cutlass.range_constexpr(
+                                        MmaNPerEpiN
+                                    ):
+                                        for mma_m_in_epi in cutlass.range_constexpr(
+                                            MmaMPerEpiM
+                                        ):
+                                            mma_m = (
+                                                epi_m * MmaMPerEpiM + mma_m_in_epi
+                                            )
+                                            mma_n = mma_n_in_epi
+                                            tRS_rD_slice = tRS_rD[
+                                                (None, mma_m_in_epi, mma_n_in_epi)
+                                            ]
+                                            up_slice = tRS_rUp[(None, mma_m, mma_n)]
+                                            for elem_idx in cutlass.range_constexpr(
+                                                cute.size(tRS_rD_slice)
+                                            ):
+                                                tRS_rD_slice[elem_idx] = (
+                                                    alpha_value
+                                                    * up_slice[elem_idx]
+                                                )
+                                    acc_vec = tRS_rD.load()
+                                    acc_vec = acc_vec.to(cutlass.BFloat16)
+                                    tRS_rD_out.store(acc_vec)
+                                    cute.copy(
+                                        tiled_copy_r2s,
+                                        tRS_rD_out,
+                                        tRS_sD[(None, None, None, epi_buffer)],
+                                    )
+                                    cute.arch.fence_proxy(
+                                        "async.shared", space="cta"
+                                    )
+                                self.epilog_sync_barrier.arrive_and_wait()
+                                for _sl in cutlass.range_constexpr(tr_row_slots):
+                                    tr_row = tr_warp + Int32(
+                                        _sl * self.num_mma_warps
+                                    )
+                                    if tr_row < epi_rows:
+                                        aa0 = cutlass.Float32(0.0)
+                                        aa1 = cutlass.Float32(0.0)
+                                        bb0 = cutlass.Float32(0.0)
+                                        bb1 = cutlass.Float32(0.0)
+                                        for _pb in cutlass.range_constexpr(2):
+                                            tr_ci = (
+                                                Int32(_pb * 64)
+                                                + (
+                                                    (tr_chunk >> Int32(1))
+                                                    << Int32(5)
+                                                )
+                                                + tr_chunk_lane * Int32(4)
+                                            )
+                                            p0 = tr_pre[_sl * 8 + _pb * 4]
+                                            p1 = tr_pre[_sl * 8 + _pb * 4 + 1]
+                                            p2 = tr_pre[_sl * 8 + _pb * 4 + 2]
+                                            p3 = tr_pre[_sl * 8 + _pb * 4 + 3]
+                                            if tr_slot != Int32(0):
+                                                p0 = cutlass.Float32(
+                                                    sC[tr_row, tr_ci, epi_buffer]
+                                                )
+                                                p1 = cutlass.Float32(
+                                                    sC[
+                                                        tr_row,
+                                                        tr_ci + Int32(1),
+                                                        epi_buffer,
+                                                    ]
+                                                )
+                                                p2 = cutlass.Float32(
+                                                    sC[
+                                                        tr_row,
+                                                        tr_ci + Int32(2),
+                                                        epi_buffer,
+                                                    ]
+                                                )
+                                                p3 = cutlass.Float32(
+                                                    sC[
+                                                        tr_row,
+                                                        tr_ci + Int32(3),
+                                                        epi_buffer,
+                                                    ]
+                                                )
+                                            h0, h1, h2, h3 = _w4a8_had128_quad(
+                                                p0, p1, p2, p3, tr_lane
+                                            )
+                                            tr_coord = tr_slice_col + tr_ci
+                                            tr_scale = (
+                                                task_expert_idx
+                                                * (Int32(6) * tr_isz)
+                                                + tr_slot * tr_isz
+                                                + tr_coord
+                                            )
+                                            h0 = h0 * cutlass.Float32(
+                                                trellis_rotations[tr_scale]
+                                            )
+                                            h1 = h1 * cutlass.Float32(
+                                                trellis_rotations[
+                                                    tr_scale + Int32(1)
+                                                ]
+                                            )
+                                            h2 = h2 * cutlass.Float32(
+                                                trellis_rotations[
+                                                    tr_scale + Int32(2)
+                                                ]
+                                            )
+                                            h3 = h3 * cutlass.Float32(
+                                                trellis_rotations[
+                                                    tr_scale + Int32(3)
+                                                ]
+                                            )
+                                            h0, h1, h2, h3 = _w4a8_had128_quad(
+                                                h0, h1, h2, h3, tr_lane
+                                            )
+                                            tr_sign = (
+                                                task_expert_idx
+                                                * (Int32(6) * tr_isz)
+                                                + Int32(3) * tr_isz
+                                                + (
+                                                    tr_slice_col
+                                                    + tr_slice_col
+                                                    + Int32(_pb * 128)
+                                                )
+                                                + tr_lane * Int32(4)
+                                            )
+                                            h0 = h0 * cutlass.Float32(
+                                                trellis_rotations[tr_sign]
+                                            )
+                                            h1 = h1 * cutlass.Float32(
+                                                trellis_rotations[
+                                                    tr_sign + Int32(1)
+                                                ]
+                                            )
+                                            h2 = h2 * cutlass.Float32(
+                                                trellis_rotations[
+                                                    tr_sign + Int32(2)
+                                                ]
+                                            )
+                                            h3 = h3 * cutlass.Float32(
+                                                trellis_rotations[
+                                                    tr_sign + Int32(3)
+                                                ]
+                                            )
+                                            s0 = self._gated_activation_value(
+                                                h0, h1
+                                            )
+                                            s1 = self._gated_activation_value(
+                                                h2, h3
+                                            )
+                                            if cutlass.const_expr(_pb == 0):
+                                                aa0 = s0
+                                                aa1 = s1
+                                            else:
+                                                bb0 = s0
+                                                bb1 = s1
+                                        src0 = (tr_lane & Int32(15)) << Int32(1)
+                                        src1 = src0 + Int32(1)
+                                        av0 = cute.arch.shuffle_sync(aa0, src0)
+                                        av1 = cute.arch.shuffle_sync(aa1, src0)
+                                        av2 = cute.arch.shuffle_sync(aa0, src1)
+                                        av3 = cute.arch.shuffle_sync(aa1, src1)
+                                        bv0 = cute.arch.shuffle_sync(bb0, src0)
+                                        bv1 = cute.arch.shuffle_sync(bb1, src0)
+                                        bv2 = cute.arch.shuffle_sync(bb0, src1)
+                                        bv3 = cute.arch.shuffle_sync(bb1, src1)
+                                        v0 = av0
+                                        v1 = av1
+                                        v2 = av2
+                                        v3 = av3
+                                        if tr_lane >= Int32(16):
+                                            v0 = bv0
+                                            v1 = bv1
+                                            v2 = bv2
+                                            v3 = bv3
+                                        tr_col = tr_slice_col + tr_lane * Int32(4)
+                                        tr_ub = (
+                                            task_expert_idx
+                                            * (Int32(6) * tr_isz)
+                                            + Int32(5) * tr_isz
+                                            + tr_col
+                                        )
+                                        v0 = v0 * cutlass.Float32(
+                                            trellis_rotations[tr_ub]
+                                        )
+                                        v1 = v1 * cutlass.Float32(
+                                            trellis_rotations[tr_ub + Int32(1)]
+                                        )
+                                        v2 = v2 * cutlass.Float32(
+                                            trellis_rotations[tr_ub + Int32(2)]
+                                        )
+                                        v3 = v3 * cutlass.Float32(
+                                            trellis_rotations[tr_ub + Int32(3)]
+                                        )
+                                        v0, v1, v2, v3 = _w4a8_had128_quad(
+                                            v0, v1, v2, v3, tr_lane
+                                        )
+                                        tr_dn = (
+                                            task_expert_idx
+                                            * (Int32(6) * tr_isz)
+                                            + Int32(2) * tr_isz
+                                            + tr_col
+                                        )
+                                        v0 = v0 * cutlass.Float32(
+                                            trellis_rotations[tr_dn]
+                                        )
+                                        v1 = v1 * cutlass.Float32(
+                                            trellis_rotations[tr_dn + Int32(1)]
+                                        )
+                                        v2 = v2 * cutlass.Float32(
+                                            trellis_rotations[tr_dn + Int32(2)]
+                                        )
+                                        v3 = v3 * cutlass.Float32(
+                                            trellis_rotations[tr_dn + Int32(3)]
+                                        )
+                                        v0, v1, v2, v3 = _w4a8_had128_quad(
+                                            v0, v1, v2, v3, tr_lane
+                                        )
+                                        tr_c4 = tr_lane * Int32(4)
+                                        sC[tr_row, tr_c4, epi_buffer] = (
+                                            cutlass.BFloat16(v0)
+                                        )
+                                        sC[tr_row, tr_c4 + Int32(1), epi_buffer] = (
+                                            cutlass.BFloat16(v1)
+                                        )
+                                        sC[tr_row, tr_c4 + Int32(2), epi_buffer] = (
+                                            cutlass.BFloat16(v2)
+                                        )
+                                        sC[tr_row, tr_c4 + Int32(3), epi_buffer] = (
+                                            cutlass.BFloat16(v3)
                                         )
                                 cute.arch.fence_proxy("async.shared", space="cta")
                                 self.epilog_sync_barrier.arrive_and_wait()

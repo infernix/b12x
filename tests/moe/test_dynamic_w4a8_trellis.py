@@ -64,6 +64,7 @@ def _run_trellis_dynamic(
     recipe: str = "w4a8_trellis",
     tile_m: int = _TILE_M,
     split_materialized: bool = False,
+    coupled: bool = False,
 ):
     device = torch.device("cuda")
     torch.manual_seed(seed)
@@ -108,8 +109,33 @@ def _run_trellis_dynamic(
         down_svh=h_scale,
         tile_config=(128, 128, 128, 128),
     )
+    if coupled:
+        from dataclasses import replace as _dc_replace
+
+        coupled_signs = (
+            torch.randint(0, 2, (E, 3 * n), dtype=torch.int32, device=device)
+            .mul_(2)
+            .sub_(1)
+            .to(torch.float16)
+        )
+        prepared = _dc_replace(
+            prepared,
+            coupled_hadamard=True,
+            intermediate_rotations=torch.cat(
+                (
+                    torch.ones((E, 3 * n), dtype=torch.float16, device=device),
+                    coupled_signs,
+                ),
+                dim=1,
+            ).contiguous(),
+        )
     scratch = make_trellis_w4a8_moe_scratch(
-        m=m, topk=top_k, hidden_size=K, intermediate_size=n, device=device
+        m=m,
+        topk=top_k,
+        hidden_size=K,
+        intermediate_size=n,
+        device=device,
+        coupled_hadamard=coupled,
     )
     oracle = run_trellis_w4a8_moe(
         x, prepared, topk_weights, topk_ids, scratch
@@ -121,8 +147,17 @@ def _run_trellis_dynamic(
     # identity here). Rotate the input on the host and un-rotate the output;
     # the activation-boundary rotation runs inside the kernel.
     had = _h128(device)
+    x_pre = x.float()
+    if coupled:
+        h4 = torch.tensor(
+            [[1, 1, 1, 1], [1, -1, 1, -1], [1, 1, -1, -1], [1, -1, -1, 1]],
+            dtype=torch.float32,
+            device=device,
+        ) * 0.5
+        h512 = torch.kron(h4, had)
+        x_pre = (x_pre.reshape(m, K // 512, 512) @ h512).reshape(m, K)
     x_dyn = (
-        (x.float().reshape(m, K // 128, 128) @ had).reshape(m, K).to(torch.bfloat16)
+        (x_pre.reshape(m, K // 128, 128) @ had).reshape(m, K).to(torch.bfloat16)
     )
     # Expert-major flat payloads: w13 [E][proj][K16][N16], down [E][K16][N16].
     w13_flat = (
@@ -130,11 +165,14 @@ def _run_trellis_dynamic(
     )
     down_flat = w2_i16.contiguous().view(torch.int32).reshape(-1)
     t12_lut = sqg_xor_cheb_t12_lut_cpu().to(device)
-    rot_flat = (
-        torch.ones((E, 3 * n), dtype=torch.float16, device=device)
-        .reshape(-1)
-        .contiguous()
-    )
+    if coupled:
+        rot_flat = prepared.intermediate_rotations.reshape(-1).contiguous()
+    else:
+        rot_flat = (
+            torch.ones((E, 3 * n), dtype=torch.float16, device=device)
+            .reshape(-1)
+            .contiguous()
+        )
     sentinel_u32 = torch.zeros(1, dtype=torch.uint32, device=device)
     # Dummy packed-FP4 weight tensors: shape-only (TMA descriptors and tile
     # counts); never dereferenced by the trellis staging.
@@ -193,6 +231,7 @@ def _run_trellis_dynamic(
             w4a8_repacked=True,
             num_topk=top_k,
             trellis_bits=_BITS,
+            trellis_coupled=coupled,
             direct_routing=_direct,
             materialize_intermediate=split_materialized or _direct,
             share_input_across_experts=_share,
@@ -278,6 +317,7 @@ def _run_trellis_dynamic(
             ("recipe", recipe),
             ("tile_m", tile_m),
             ("split", int(split_materialized)),
+            ("coupled", int(coupled)),
             ("direct", int(_direct)),
             ("share", int(_share)),
             ("activation", activation),
@@ -339,10 +379,10 @@ def _run_trellis_dynamic(
     torch.cuda.synchronize()
     if keepalive is not None:
         keepalive.append(dict(locals()))
-    out = (
-        (scatter_output.float().reshape(m, K // 128, 128) @ had)
-        .reshape(m, K)
-    )
+    out = scatter_output.float()
+    if coupled:
+        out = (out.reshape(m, K // 512, 512) @ h512).reshape(m, K)
+    out = (out.reshape(m, K // 128, 128) @ had).reshape(m, K)
     return out, oracle
 
 
@@ -382,6 +422,28 @@ def test_dynamic_trellis_split_materialized_matches_scaffold(m: int) -> None:
         tile_m=64,
         split_materialized=True,
         mac=64,
+    )
+    assert torch.isfinite(got).all()
+    cosine = torch.nn.functional.cosine_similarity(
+        got.reshape(1, -1), want.reshape(1, -1)
+    ).item()
+    assert cosine > 0.998, cosine
+    rel_l2 = ((got - want).norm() / want.norm().clamp_min(1e-9)).item()
+    assert rel_l2 < 0.06, rel_l2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("m", [1, 3])
+def test_dynamic_trellis_coupled_matches_scaffold(m: int) -> None:
+    got, want = _run_trellis_dynamic(
+        activation="situ",
+        E=8,
+        m=m,
+        K=512,
+        n=256,
+        top_k=4,
+        seed=20260813,
+        coupled=True,
     )
     assert torch.isfinite(got).all()
     cosine = torch.nn.functional.cosine_similarity(

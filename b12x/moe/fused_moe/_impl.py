@@ -8793,7 +8793,18 @@ class _DynamicMoEW4A8Launch:
                 cute.make_tensor(
                     trellis_rot_ptr,
                     layout=cute.make_layout(
-                        (row_counts.shape[0] * 3 * self._n,), stride=(1,)
+                        (
+                            row_counts.shape[0]
+                            * (
+                                6
+                                if getattr(
+                                    self._kernel, "trellis_coupled", False
+                                )
+                                else 3
+                            )
+                            * self._n,
+                        ),
+                        stride=(1,),
                     ),
                 )
                 if cutlass.const_expr(trellis_rot_ptr is not None)
