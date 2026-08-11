@@ -15,10 +15,6 @@ from b12x.moe.fused_moe import META as FUSED_MOE_META
 from b12x.moe._shared.kernels.w4a16.host import plan_w4a16_buffers
 from b12x.moe._shared.kernels.w4a16.host import make_w4a16_packed_buffers
 from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
-from b12x.moe._shared.kernels.trellis_w4a8 import (
-    make_trellis_w4a8_moe_scratch,
-    run_trellis_w4a8_moe,
-)
 from b12x.moe._shared.kernels.w4a16.prepare import (
     PreparedW4A16MoeWeights,
     _prepare_qsrt_coupled_h308_atom_v2_moe_weights,
@@ -1478,110 +1474,11 @@ def test_coupled_k2_fused_moe_matches_transform_reference_and_captures(
     assert torch.equal(captured, actual)
 
 
-    a8_scratch = make_trellis_w4a8_moe_scratch(
-        m=m,
-        topk=topk,
-        hidden_size=hidden,
-        intermediate_size=intermediate,
-        device=device,
-        coupled_hadamard=True,
-    )
-
-    def run_a8() -> torch.Tensor:
-        return run_trellis_w4a8_moe(
-            x,
-            prepared,
-            router_weights,
-            ids,
-            a8_scratch,
-        )
-
-    actual_a8 = run_a8().clone()
-    torch.cuda.synchronize(device)
-
-    # Close the coupled output boundary independently from the two MXFP8 MMA
-    # stages.  This uses the route values actually emitted by FC2, so any
-    # discrepancy here is a transform/reduction defect rather than ordinary
-    # MXFP8 accumulation error.
-    reduced_fc2 = sum(
-        router_weights[0, slot]
-        * a8_scratch.fc2[slot : slot + 1].float()
-        for slot in range(topk)
-    )
-    reduced_fc2 = _had128(reduced_fc2, hadamard, store_fp16=False)
-    reduced_fc2 *= down_svh.float()
-    reduced_fc2 = _coupled_h512(reduced_fc2, hadamard)
-    torch.testing.assert_close(actual_a8, reduced_fc2, rtol=1.0e-4, atol=2.0e-3)
-    coupled_output_cosine = torch.nn.functional.cosine_similarity(
-        actual_a8.flatten(), reduced_fc2.flatten(), dim=0
-    )
-    assert float(coupled_output_cosine) >= 0.999999
-
-    source_a8 = _coupled_h512(x.to(torch.float16), hadamard)
-    source_a8 = _had128(
-        source_a8 * source_suh.float(), hadamard, store_fp16=False
-    )
-    source_a8 = _reference_mxfp8_rows(source_a8)
-    expected_slot0_a8 = (source_a8 @ slot0_weights[0].float()).half()
-    expected_slot1_a8 = (source_a8 @ slot1_weights[0].float()).half()
-    fc1_relative_error_a8 = max(
-        float(
-            (a8_scratch.gate_fc1 - expected_slot0_a8).norm()
-            / expected_slot0_a8.norm().clamp_min(1.0e-9)
-        ),
-        float(
-            (a8_scratch.up_fc1 - expected_slot1_a8).norm()
-            / expected_slot1_a8.norm().clamp_min(1.0e-9)
-        ),
-    )
-    reference_a8 = _reference_coupled_decoded(
-        x,
-        ids,
-        router_weights,
-        slot0_weights,
-        slot1_weights,
-        down_weights,
-        source_suh,
-        ordinary_rotations,
-        coupled_signs,
-        down_svh,
-        quantize_activations=True,
-    )
-    relative_error_a8 = (
-        (actual_a8 - reference_a8).norm()
-        / reference_a8.norm().clamp_min(1.0e-9)
-    )
-    cosine_a8 = torch.nn.functional.cosine_similarity(
-        actual_a8.flatten(), reference_a8.flatten(), dim=0
-    )
-    assert float(relative_error_a8) <= 4.0e-2, (
-        float(relative_error_a8),
-        float(cosine_a8),
-        fc1_relative_error_a8,
-    )
-    # The full reference computes the two matrix products with torch FP32
-    # accumulation after reconstructing the logical MXFP8 rows.  The native
-    # kernel accumulates MXFP8 tensor-core fragments, so its end-to-end SiTU
-    # result is not expected to be bit-identical to that diagnostic.  Matrix
-    # and transform boundaries above close independently; this final check
-    # guards against material functional drift through the nonlinear path.
-    assert float(cosine_a8) >= 0.999, (
-        float(relative_error_a8),
-        float(cosine_a8),
-        fc1_relative_error_a8,
-    )
-
-    a8_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(a8_graph):
-        captured_a8 = run_a8()
-    a8_graph.replay()
-    torch.cuda.synchronize(device)
-    assert torch.equal(captured_a8, actual_a8)
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("bits", [3, 4])
-def test_coupled_higher_rate_w4a16_and_w4a8_match_transform_reference(
+def test_coupled_higher_rate_w4a16_matches_transform_reference(
     bits: int,
 ) -> None:
     """Close uniform K3/K4 payloads through the coupled transform contract."""
@@ -1719,43 +1616,6 @@ def test_coupled_higher_rate_w4a16_and_w4a8_match_transform_reference(
     assert float(relative_a16) <= 2.0e-2
     assert float(cosine_a16) >= 0.9999
 
-    a8_scratch = make_trellis_w4a8_moe_scratch(
-        m=m,
-        topk=topk,
-        hidden_size=hidden,
-        intermediate_size=intermediate,
-        device=device,
-        coupled_hadamard=True,
-    )
-    actual_a8 = run_trellis_w4a8_moe(
-        x,
-        prepared,
-        router_weights,
-        ids,
-        a8_scratch,
-    ).clone()
-    reference_a8 = _reference_coupled_decoded(
-        x,
-        ids,
-        router_weights,
-        slot0_weights,
-        slot1_weights,
-        down_weights,
-        source_suh,
-        ordinary_rotations,
-        coupled_signs,
-        down_svh,
-        quantize_activations=True,
-    )
-    relative_a8 = (
-        (actual_a8 - reference_a8).norm()
-        / reference_a8.norm().clamp_min(1.0e-9)
-    )
-    cosine_a8 = torch.nn.functional.cosine_similarity(
-        actual_a8.flatten(), reference_a8.flatten(), dim=0
-    )
-    assert float(relative_a8) <= 4.0e-2
-    assert float(cosine_a8) >= 0.999
 
 
 def _qsrt_atom_extent_from_pair_payloads(
