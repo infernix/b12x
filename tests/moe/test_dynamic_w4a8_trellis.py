@@ -433,6 +433,31 @@ def test_dynamic_trellis_split_materialized_matches_scaffold(m: int) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("m", [33])
+def test_dynamic_trellis_coupled_split_matches_scaffold(m: int) -> None:
+    got, want = _run_trellis_dynamic(
+        activation="situ",
+        E=8,
+        m=m,
+        K=512,
+        n=256,
+        top_k=4,
+        seed=20260814,
+        tile_m=64,
+        split_materialized=True,
+        coupled=True,
+        mac=64,
+    )
+    assert torch.isfinite(got).all()
+    cosine = torch.nn.functional.cosine_similarity(
+        got.reshape(1, -1), want.reshape(1, -1)
+    ).item()
+    assert cosine > 0.998, cosine
+    rel_l2 = ((got - want).norm() / want.norm().clamp_min(1e-9)).item()
+    assert rel_l2 < 0.06, rel_l2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("m", [1, 3])
 def test_dynamic_trellis_coupled_matches_scaffold(m: int) -> None:
     got, want = _run_trellis_dynamic(

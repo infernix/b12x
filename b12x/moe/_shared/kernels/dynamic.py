@@ -880,6 +880,9 @@ class MoEDynamicKernelBackend:
                 if self.w4a8_trellis and self.w4a8_split_materialized
                 else None
             ),
+            trellis_coupled=(
+                self.trellis_coupled and self.w4a8_split_materialized
+            ),
             # This helper is gated-only and is never launched unless the split
             # materialized path is active.  Use a valid inert specialization for
             # non-split activations (notably ReLU2) instead of rejecting them

@@ -95,6 +95,7 @@ class W4A8MaterializedPhase1Kernel:
         num_topk: int = 1,
         activation: str = "silu",
         trellis_bits: int | None = None,
+        trellis_coupled: bool = False,
     ):
         if source_tile_m not in (64, 128):
             raise ValueError(
@@ -119,6 +120,9 @@ class W4A8MaterializedPhase1Kernel:
             )
         self.w4a8_trellis = trellis_bits is not None
         self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
+        if trellis_coupled and not self.w4a8_trellis:
+            raise ValueError("trellis_coupled requires trellis_bits")
+        self.trellis_coupled = bool(trellis_coupled)
         if self.w4a8_trellis:
             # Append a 4 KiB shared region for the T12 staircase; every
             # decode gathers from shared memory.
@@ -782,7 +786,8 @@ class W4A8MaterializedPhase1Kernel:
             cute.arch.sync_threads()
             tr_isz = intermediate_tiles * Int32(128)
             tr_col = output_tile * Int32(128) + lane * Int32(4)
-            tr_rot = expert_idx * (Int32(3) * tr_isz) + tr_col
+            tr_seg = Int32(6) if cutlass.const_expr(self.trellis_coupled) else Int32(3)
+            tr_rot = expert_idx * (tr_seg * tr_isz) + tr_col
             rg0 = cutlass.Float32(trellis_rotations[tr_rot])
             rg1 = cutlass.Float32(trellis_rotations[tr_rot + Int32(1)])
             rg2 = cutlass.Float32(trellis_rotations[tr_rot + Int32(2)])
@@ -797,6 +802,9 @@ class W4A8MaterializedPhase1Kernel:
             sd2 = cutlass.Float32(trellis_rotations[sd_base + Int32(2)])
             sd3 = cutlass.Float32(trellis_rotations[sd_base + Int32(3)])
             unit_alpha = cutlass.Float32(1.0)
+            tr_chunk = lane >> Int32(3)
+            tr_chunk_lane = lane & Int32(7)
+            tr_slot = tr_chunk & Int32(1)
             for row_it in cutlass.range_constexpr(self.tile_m // self.num_warps):
                 seam_row = warp_idx * Int32(self.tile_m // self.num_warps) + Int32(
                     row_it
@@ -809,23 +817,136 @@ class W4A8MaterializedPhase1Kernel:
                     up_tile_base
                     + (seam_row * Int32(self.tile_n) + lane * Int32(4)) * Int32(2)
                 )
-                g0 = ld_shared_bf16_to_f32(row_addr)
-                g1 = ld_shared_bf16_to_f32(row_addr + Int32(2))
-                g2 = ld_shared_bf16_to_f32(row_addr + Int32(4))
-                g3 = ld_shared_bf16_to_f32(row_addr + Int32(6))
-                u0 = ld_shared_bf16_to_f32(up_addr)
-                u1 = ld_shared_bf16_to_f32(up_addr + Int32(2))
-                u2 = ld_shared_bf16_to_f32(up_addr + Int32(4))
-                u3 = ld_shared_bf16_to_f32(up_addr + Int32(6))
-                gh0, gh1, gh2, gh3 = _w4a8_had128_quad(g0, g1, g2, g3, lane)
-                uh0, uh1, uh2, uh3 = _w4a8_had128_quad(u0, u1, u2, u3, lane)
-                a0 = self._activated_value(gh0 * rg0, uh0 * ru0, unit_alpha) * sd0
-                a1 = self._activated_value(gh1 * rg1, uh1 * ru1, unit_alpha) * sd1
-                a2 = self._activated_value(gh2 * rg2, uh2 * ru2, unit_alpha) * sd2
-                a3 = self._activated_value(gh3 * rg3, uh3 * ru3, unit_alpha) * sd3
-                o0, o1, o2, o3 = _w4a8_had128_quad(a0, a1, a2, a3, lane)
-                st_shared_u32(row_addr, pack_f32x2_to_bfloat2(o0, o1))
-                st_shared_u32(row_addr + Int32(4), pack_f32x2_to_bfloat2(o2, o3))
+                if cutlass.const_expr(self.trellis_coupled):
+                    aa0 = cutlass.Float32(0.0)
+                    aa1 = cutlass.Float32(0.0)
+                    bb0 = cutlass.Float32(0.0)
+                    bb1 = cutlass.Float32(0.0)
+                    for _pb in cutlass.range_constexpr(2):
+                        tr_ci = (
+                            Int32(_pb * 64)
+                            + ((tr_chunk >> Int32(1)) << Int32(5))
+                            + tr_chunk_lane * Int32(4)
+                        )
+                        src_base = (
+                            epilogue_base
+                            + (seam_row * Int32(self.tile_n) + tr_ci) * Int32(2)
+                        )
+                        if tr_slot != Int32(0):
+                            src_base = (
+                                up_tile_base
+                                + (seam_row * Int32(self.tile_n) + tr_ci)
+                                * Int32(2)
+                            )
+                        p0 = ld_shared_bf16_to_f32(src_base)
+                        p1 = ld_shared_bf16_to_f32(src_base + Int32(2))
+                        p2 = ld_shared_bf16_to_f32(src_base + Int32(4))
+                        p3 = ld_shared_bf16_to_f32(src_base + Int32(6))
+                        h0, h1, h2, h3 = _w4a8_had128_quad(p0, p1, p2, p3, lane)
+                        tr_coord = output_tile * Int32(128) + tr_ci
+                        tr_scale = (
+                            expert_idx * (Int32(6) * tr_isz)
+                            + tr_slot * tr_isz
+                            + tr_coord
+                        )
+                        h0 = h0 * cutlass.Float32(trellis_rotations[tr_scale])
+                        h1 = h1 * cutlass.Float32(
+                            trellis_rotations[tr_scale + Int32(1)]
+                        )
+                        h2 = h2 * cutlass.Float32(
+                            trellis_rotations[tr_scale + Int32(2)]
+                        )
+                        h3 = h3 * cutlass.Float32(
+                            trellis_rotations[tr_scale + Int32(3)]
+                        )
+                        h0, h1, h2, h3 = _w4a8_had128_quad(h0, h1, h2, h3, lane)
+                        tr_sign = (
+                            expert_idx * (Int32(6) * tr_isz)
+                            + Int32(3) * tr_isz
+                            + output_tile * Int32(256)
+                            + Int32(_pb * 128)
+                            + lane * Int32(4)
+                        )
+                        h0 = h0 * cutlass.Float32(trellis_rotations[tr_sign])
+                        h1 = h1 * cutlass.Float32(
+                            trellis_rotations[tr_sign + Int32(1)]
+                        )
+                        h2 = h2 * cutlass.Float32(
+                            trellis_rotations[tr_sign + Int32(2)]
+                        )
+                        h3 = h3 * cutlass.Float32(
+                            trellis_rotations[tr_sign + Int32(3)]
+                        )
+                        s0 = self._activated_value(h0, h1, unit_alpha)
+                        s1 = self._activated_value(h2, h3, unit_alpha)
+                        if cutlass.const_expr(_pb == 0):
+                            aa0 = s0
+                            aa1 = s1
+                        else:
+                            bb0 = s0
+                            bb1 = s1
+                    src0 = (lane & Int32(15)) << Int32(1)
+                    src1 = src0 + Int32(1)
+                    av0 = cute.arch.shuffle_sync(aa0, src0)
+                    av1 = cute.arch.shuffle_sync(aa1, src0)
+                    av2 = cute.arch.shuffle_sync(aa0, src1)
+                    av3 = cute.arch.shuffle_sync(aa1, src1)
+                    bv0 = cute.arch.shuffle_sync(bb0, src0)
+                    bv1 = cute.arch.shuffle_sync(bb1, src0)
+                    bv2 = cute.arch.shuffle_sync(bb0, src1)
+                    bv3 = cute.arch.shuffle_sync(bb1, src1)
+                    o0 = av0
+                    o1 = av1
+                    o2 = av2
+                    o3 = av3
+                    if lane >= Int32(16):
+                        o0 = bv0
+                        o1 = bv1
+                        o2 = bv2
+                        o3 = bv3
+                    tr_col = output_tile * Int32(128) + lane * Int32(4)
+                    tr_ub = (
+                        expert_idx * (Int32(6) * tr_isz)
+                        + Int32(5) * tr_isz
+                        + tr_col
+                    )
+                    o0 = o0 * cutlass.Float32(trellis_rotations[tr_ub])
+                    o1 = o1 * cutlass.Float32(trellis_rotations[tr_ub + Int32(1)])
+                    o2 = o2 * cutlass.Float32(trellis_rotations[tr_ub + Int32(2)])
+                    o3 = o3 * cutlass.Float32(trellis_rotations[tr_ub + Int32(3)])
+                    o0, o1, o2, o3 = _w4a8_had128_quad(o0, o1, o2, o3, lane)
+                    tr_dn = (
+                        expert_idx * (Int32(6) * tr_isz)
+                        + Int32(2) * tr_isz
+                        + tr_col
+                    )
+                    o0 = o0 * cutlass.Float32(trellis_rotations[tr_dn])
+                    o1 = o1 * cutlass.Float32(trellis_rotations[tr_dn + Int32(1)])
+                    o2 = o2 * cutlass.Float32(trellis_rotations[tr_dn + Int32(2)])
+                    o3 = o3 * cutlass.Float32(trellis_rotations[tr_dn + Int32(3)])
+                    o0, o1, o2, o3 = _w4a8_had128_quad(o0, o1, o2, o3, lane)
+                    st_shared_u32(row_addr, pack_f32x2_to_bfloat2(o0, o1))
+                    st_shared_u32(
+                        row_addr + Int32(4), pack_f32x2_to_bfloat2(o2, o3)
+                    )
+                else:
+                    g0 = ld_shared_bf16_to_f32(row_addr)
+                    g1 = ld_shared_bf16_to_f32(row_addr + Int32(2))
+                    g2 = ld_shared_bf16_to_f32(row_addr + Int32(4))
+                    g3 = ld_shared_bf16_to_f32(row_addr + Int32(6))
+                    u0 = ld_shared_bf16_to_f32(up_addr)
+                    u1 = ld_shared_bf16_to_f32(up_addr + Int32(2))
+                    u2 = ld_shared_bf16_to_f32(up_addr + Int32(4))
+                    u3 = ld_shared_bf16_to_f32(up_addr + Int32(6))
+                    gh0, gh1, gh2, gh3 = _w4a8_had128_quad(g0, g1, g2, g3, lane)
+                    uh0, uh1, uh2, uh3 = _w4a8_had128_quad(u0, u1, u2, u3, lane)
+                    a0 = self._activated_value(gh0 * rg0, uh0 * ru0, unit_alpha) * sd0
+                    a1 = self._activated_value(gh1 * rg1, uh1 * ru1, unit_alpha) * sd1
+                    a2 = self._activated_value(gh2 * rg2, uh2 * ru2, unit_alpha) * sd2
+                    a3 = self._activated_value(gh3 * rg3, uh3 * ru3, unit_alpha) * sd3
+                    o0, o1, o2, o3 = _w4a8_had128_quad(a0, a1, a2, a3, lane)
+                    st_shared_u32(row_addr, pack_f32x2_to_bfloat2(o0, o1))
+                    st_shared_u32(row_addr + Int32(4), pack_f32x2_to_bfloat2(o2, o3))
         else:
             for nt in cutlass.range_constexpr(4):
                 col = col_base + Int32(nt * 8)
