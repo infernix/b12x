@@ -18,7 +18,10 @@ from cutlass.cute.runtime import make_ptr
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x.moe.fused_moe._impl import _DynamicMoEW4A8Launch, current_cuda_stream
 from b12x.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
-from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_lut_cpu
+from b12x._lib.quant.sqg_e4m3 import (
+    sqg_xor_cheb_t12_direct_lut_cpu,
+    sqg_xor_cheb_t12_lut_cpu,
+)
 from tests._reference.trellis_moe import (
     build_trellis_weight,
     trellis_moe_reference,
@@ -62,6 +65,7 @@ def _run_trellis_dynamic(
     tile_m: int = _TILE_M,
     split_materialized: bool = False,
     coupled: bool = False,
+    direct_lut: bool = False,
 ):
     device = torch.device("cuda")
     torch.manual_seed(seed)
@@ -116,7 +120,12 @@ def _run_trellis_dynamic(
     # [E][K16][N16] (the prepared QSRT layout, shared with the micro path).
     w13_flat = w13_i16.contiguous().view(torch.int32).reshape(-1)
     down_flat = w2_i16.contiguous().view(torch.int32).reshape(-1)
-    t12_lut = sqg_xor_cheb_t12_lut_cpu().to(device)
+    if direct_lut:
+        # Rate-indexed 192 KiB state table; the phase kernels gather from it
+        # in global memory (bit-identical to the T12 staircase law).
+        t12_lut = sqg_xor_cheb_t12_direct_lut_cpu().to(device)
+    else:
+        t12_lut = sqg_xor_cheb_t12_lut_cpu().to(device)
     rot_flat = rotations.reshape(-1).contiguous()
     sentinel_u32 = torch.zeros(1, dtype=torch.uint32, device=device)
     # Dummy packed-FP4 weight tensors: shape-only (TMA descriptors and tile
@@ -177,6 +186,7 @@ def _run_trellis_dynamic(
             num_topk=top_k,
             trellis_bits=_BITS,
             trellis_coupled=coupled,
+            trellis_direct_lut=direct_lut,
             direct_routing=_direct,
             materialize_intermediate=split_materialized or _direct,
             share_input_across_experts=_share,
@@ -264,6 +274,7 @@ def _run_trellis_dynamic(
             ("split", int(split_materialized)),
             ("coupled", int(coupled)),
             ("direct", int(_direct)),
+            ("direct_lut", int(direct_lut)),
             ("share", int(_share)),
             ("activation", activation),
             ("bits", _BITS),
@@ -418,3 +429,26 @@ def test_dynamic_trellis_coupled_matches_scaffold(m: int) -> None:
     assert cosine > 0.995, cosine
     rel_l2 = ((got - want).norm() / want.norm().clamp_min(1e-9)).item()
     assert rel_l2 < 0.12, rel_l2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("coupled", [False, True])
+def test_dynamic_trellis_direct_lut_matches_t12(coupled: bool) -> None:
+    """The direct state table precomposes the XOR-Cheb rank map with the
+    modal T12 staircase, so the split phase kernels decode identical weight
+    bytes under either mode (pinned bit-level by
+    test_trellis_direct_lut_decode). The split path's scattered top-k
+    accumulation is not run-to-run deterministic, so outputs are compared
+    within that noise floor and against the reference."""
+
+    kwargs = dict(
+        activation="situ", E=8, m=96, K=512, n=256, top_k=4,
+        seed=20260812, tile_m=64, split_materialized=True, coupled=coupled,
+    )
+    got_t12, want = _run_trellis_dynamic(**kwargs, direct_lut=False)
+    got_direct, _ = _run_trellis_dynamic(**kwargs, direct_lut=True)
+    assert torch.allclose(got_t12, got_direct, rtol=0.0, atol=0.06)
+    cosine = torch.nn.functional.cosine_similarity(
+        got_direct.reshape(1, -1), want.reshape(1, -1)
+    ).item()
+    assert cosine > 0.995, cosine

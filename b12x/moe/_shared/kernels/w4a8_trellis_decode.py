@@ -19,6 +19,7 @@ from b12x._lib.intrinsics import (
     get_ptr_as_int64,
     ld_shared_u32,
     packed_decode_sqg_xor_cheb_t12_to_e4m3x8,
+    packed_decode_trellis_sqg_direct_lut_to_e4m3x8,
 )
 
 
@@ -159,6 +160,7 @@ def _w4a8_trellis_decode_half(
     n_high: Int32,
     bits: cutlass.Constexpr,
     lut_addr: Int64,
+    direct_lut: cutlass.Constexpr = False,
 ) -> Uint32:
     """Decode one K16 window's E4M3x4 word for one n8 half of an N16 tile."""
 
@@ -167,13 +169,22 @@ def _w4a8_trellis_decode_half(
     merged = (Int64(a) << Int64(32)) | Int64(b)
     win_a = Uint32(merged >> Int64(s2))
     win_b = Uint32(merged >> Int64(s2 + Int32(4 * int(bits))))
-    lo, hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
-        win_a,
-        win_b,
-        lut_addr,
-        int(bits),
-        t12_in_shared=True,
-    )
+    if cutlass.const_expr(direct_lut):
+        lo, hi = packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
+            win_a,
+            win_b,
+            lut_addr,
+            int(bits),
+            rate_indexed=True,
+        )
+    else:
+        lo, hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
+            win_a,
+            win_b,
+            lut_addr,
+            int(bits),
+            t12_in_shared=True,
+        )
     value = lo
     if n_high != Int32(0):
         value = hi
@@ -192,6 +203,7 @@ def _w4a8_trellis_pair_words(
     n_high: Int32,
     bits: cutlass.Constexpr,
     lut_addr: Int64,
+    direct_lut: cutlass.Constexpr = False,
 ):
     """(b0, b1) QMMA E4M3 words for one n8 half and one K32 block.
 
@@ -202,10 +214,10 @@ def _w4a8_trellis_pair_words(
     """
 
     e0 = _w4a8_trellis_decode_half(
-        smem_base, base0_u32, ia, ib, s2, n_high, bits, lut_addr
+        smem_base, base0_u32, ia, ib, s2, n_high, bits, lut_addr, direct_lut
     )
     e1 = _w4a8_trellis_decode_half(
-        smem_base, base1_u32, ia, ib, s2, n_high, bits, lut_addr
+        smem_base, base1_u32, ia, ib, s2, n_high, bits, lut_addr, direct_lut
     )
     c = lane & Int32(3)
     own = e0
@@ -226,6 +238,7 @@ def _w4a8_trellis_decode_both(
     bits: cutlass.Constexpr,
     lut_addr: Int64,
     lut_in_smem: cutlass.Constexpr = True,
+    direct_lut: cutlass.Constexpr = False,
 ):
     """Decode one K16 window's E4M3x4 words for both n8 halves."""
 
@@ -234,13 +247,23 @@ def _w4a8_trellis_decode_both(
     merged = (Int64(a) << Int64(32)) | Int64(b)
     win_a = Uint32(merged >> Int64(s2))
     win_b = Uint32(merged >> Int64(s2 + Int32(4 * int(bits))))
-    return packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
-        win_a,
-        win_b,
-        lut_addr,
-        int(bits),
-        t12_in_shared=bool(lut_in_smem),
-    )
+    if cutlass.const_expr(direct_lut):
+        lo, hi = packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
+            win_a,
+            win_b,
+            lut_addr,
+            int(bits),
+            rate_indexed=True,
+        )
+    else:
+        lo, hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
+            win_a,
+            win_b,
+            lut_addr,
+            int(bits),
+            t12_in_shared=bool(lut_in_smem),
+        )
+    return lo, hi
 
 
 @cute.jit
@@ -255,6 +278,7 @@ def _w4a8_trellis_pair_words_both(
     bits: cutlass.Constexpr,
     lut_addr: Int64,
     lut_in_smem: cutlass.Constexpr = True,
+    direct_lut: cutlass.Constexpr = False,
 ):
     """(b0, b1) QMMA words for both n8 halves of one N16 tile and one K32.
 
@@ -264,10 +288,12 @@ def _w4a8_trellis_pair_words_both(
     """
 
     e0_lo, e0_hi = _w4a8_trellis_decode_both(
-        smem_base, base0_u32, ia, ib, s2, bits, lut_addr, lut_in_smem
+        smem_base, base0_u32, ia, ib, s2, bits, lut_addr, lut_in_smem,
+        direct_lut,
     )
     e1_lo, e1_hi = _w4a8_trellis_decode_both(
-        smem_base, base1_u32, ia, ib, s2, bits, lut_addr, lut_in_smem
+        smem_base, base1_u32, ia, ib, s2, bits, lut_addr, lut_in_smem,
+        direct_lut,
     )
     c = lane & Int32(3)
     own_lo = e0_lo

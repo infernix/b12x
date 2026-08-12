@@ -96,6 +96,7 @@ class W4A8MaterializedPhase1Kernel:
         activation: str = "silu",
         trellis_bits: int | None = None,
         trellis_coupled: bool = False,
+        trellis_direct_lut: bool = False,
     ):
         if source_tile_m not in (64, 128):
             raise ValueError(
@@ -123,11 +124,14 @@ class W4A8MaterializedPhase1Kernel:
         if trellis_coupled and not self.w4a8_trellis:
             raise ValueError("trellis_coupled requires trellis_bits")
         self.trellis_coupled = bool(trellis_coupled)
+        # Direct-LUT decode gathers each byte from the rate-indexed 192 KiB
+        # global state table instead of hashing into a 4 KiB shared T12
+        # staircase; the shared region is then not allocated.
+        self.trellis_direct_lut = bool(trellis_direct_lut) and self.w4a8_trellis
         if self.w4a8_trellis:
-            # Append a 4 KiB shared region for the T12 staircase; every
-            # decode gathers from shared memory.
             self.trellis_lut_offset = self.shared_bytes
-            self.shared_words = (self.shared_bytes + 4096 + 3) // 4
+            if not self.trellis_direct_lut:
+                self.shared_words = (self.shared_bytes + 4096 + 3) // 4
 
     @cute.jit
     def __call__(
@@ -449,6 +453,8 @@ class W4A8MaterializedPhase1Kernel:
             trellis_lut_addr = Int64(
                 smem_base + Int32(self.trellis_lut_offset)
             )
+            if cutlass.const_expr(self.trellis_direct_lut):
+                trellis_lut_addr = trellis_lut.iterator.toint()
 
         self._stage_slice(
             packed_a_u32,
@@ -571,7 +577,8 @@ class W4A8MaterializedPhase1Kernel:
                                 tr_s2,
                                 self.trellis_bits,
                                 trellis_lut_addr,
-                                True,
+                                not self.trellis_direct_lut,
+                                self.trellis_direct_lut,
                             )
                         )
                         gate_b0[th * 2] = g_lo0
@@ -589,7 +596,8 @@ class W4A8MaterializedPhase1Kernel:
                                 tr_s2,
                                 self.trellis_bits,
                                 trellis_lut_addr,
-                                True,
+                                not self.trellis_direct_lut,
+                                self.trellis_direct_lut,
                             )
                         )
                         up_b0[th * 2] = u_lo0
@@ -1065,7 +1073,9 @@ class W4A8MaterializedPhase1Kernel:
 
         storage = smem.allocate(Storage)
         smem_base = shared_ptr_to_u32(storage.words.data_ptr())
-        if cutlass.const_expr(self.w4a8_trellis):
+        if cutlass.const_expr(
+            self.w4a8_trellis and not self.trellis_direct_lut
+        ):
             trellis_lut_u32 = cute.recast_tensor(trellis_lut, cutlass.Uint32)
             lut_copy_i = Int32(tidx)
             while lut_copy_i < Int32(1024):

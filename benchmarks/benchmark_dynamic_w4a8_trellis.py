@@ -41,6 +41,7 @@ def main() -> None:
         help="materialized phase-kernel prefill regime (tile 64)",
     )
     parser.add_argument("--coupled", action="store_true")
+    parser.add_argument("--direct-lut", action="store_true")
     parser.add_argument("--share-input", action="store_true")
     parser.add_argument("--mac", type=int, default=188)
     parser.add_argument("--iterations", type=int, default=None)
@@ -86,6 +87,7 @@ def main() -> None:
         tile_m=64 if args.split else 16,
         split_materialized=args.split,
         coupled=args.coupled,
+        direct_lut=args.direct_lut,
     )
     harness.b12x_compile = orig_compile
     if args.recipe == "w4a8_trellis":
@@ -116,7 +118,8 @@ def main() -> None:
         end.synchronize()
         samples.append(start.elapsed_time(end) * 1000.0 / iters)
     print(
-        f"{args.recipe} M{args.tokens} E{args.experts} "
+        f"{args.recipe}{' direct-lut' if args.direct_lut else ''} "
+        f"M{args.tokens} E{args.experts} "
         f"H{args.hidden_size} I{args.intermediate_size} "
         f"split={args.split} coupled={args.coupled}: "
         f"median {statistics.median(samples):.3f} us  "

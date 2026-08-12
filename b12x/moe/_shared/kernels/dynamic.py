@@ -705,6 +705,7 @@ class MoEDynamicKernelBackend:
         mxfp6_fmt_b: str | None = None,
         trellis_bits: int | None = None,
         trellis_coupled: bool = False,
+        trellis_direct_lut: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         if quant_recipe not in {
@@ -834,6 +835,7 @@ class MoEDynamicKernelBackend:
         if trellis_coupled and not self.w4a8_trellis:
             raise ValueError("trellis_coupled requires quant_recipe='w4a8_trellis'")
         self.trellis_coupled = bool(trellis_coupled)
+        self.trellis_direct_lut = bool(trellis_direct_lut) and self.w4a8_trellis
         self.w4a8_repacked = bool(w4a8_repacked)
         self.direct_routing = bool(direct_routing)
         self.materialize_intermediate = bool(materialize_intermediate)
@@ -883,6 +885,9 @@ class MoEDynamicKernelBackend:
             trellis_coupled=(
                 self.trellis_coupled and self.w4a8_split_materialized
             ),
+            trellis_direct_lut=(
+                self.trellis_direct_lut and self.w4a8_split_materialized
+            ),
             # This helper is gated-only and is never launched unless the split
             # materialized path is active.  Use a valid inert specialization for
             # non-split activations (notably ReLU2) instead of rejecting them
@@ -896,6 +901,9 @@ class MoEDynamicKernelBackend:
                 trellis_bits
                 if self.w4a8_trellis and self.w4a8_split_materialized
                 else None
+            ),
+            trellis_direct_lut=(
+                self.trellis_direct_lut and self.w4a8_split_materialized
             ),
         )
         if self.w4a8_repacked and quant_recipe not in ("w4a8_mx", "w4a8_trellis"):

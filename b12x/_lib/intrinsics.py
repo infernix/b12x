@@ -7151,9 +7151,9 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
     """Decode eight L16 windows through a K-specific direct E4M3 table.
 
     This is the lookup lower-bound primitive: one byte load per reconstructed
-    weight, with one reused address/code scratch pair for all eight lanes.
-    Keeping it as a single PTX block avoids the register blow-up of eight
-    independent DSL address calculations.
+    weight. Every slot owns its own address/code registers so all eight
+    global gathers are in flight together; a shared scratch pair would chain
+    them behind full global-memory latency each.
     """
 
     bits = int(bits)
@@ -7162,34 +7162,52 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
             f"unsupported SQG-normal trellis bitrate {bits}; expected 2, 3, or 4"
         )
     table_offset = ((bits - 2) << 16) if rate_indexed else 0
-    decode_blocks: list[str] = []
+    extract_lines: list[str] = []
+    load_lines: list[str] = []
+    pack_lines: list[str] = []
     for index in range(8):
         source = "$3" if index < 4 else "$2"
         shift = (3 - (index & 3)) * bits
-        target = "$0" if index < 4 else "$1"
+        # Accumulate into declared scratch registers, never directly into
+        # the "=r" outputs: without early-clobber the outputs may alias the
+        # window inputs that later iterations still read.
+        target = "out0" if index < 4 else "out1"
         byte_shift = 8 * (index & 3)
-        extract = f"mov.b32 w, {source};"
         if shift:
-            extract += f" shr.u32 w, w, {shift};"
-        pack = f"shl.b32 code, code, {byte_shift};" if byte_shift else ""
-        decode_blocks.append(
+            extract_lines.append(
+                f"bfe.u32 w{index}, {source}, {shift}, 16;"
+            )
+        else:
+            extract_lines.append(f"and.b32 w{index}, {source}, 0xffff;")
+        load_lines.append(
             f"""
-                {extract}
-                and.b32 w, w, 0xffff;
-                cvt.u64.u32 addr, w;
-                add.u64 addr, addr, $4;
-                ld.global.u8 code, [addr];
-                {pack}
-                or.b32 {target}, {target}, code;
+                cvt.u64.u32 addr{index}, w{index};
+                add.u64 addr{index}, addr{index}, $4;
+                ld.global.u8 w{index}, [addr{index}];
             """
         )
-    asm = """
+        if byte_shift:
+            pack_lines.append(
+                f"shl.b32 w{index}, w{index}, {byte_shift};"
+            )
+        pack_lines.append(f"or.b32 {target}, {target}, w{index};")
+    asm = (
+        """
         {
-            .reg .b32 w,code;
-            .reg .b64 addr;
-            mov.b32 $0, 0;
-            mov.b32 $1, 0;
-    """ + "\n".join(decode_blocks) + "\n}"
+            .reg .b32 out0,out1;
+            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7;
+            .reg .b64 addr0,addr1,addr2,addr3,addr4,addr5,addr6,addr7;
+            mov.b32 out0, 0;
+            mov.b32 out1, 0;
+    """
+        + "\n".join(extract_lines)
+        + "\n".join(load_lines)
+        + "\n".join(pack_lines)
+        + """
+            mov.b32 $0, out0;
+            mov.b32 $1, out1;
+        }"""
+    )
     table_base = Int64(direct_lut_addr) + Int64(table_offset)
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
