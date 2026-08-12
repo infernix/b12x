@@ -388,6 +388,9 @@ class MoEMicroKernelBackend:
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
         w13_layout: str = "w13",
+        weight_layout: str = "modelopt",
+        trellis_bits: int | None = None,
+        trellis_coupled: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         if int(compile_time_phase) not in {0, 1, 2}:
@@ -407,6 +410,23 @@ class MoEMicroKernelBackend:
         swiglu_beta = normalize_swiglu_beta_for_activation(activation, swiglu_beta)
         if w13_layout not in {"w13", "w31"}:
             raise ValueError(f"unsupported micro w13_layout {w13_layout!r}")
+        if weight_layout not in {"modelopt", "trellis3_t256"}:
+            raise ValueError(f"unsupported micro weight_layout {weight_layout!r}")
+        if weight_layout == "trellis3_t256":
+            if trellis_bits not in (2, 3, 4):
+                raise ValueError(
+                    "trellis3_t256 micro weights require trellis_bits in "
+                    f"{{2, 3, 4}}, got {trellis_bits!r}"
+                )
+            if not is_gated_moe_activation(activation):
+                raise ValueError(
+                    "trellis3_t256 micro weights require a gated activation"
+                )
+        elif trellis_bits is not None or trellis_coupled:
+            raise ValueError(
+                "trellis_bits/trellis_coupled require weight_layout "
+                "'trellis3_t256'"
+            )
         self.scale_format = scale_format
         self.scale_format_e8m0_k32 = scale_format == "e8m0_k32"
         self.e8m0_scale_layout = e8m0_scale_layout
@@ -433,6 +453,10 @@ class MoEMicroKernelBackend:
         # UE8M0 block scales (no global scale) so decode numerics track the
         # w4a8 prefill recipe. Same f16 dot-product math and weights.
         self.a8_mx_mode = a8_mx_mode
+        self.weight_layout = weight_layout
+        self.weight_layout_trellis256 = weight_layout == "trellis3_t256"
+        self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
+        self.trellis_coupled = bool(trellis_coupled)
         self._cfg = None
         self.m_const = 0
         self.m1_fc2_onepass = False
@@ -452,6 +476,9 @@ class MoEMicroKernelBackend:
             self.compile_time_phase,
             self.w4a16_mode,
             self.a8_mx_mode,
+            self.weight_layout,
+            self.trellis_bits,
+            self.trellis_coupled,
             self.scale_format,
             self.e8m0_scale_layout,
             self.w13_layout,
@@ -767,7 +794,17 @@ class MoEMicroKernelBackend:
             )
             while n % num_fc1_chunks != 0 or (n // num_fc1_chunks) % _BLOCK_SIZE != 0:
                 num_fc1_chunks += 1
-        if self.a8_mx_mode:
+        if self.weight_layout_trellis256:
+            # One FC1 chunk = one 128-wide intermediate window: the H128
+            # activation boundary needs the whole block in smem_int, and the
+            # warp map covers eight N16 tiles by two K halves per chunk.
+            trellis_chunks = max(1, n // 128)
+            if n % 128:
+                raise ValueError(
+                    "trellis3_t256 micro weights require intermediate % 128 == 0"
+                )
+            num_fc1_chunks = trellis_chunks
+        elif self.a8_mx_mode:
             # Per-32 self-ranging blocks: chunks must hold whole 32-blocks
             # (the default policy picks i_chunk=16 at m<=2).
             # The standalone FC1 phase only writes the contiguous FP32
