@@ -2829,9 +2829,14 @@ def _prepare_qsrt_p22_atom_v2_moe_weights(
             "pure-K2 atom extents must not cross the two transformed "
             "preactivation halves"
         )
-    if intermediate_size != atom_count * 32:
+    source_intermediate_size = atom_count * 32
+    if (
+        intermediate_size < source_intermediate_size
+        or intermediate_size % 128
+    ):
         raise ValueError(
-            "pure-K2 local intermediate size must equal 32 times its atom count"
+            "pure-K2 runtime intermediate size must contain its atom extent "
+            "and close 128-channel postactivation blocks"
         )
     if atom_payload.shape[1] < num_experts * _QSRT_V2_P22_ATOM_BUNDLE_BYTES:
         raise ValueError("pure-K2 atom row is shorter than its expert bundles")
@@ -2854,18 +2859,19 @@ def _prepare_qsrt_p22_atom_v2_moe_weights(
         atom_count, num_experts, _QSRT_V2_P22_ATOM_BUNDLE_BYTES
     )
     hidden_tiles = hidden_size // 16
+    source_local_tiles = source_intermediate_size // 16
     local_tiles = intermediate_size // 16
-    w13 = torch.empty(
+    w13 = torch.zeros(
         (2, num_experts, hidden_tiles, local_tiles, 32),
         dtype=torch.int16,
         device=device,
     )
-    w2 = torch.empty(
+    w2 = torch.zeros(
         (num_experts, local_tiles, hidden_tiles, 32),
         dtype=torch.int16,
         device=device,
     )
-    intermediate_rotations = torch.empty(
+    intermediate_rotations = torch.zeros(
         (num_experts, 3 * intermediate_size),
         dtype=torch.float16,
         device=device,
@@ -2890,17 +2896,23 @@ def _prepare_qsrt_p22_atom_v2_moe_weights(
             if matrix_index < 2:
                 restored = (
                     values.permute(1, 3, 0, 2, 4)
-                    .reshape(count, hidden_tiles, local_tiles, 32)
+                    .reshape(count, hidden_tiles, source_local_tiles, 32)
                 )
-                w13[matrix_index, first_expert : first_expert + count].copy_(
-                    restored
-                )
+                w13[
+                    matrix_index,
+                    first_expert : first_expert + count,
+                    :,
+                    :source_local_tiles,
+                ].copy_(restored)
             else:
                 restored = (
                     values.permute(1, 0, 2, 3, 4)
-                    .reshape(count, local_tiles, hidden_tiles, 32)
+                    .reshape(count, source_local_tiles, hidden_tiles, 32)
                 )
-                w2[first_expert : first_expert + count].copy_(restored)
+                w2[
+                    first_expert : first_expert + count,
+                    :source_local_tiles,
+                ].copy_(restored)
 
             scale_begin = scale_base + matrix_index * 64
             scales = (
@@ -2913,22 +2925,22 @@ def _prepare_qsrt_p22_atom_v2_moe_weights(
                 .to(device=device)
                 .view(torch.float16)
                 .permute(1, 0, 2)
-                .reshape(count, intermediate_size)
+                .reshape(count, source_intermediate_size)
             )
             intermediate_rotations[
                 first_expert : first_expert + count,
-                matrix_index
-                * intermediate_size : (matrix_index + 1)
-                * intermediate_size,
+                matrix_index * intermediate_size : matrix_index
+                * intermediate_size
+                + source_intermediate_size,
             ].copy_(scales)
 
     # The preactivation signs index the interleaved length-2I coordinate and
     # the postactivation signs index the ordinary I coordinate.  Atom-v2's
     # coupled placement makes both slices contiguous for every balanced rank.
     pre_begin = 2 * first_atom_slot * 32
-    pre_count = 2 * intermediate_size
+    pre_count = 2 * source_intermediate_size
     post_begin = first_atom_slot * 32
-    signs = torch.empty(
+    signs = torch.ones(
         (num_experts, 3 * intermediate_size), dtype=torch.float16
     )
     for draw in sorted(set(int(value) for value in rotation_draws.tolist())):
@@ -2937,13 +2949,20 @@ def _prepare_qsrt_p22_atom_v2_moe_weights(
             pre_begin : pre_begin + pre_count
         ]
         post = _qsrt_coupled_rotation_signs(3072, draw=draw, axis=2)[
-            post_begin : post_begin + intermediate_size
+            post_begin : post_begin + source_intermediate_size
         ]
-        signs.index_copy_(
-            0,
-            rows,
-            torch.cat((pre, post)).to(torch.float16).expand(rows.numel(), -1),
+        draw_signs = torch.ones(
+            (rows.numel(), 3 * intermediate_size), dtype=torch.float16
         )
+        draw_signs[:, :pre_count].copy_(
+            pre.to(torch.float16).expand(rows.numel(), -1)
+        )
+        draw_signs[
+            :,
+            2 * intermediate_size : 2 * intermediate_size
+            + source_intermediate_size,
+        ].copy_(post.to(torch.float16).expand(rows.numel(), -1))
+        signs.index_copy_(0, rows, draw_signs)
     coupled_signs = signs.to(device=device, non_blocking=True).contiguous()
 
     # Each balanced rank owns a contiguous slice of the transformed length-2I

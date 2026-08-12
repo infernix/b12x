@@ -1223,6 +1223,145 @@ def _qsrt_coupled_signs_reference(
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_coupled_k2_atom_extent_pads_short_tp_rank() -> None:
+    """Pad a complete 256-channel atom extent to the TP10 runtime width."""
+
+    torch.manual_seed(20260811)
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts = 1
+    hidden = 3584
+    source_intermediate = 256
+    runtime_intermediate = 384
+    source_tiles = source_intermediate // 16
+    runtime_tiles = runtime_intermediate // 16
+    bits = 2
+    first_atom_slot = 24
+    draw = 6
+
+    source_w13 = torch.randint(
+        -32768,
+        32767,
+        (2, experts, hidden // 16, source_tiles, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    source_w2 = torch.randint(
+        -32768,
+        32767,
+        (experts, source_tiles, hidden // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    source_rotations = (
+        0.875
+        + 0.25
+        * torch.rand((experts, 3 * source_intermediate), device=device)
+    ).to(torch.float16)
+    atom_payload = _qsrt_p22_atom_extent_from_payloads(
+        source_w13, source_w2, source_rotations
+    ).cpu()
+    gate_suh = torch.ones((1, hidden), dtype=torch.float16, device=device)
+    up_suh = torch.full(
+        (1, hidden), 1.125, dtype=torch.float16, device=device
+    )
+    down_svh = torch.ones((1, hidden), dtype=torch.float16, device=device)
+
+    prepared = _prepare_qsrt_p22_atom_v2_moe_weights(
+        atom_payload,
+        first_atom_slot=first_atom_slot,
+        rotation_draws=torch.tensor([draw], dtype=torch.uint8),
+        hidden_size=hidden,
+        intermediate_size=runtime_intermediate,
+        num_experts=experts,
+        activation="situ",
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        down_svh=down_svh,
+        params_dtype=torch.float16,
+        codebook="sqg_xor_cheb_t12",
+        tile_config=(128, 128, 128, 128),
+        dummy_scale=None,
+        workspace=None,
+    )
+
+    expected_w13 = torch.zeros(
+        (2, experts, hidden // 16, runtime_tiles, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    expected_w13[:, :, :, :source_tiles].copy_(source_w13)
+    expected_w2 = torch.zeros(
+        (experts, runtime_tiles, hidden // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    expected_w2[:, :source_tiles].copy_(source_w2)
+    torch.testing.assert_close(
+        prepared.w13.view(torch.int16).view_as(expected_w13),
+        expected_w13,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        prepared.w2.view(torch.int16).view_as(expected_w2),
+        expected_w2,
+        rtol=0,
+        atol=0,
+    )
+
+    expected_rotations = torch.zeros(
+        (experts, 3 * runtime_intermediate),
+        dtype=torch.float16,
+        device=device,
+    )
+    for matrix_index in range(3):
+        expected_rotations[
+            :,
+            matrix_index * runtime_intermediate : matrix_index
+            * runtime_intermediate
+            + source_intermediate,
+        ].copy_(
+            source_rotations[
+                :,
+                matrix_index * source_intermediate : (matrix_index + 1)
+                * source_intermediate,
+            ]
+        )
+    expected_signs = torch.ones_like(expected_rotations)
+    expected_signs[:, : 2 * source_intermediate].copy_(
+        _qsrt_coupled_signs_reference(
+            2 * 3072, draw=draw, axis=1, device=device
+        )[
+            2 * first_atom_slot * 32 : 2 * first_atom_slot * 32
+            + 2 * source_intermediate
+        ].reshape(1, -1)
+    )
+    expected_signs[
+        :,
+        2 * runtime_intermediate : 2 * runtime_intermediate
+        + source_intermediate,
+    ].copy_(
+        _qsrt_coupled_signs_reference(
+            3072, draw=draw, axis=2, device=device
+        )[
+            first_atom_slot * 32 : first_atom_slot * 32 + source_intermediate
+        ].reshape(1, -1)
+    )
+    torch.testing.assert_close(
+        prepared.intermediate_rotations[:, : 3 * runtime_intermediate],
+        expected_rotations,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        prepared.intermediate_rotations[:, 3 * runtime_intermediate :],
+        expected_signs,
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("first_atom_slot", [0, 48])
 def test_coupled_k2_fused_moe_matches_transform_reference_and_captures(
     first_atom_slot: int,
