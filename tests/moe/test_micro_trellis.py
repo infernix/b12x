@@ -21,7 +21,15 @@ _BITS = 2
 
 
 def _run_micro_trellis(
-    *, E: int, m: int, K: int, n: int, top_k: int, seed: int, mac: int = 64
+    *,
+    E: int,
+    m: int,
+    K: int,
+    n: int,
+    top_k: int,
+    seed: int,
+    mac: int = 64,
+    coupled: bool = False,
 ):
     device = torch.device("cuda")
     torch.manual_seed(seed)
@@ -45,8 +53,11 @@ def _run_micro_trellis(
     topk_weights = torch.softmax(
         torch.randn(m, top_k, device=device), dim=-1
     ).float()
+    rot_segments = 6 if coupled else 3
     rotations = (
-        torch.rand((E, 3 * n), generator=gen, dtype=torch.float32).add_(0.5)
+        torch.rand(
+            (E, rot_segments * n), generator=gen, dtype=torch.float32
+        ).add_(0.5)
     ).to(device=device, dtype=torch.float16)
 
     oracle = trellis_moe_reference(
@@ -56,7 +67,7 @@ def _run_micro_trellis(
         rotations,
         topk_ids,
         topk_weights,
-        coupled=False,
+        coupled=coupled,
     )
 
     kernel = MoEMicroKernelBackend(
@@ -68,6 +79,7 @@ def _run_micro_trellis(
         scale_format="e8m0_k32",
         weight_layout="trellis3_t256",
         trellis_bits=_BITS,
+        trellis_coupled=coupled,
         share_input_across_experts=True,
         single_token=m == 1,
     )
@@ -120,9 +132,13 @@ def _run_micro_trellis(
 # mac=8 pins the single-CTA FC1 path (trellis_ksplit=1); mac=64 exercises
 # the K-split global-scratch merge at the maximum split factor.
 @pytest.mark.parametrize("mac", [8, 64])
-def test_micro_trellis_matches_reference(m: int, mac: int) -> None:
+@pytest.mark.parametrize("coupled", [False, True])
+def test_micro_trellis_matches_reference(
+    m: int, mac: int, coupled: bool
+) -> None:
     got, want = _run_micro_trellis(
-        E=8, m=m, K=512, n=256, top_k=4, seed=20260815, mac=mac
+        E=8, m=m, K=512, n=256, top_k=4, seed=20260815, mac=mac,
+        coupled=coupled,
     )
     assert torch.isfinite(got).all()
     cosine = torch.nn.functional.cosine_similarity(

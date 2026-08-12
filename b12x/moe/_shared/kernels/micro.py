@@ -2859,65 +2859,204 @@ class MoEMicroKernelBackend:
                         )
                     cute.arch.sync_threads()
                 if tr_final > Int32(0) and warp_id == Int32(0):
-                    # H128 activation boundary (ordinary transform), then
+                    # H128 activation boundary (ordinary or coupled), then
                     # per-32 a8 quantize-dequantize and the plain f16-pair
                     # intermediate store for the trellis FC2 arm.
                     tr_isz = Int32(cfg.n)
                     tr_col = i_chunk_off + lane * Int32(4)
-                    tr_rot = eid * (Int32(3) * tr_isz) + tr_col
-                    bg0 = Float32(trellis_red[lane * Int32(4)])
-                    bg1 = Float32(trellis_red[lane * Int32(4) + Int32(1)])
-                    bg2 = Float32(trellis_red[lane * Int32(4) + Int32(2)])
-                    bg3 = Float32(trellis_red[lane * Int32(4) + Int32(3)])
-                    bu0 = Float32(
-                        trellis_red[Int32(cfg.i_chunk) + lane * Int32(4)]
-                    )
-                    bu1 = Float32(
-                        trellis_red[
-                            Int32(cfg.i_chunk) + lane * Int32(4) + Int32(1)
-                        ]
-                    )
-                    bu2 = Float32(
-                        trellis_red[
-                            Int32(cfg.i_chunk) + lane * Int32(4) + Int32(2)
-                        ]
-                    )
-                    bu3 = Float32(
-                        trellis_red[
-                            Int32(cfg.i_chunk) + lane * Int32(4) + Int32(3)
-                        ]
-                    )
-                    hg0, hg1, hg2, hg3 = _w4a8_had128_quad(
-                        bg0, bg1, bg2, bg3, lane
-                    )
-                    hu0, hu1, hu2, hu3 = _w4a8_had128_quad(
-                        bu0, bu1, bu2, bu3, lane
-                    )
-                    rg0 = Float32(trellis_rotations[tr_rot])
-                    rg1 = Float32(trellis_rotations[tr_rot + Int32(1)])
-                    rg2 = Float32(trellis_rotations[tr_rot + Int32(2)])
-                    rg3 = Float32(trellis_rotations[tr_rot + Int32(3)])
-                    ru0 = Float32(trellis_rotations[tr_rot + tr_isz])
-                    ru1 = Float32(trellis_rotations[tr_rot + tr_isz + Int32(1)])
-                    ru2 = Float32(trellis_rotations[tr_rot + tr_isz + Int32(2)])
-                    ru3 = Float32(trellis_rotations[tr_rot + tr_isz + Int32(3)])
-                    sd0 = Float32(
-                        trellis_rotations[tr_rot + Int32(2) * tr_isz]
-                    )
-                    sd1 = Float32(
-                        trellis_rotations[tr_rot + Int32(2) * tr_isz + Int32(1)]
-                    )
-                    sd2 = Float32(
-                        trellis_rotations[tr_rot + Int32(2) * tr_isz + Int32(2)]
-                    )
-                    sd3 = Float32(
-                        trellis_rotations[tr_rot + Int32(2) * tr_isz + Int32(3)]
-                    )
-                    a0 = self._trellis_gated_value(hg0 * rg0, hu0 * ru0) * sd0
-                    a1 = self._trellis_gated_value(hg1 * rg1, hu1 * ru1) * sd1
-                    a2 = self._trellis_gated_value(hg2 * rg2, hu2 * ru2) * sd2
-                    a3 = self._trellis_gated_value(hg3 * rg3, hu3 * ru3) * sd3
-                    o0, o1, o2, o3 = _w4a8_had128_quad(a0, a1, a2, a3, lane)
+                    if cutlass.const_expr(self.trellis_coupled):
+                        # Coupled interleaved boundary over the six-segment
+                        # per-expert rotations: each 64-neuron block forms
+                        # the pre window [g[a:a+32], u[a:a+32], g[a+32:],
+                        # u[a+32:]], then H128 -> U_A -> H128 -> presign ->
+                        # pairwise gated activation; a warp re-gather closes
+                        # the interleave and U_B -> H128 -> down scale ->
+                        # H128 lands the chunk. Index formulas mirror the
+                        # dynamic-kernel coupled epilogue.
+                        tr_rot6 = eid * (Int32(6) * tr_isz)
+                        tr_chunk = lane >> Int32(3)
+                        tr_chunk_lane = lane & Int32(7)
+                        tr_slot = tr_chunk & Int32(1)
+                        aa0 = Float32(0.0)
+                        aa1 = Float32(0.0)
+                        bb0 = Float32(0.0)
+                        bb1 = Float32(0.0)
+                        for _pb in cutlass.range_constexpr(2):
+                            tr_ci = (
+                                Int32(_pb * 64)
+                                + ((tr_chunk >> Int32(1)) << Int32(5))
+                                + tr_chunk_lane * Int32(4)
+                            )
+                            tr_src = tr_slot * Int32(cfg.i_chunk) + tr_ci
+                            p0 = Float32(trellis_red[tr_src])
+                            p1 = Float32(trellis_red[tr_src + Int32(1)])
+                            p2 = Float32(trellis_red[tr_src + Int32(2)])
+                            p3 = Float32(trellis_red[tr_src + Int32(3)])
+                            h0, h1, h2, h3 = _w4a8_had128_quad(
+                                p0, p1, p2, p3, lane
+                            )
+                            tr_scale = (
+                                tr_rot6
+                                + tr_slot * tr_isz
+                                + i_chunk_off
+                                + tr_ci
+                            )
+                            h0 = h0 * Float32(trellis_rotations[tr_scale])
+                            h1 = h1 * Float32(
+                                trellis_rotations[tr_scale + Int32(1)]
+                            )
+                            h2 = h2 * Float32(
+                                trellis_rotations[tr_scale + Int32(2)]
+                            )
+                            h3 = h3 * Float32(
+                                trellis_rotations[tr_scale + Int32(3)]
+                            )
+                            h0, h1, h2, h3 = _w4a8_had128_quad(
+                                h0, h1, h2, h3, lane
+                            )
+                            tr_sign = (
+                                tr_rot6
+                                + Int32(3) * tr_isz
+                                + i_chunk_off
+                                + i_chunk_off
+                                + Int32(_pb * 128)
+                                + lane * Int32(4)
+                            )
+                            h0 = h0 * Float32(trellis_rotations[tr_sign])
+                            h1 = h1 * Float32(
+                                trellis_rotations[tr_sign + Int32(1)]
+                            )
+                            h2 = h2 * Float32(
+                                trellis_rotations[tr_sign + Int32(2)]
+                            )
+                            h3 = h3 * Float32(
+                                trellis_rotations[tr_sign + Int32(3)]
+                            )
+                            s0 = self._trellis_gated_value(h0, h1)
+                            s1 = self._trellis_gated_value(h2, h3)
+                            if cutlass.const_expr(_pb == 0):
+                                aa0 = s0
+                                aa1 = s1
+                            else:
+                                bb0 = s0
+                                bb1 = s1
+                        # Re-gather: lane owns h positions lane*4..+3 of the
+                        # chunk; window 0 pairs live two-per-lane on lanes
+                        # 0..31 (aa), window 1 on the same lanes (bb).
+                        src0 = (lane & Int32(15)) << Int32(1)
+                        src1 = src0 + Int32(1)
+                        av0 = Float32(cute.arch.shuffle_sync(aa0, src0))
+                        av1 = Float32(cute.arch.shuffle_sync(aa1, src0))
+                        av2 = Float32(cute.arch.shuffle_sync(aa0, src1))
+                        av3 = Float32(cute.arch.shuffle_sync(aa1, src1))
+                        bv0 = Float32(cute.arch.shuffle_sync(bb0, src0))
+                        bv1 = Float32(cute.arch.shuffle_sync(bb1, src0))
+                        bv2 = Float32(cute.arch.shuffle_sync(bb0, src1))
+                        bv3 = Float32(cute.arch.shuffle_sync(bb1, src1))
+                        v0 = av0
+                        v1 = av1
+                        v2 = av2
+                        v3 = av3
+                        if lane >= Int32(16):
+                            v0 = bv0
+                            v1 = bv1
+                            v2 = bv2
+                            v3 = bv3
+                        tr_ub = tr_rot6 + Int32(5) * tr_isz + tr_col
+                        v0 = v0 * Float32(trellis_rotations[tr_ub])
+                        v1 = v1 * Float32(trellis_rotations[tr_ub + Int32(1)])
+                        v2 = v2 * Float32(trellis_rotations[tr_ub + Int32(2)])
+                        v3 = v3 * Float32(trellis_rotations[tr_ub + Int32(3)])
+                        v0, v1, v2, v3 = _w4a8_had128_quad(
+                            v0, v1, v2, v3, lane
+                        )
+                        tr_dn = tr_rot6 + Int32(2) * tr_isz + tr_col
+                        v0 = v0 * Float32(trellis_rotations[tr_dn])
+                        v1 = v1 * Float32(trellis_rotations[tr_dn + Int32(1)])
+                        v2 = v2 * Float32(trellis_rotations[tr_dn + Int32(2)])
+                        v3 = v3 * Float32(trellis_rotations[tr_dn + Int32(3)])
+                        o0, o1, o2, o3 = _w4a8_had128_quad(
+                            v0, v1, v2, v3, lane
+                        )
+                    else:
+                        tr_rot = eid * (Int32(3) * tr_isz) + tr_col
+                        bg0 = Float32(trellis_red[lane * Int32(4)])
+                        bg1 = Float32(trellis_red[lane * Int32(4) + Int32(1)])
+                        bg2 = Float32(trellis_red[lane * Int32(4) + Int32(2)])
+                        bg3 = Float32(trellis_red[lane * Int32(4) + Int32(3)])
+                        bu0 = Float32(
+                            trellis_red[Int32(cfg.i_chunk) + lane * Int32(4)]
+                        )
+                        bu1 = Float32(
+                            trellis_red[
+                                Int32(cfg.i_chunk) + lane * Int32(4) + Int32(1)
+                            ]
+                        )
+                        bu2 = Float32(
+                            trellis_red[
+                                Int32(cfg.i_chunk) + lane * Int32(4) + Int32(2)
+                            ]
+                        )
+                        bu3 = Float32(
+                            trellis_red[
+                                Int32(cfg.i_chunk) + lane * Int32(4) + Int32(3)
+                            ]
+                        )
+                        hg0, hg1, hg2, hg3 = _w4a8_had128_quad(
+                            bg0, bg1, bg2, bg3, lane
+                        )
+                        hu0, hu1, hu2, hu3 = _w4a8_had128_quad(
+                            bu0, bu1, bu2, bu3, lane
+                        )
+                        rg0 = Float32(trellis_rotations[tr_rot])
+                        rg1 = Float32(trellis_rotations[tr_rot + Int32(1)])
+                        rg2 = Float32(trellis_rotations[tr_rot + Int32(2)])
+                        rg3 = Float32(trellis_rotations[tr_rot + Int32(3)])
+                        ru0 = Float32(trellis_rotations[tr_rot + tr_isz])
+                        ru1 = Float32(
+                            trellis_rotations[tr_rot + tr_isz + Int32(1)]
+                        )
+                        ru2 = Float32(
+                            trellis_rotations[tr_rot + tr_isz + Int32(2)]
+                        )
+                        ru3 = Float32(
+                            trellis_rotations[tr_rot + tr_isz + Int32(3)]
+                        )
+                        sd0 = Float32(
+                            trellis_rotations[tr_rot + Int32(2) * tr_isz]
+                        )
+                        sd1 = Float32(
+                            trellis_rotations[
+                                tr_rot + Int32(2) * tr_isz + Int32(1)
+                            ]
+                        )
+                        sd2 = Float32(
+                            trellis_rotations[
+                                tr_rot + Int32(2) * tr_isz + Int32(2)
+                            ]
+                        )
+                        sd3 = Float32(
+                            trellis_rotations[
+                                tr_rot + Int32(2) * tr_isz + Int32(3)
+                            ]
+                        )
+                        a0 = (
+                            self._trellis_gated_value(hg0 * rg0, hu0 * ru0)
+                            * sd0
+                        )
+                        a1 = (
+                            self._trellis_gated_value(hg1 * rg1, hu1 * ru1)
+                            * sd1
+                        )
+                        a2 = (
+                            self._trellis_gated_value(hg2 * rg2, hu2 * ru2)
+                            * sd2
+                        )
+                        a3 = (
+                            self._trellis_gated_value(hg3 * rg3, hu3 * ru3)
+                            * sd3
+                        )
+                        o0, o1, o2, o3 = _w4a8_had128_quad(a0, a1, a2, a3, lane)
                     # Per-32 UE8M0 amax across the octet owning each block.
                     blk_peak = fmax_f32(
                         fmax_f32(fmax_f32(o0, -o0), fmax_f32(o1, -o1)),
