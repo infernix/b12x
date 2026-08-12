@@ -4716,6 +4716,18 @@ def _w4a8_prepared_dict(prepared: object) -> dict[str, torch.Tensor]:
 
     if isinstance(prepared, dict):
         values = prepared
+    elif getattr(prepared, "weight_layout", None) == "trellis3_t256":
+        # Trellis-native representation: the rp slots carry the
+        # projection-major payloads and the sfb slots carry the fp16
+        # boundary rotations. The dynamic launch keys trellis mode off
+        # that dtype; the kernel's SFB operands are compile-time dead
+        # (identity UE8M0 word).
+        values = {
+            "w13_rp": prepared.w13,
+            "w13_sfb": prepared.intermediate_rotations,
+            "w2_rp": prepared.w2,
+            "w2_sfb": prepared.intermediate_rotations,
+        }
     else:
         values = {
             name: getattr(prepared, name)
@@ -8939,6 +8951,8 @@ def _get_dynamic_kernel(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    trellis_bits: int = 0,
+    trellis_coupled: bool = False,
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
     # w6a8_mx rides the nvfp4-shaped launch ABI (no repack/residual operands)
@@ -9027,6 +9041,8 @@ def _get_dynamic_kernel(
         bool(w4a8_repacked),
         bool(direct_routing),
         materialize_intermediate,
+        int(trellis_bits),
+        bool(trellis_coupled),
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -9074,7 +9090,12 @@ def _get_dynamic_kernel(
     kernel_kwargs["swiglu_alpha"] = swiglu_alpha
     kernel_kwargs["swiglu_beta"] = swiglu_beta
     kernel_kwargs["direct_routing"] = bool(direct_routing)
-    if is_w4a8:
+    if is_w4a8 and int(trellis_bits) > 0:
+        kernel_kwargs["quant_recipe"] = "w4a8_trellis"
+        kernel_kwargs["w4a8_repacked"] = True
+        kernel_kwargs["trellis_bits"] = int(trellis_bits)
+        kernel_kwargs["trellis_coupled"] = bool(trellis_coupled)
+    elif is_w4a8:
         kernel_kwargs["quant_recipe"] = quant_mode
         kernel_kwargs["w4a8_repacked"] = bool(w4a8_repacked)
     elif is_w6a8:
@@ -9311,6 +9332,21 @@ def _get_dynamic_kernel(
         1,
         1,
         current_cuda_stream(),
+        *(
+            (
+                make_ptr(
+                    cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
+                ),
+                make_ptr(
+                    cutlass.Float16,
+                    16,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
+            )
+            if int(trellis_bits) > 0
+            else ()
+        ),
         compile_spec=KernelCompileSpec.from_key(
             "integration.tp_moe.dynamic",
             1,
@@ -9393,6 +9429,42 @@ def _launch_dynamic_flat(
     volatile_launch_state: bool,
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
+    # A trellis-native w4a8 binding carries the fp16 boundary rotations in
+    # the sfb slot (the QMMA repack stores int32 scale words there); the
+    # trellis geometry is recovered from the operand extents.
+    w4a8_trellis = (
+        _is_w4a8_quant_mode(quant_mode) and w13_sfb_rp.dtype == torch.float16
+    )
+    trellis_bits = 0
+    trellis_coupled = False
+    trellis_lut_tensor = None
+    if w4a8_trellis:
+        from b12x.moe._shared.kernels.w4a16.kernel import (
+            _trellis256_execution_lut,
+        )
+
+        trellis_lut_tensor = _trellis256_execution_lut(
+            a.device, "sqg_xor_cheb_t12"
+        )
+        payload_u32 = w13_rp.numel() * w13_rp.element_size() // 4
+        window_words = 2 * E * (k // 16) * (n // 16) * 8
+        trellis_bits = payload_u32 // window_words
+        if (
+            trellis_bits not in (2, 3, 4)
+            or trellis_bits * window_words != payload_u32
+        ):
+            raise RuntimeError(
+                "w4a8 trellis payload extent does not match the launch "
+                f"shape (E={E}, k={k}, n={n}, payload_u32={payload_u32})"
+            )
+        rot_elems = w13_sfb_rp.numel()
+        if rot_elems == E * 6 * n:
+            trellis_coupled = True
+        elif rot_elems != E * 3 * n:
+            raise RuntimeError(
+                "w4a8 trellis rotation extent must be E*3n or E*6n fp16 "
+                f"values, got {rot_elems} for E={E}, n={n}"
+            )
     if w4a8_repacked and int(n) % 128 != 0:
         # Half-aligned ceil-tiled rp/sfb storage is byte-identical to the
         # storage of zero-padded n_pad weights, and the dynamic kernel has no
@@ -9516,6 +9588,8 @@ def _launch_dynamic_flat(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        trellis_bits=trellis_bits,
+        trellis_coupled=trellis_coupled,
     )
     if volatile_launch_state:
         barrier_count.zero_()
@@ -9600,6 +9674,14 @@ def _launch_dynamic_flat(
         physical_tiles_capacity,
         mac,
         current_cuda_stream(),
+        *(
+            (
+                _gptr(cutlass.Uint8, trellis_lut_tensor),
+                _gptr(cutlass.Float16, w13_sfb_rp),
+            )
+            if w4a8_trellis
+            else ()
+        ),
     )
 
 

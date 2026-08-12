@@ -117,7 +117,9 @@ def _make_expert_weights(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("m", [1, 4])
+# m in {1, 4} lands in the micro band; m=16 exceeds it and exercises the
+# dynamic backend's w4a8_trellis recipe through the same public surface.
+@pytest.mark.parametrize("m", [1, 4, 16])
 def test_w4a8_trellis_micro_serving_matches_reference(m: int) -> None:
     coupled = True
     device = torch.device("cuda", torch.cuda.current_device())
