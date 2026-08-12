@@ -35,6 +35,7 @@ from b12x._lib.intrinsics import (
     fp4_dot8_sum_f32acc,
     get_ptr_as_int64,
     ld_global_acquire_i32,
+    ld_global_cg_f32,
     ld_global_nc_u32,
     ld_global_nc_v4_u32,
     mx_scale_from_amax32,
@@ -43,7 +44,9 @@ from b12x._lib.intrinsics import (
     pack_f32x2_to_f16x2,
     prefetch_global_l2,
     quant_dequant_2,
+    red_add_global_f32,
     spin_wait_global_eq_i32,
+    st_global_f32,
     st_global_i32,
     st_global_release_i32,
     threadfence,
@@ -470,6 +473,8 @@ class MoEMicroKernelBackend:
         self.weight_layout_trellis256 = weight_layout == "trellis3_t256"
         self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
         self.trellis_coupled = bool(trellis_coupled)
+        self.trellis_ksplit = 1
+        self.trellis_scratch_u32 = 0
         self._cfg = None
         self.m_const = 0
         self.m1_fc2_onepass = False
@@ -492,6 +497,7 @@ class MoEMicroKernelBackend:
             self.weight_layout,
             self.trellis_bits,
             self.trellis_coupled,
+            self.trellis_ksplit,
             self.scale_format,
             self.e8m0_scale_layout,
             self.w13_layout,
@@ -837,7 +843,9 @@ class MoEMicroKernelBackend:
         w4a16_rowpair_fc2 = bool(self.w4a16_mode and m > 1 and cfg.fc2_n_chunks == 1)
         m1_half_cta_fc2 = bool(self.compile_time_phase == 2 and m == 1)
         m1_fc2_rows = _K_PER_CTA if m1_half_cta_fc2 else _K_PER_CTA * 2
-        if m == 1:
+        if self.weight_layout_trellis256:
+            fc2_tasks = (m * cfg.k_dim) // 16
+        elif m == 1:
             fc2_tasks = cfg.k_dim // m1_fc2_rows
         elif w4a16_rowpair_fc2:
             fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 2)
@@ -845,6 +853,22 @@ class MoEMicroKernelBackend:
             fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 4)
         if max_active_ctas is None:
             max_active_ctas = min(get_num_sm(device), get_max_active_clusters(1))
+        self.trellis_ksplit = 1
+        self.trellis_scratch_u32 = 0
+        if self.weight_layout_trellis256 and self.compile_time_phase != 2:
+            # The serial per-warp decode chain over the K16 range dominates
+            # FC1 at decode sizes while most of the grid idles. Split each
+            # (route, chunk) task's K16 range across several CTAs; partial
+            # raw gate/up sums merge through a float scratch region placed
+            # behind the intermediate buffer (one 2*i_chunk block plus one
+            # arrival counter per base task), and the last-arriving CTA
+            # applies alpha and runs the activation boundary.
+            self.trellis_ksplit = max(
+                1, min(8, int(max_active_ctas) // max(1, fc1_tasks))
+            )
+            if self.trellis_ksplit > 1:
+                self.trellis_scratch_u32 = fc1_tasks * (2 * cfg.i_chunk + 1)
+            fc1_tasks = fc1_tasks * self.trellis_ksplit
         if self.compile_time_phase == 1:
             # A standalone FC1 phase has no cooperative-grid requirement.
             grid_x = max(1, fc1_tasks)
@@ -870,6 +894,10 @@ class MoEMicroKernelBackend:
         self.m1_fc2_rows_per_cta = m1_fc2_rows
         self.launch_block_dim = _K_PER_CTA * 16 if m1_half_cta_fc2 else _BLOCK_DIM
         self.grid_x = grid_x
+        # Required inter_fp32 element count: the per-token intermediate plus
+        # the trellis K-split scratch tail. Callers must zero-initialize; the
+        # kernel restores the tail to zero after each use.
+        self.inter_alloc_u32 = m * cfg.inter_u32 + self.trellis_scratch_u32
 
     @cute.jit
     def _resident_grid_barrier(
@@ -2385,6 +2413,7 @@ class MoEMicroKernelBackend:
                 topk_ids,
                 topk_weights,
                 scatter_output,
+                trellis_lut,
             )
             return
         is_cta_leader = Int32(1) if Int32(tidx) == Int32(0) else Int32(0)
@@ -2413,6 +2442,19 @@ class MoEMicroKernelBackend:
             trellis_red = cute.make_tensor(
                 trellis_red_ptr, cute.make_layout(2 * cfg.i_chunk)
             )
+            # T12 staircase in shared memory: every decode gathers eight
+            # bytes from it, so keep those trips off the L1/global path.
+            trellis_lut_smem_ptr = cute.arch.alloc_smem(Uint32, 1024)
+            trellis_lut_smem = cute.make_tensor(
+                trellis_lut_smem_ptr, cute.make_layout(1024)
+            )
+            trellis_lut_u32 = cute.recast_tensor(trellis_lut, Uint32)
+            lut_i = tidx
+            while lut_i < Int32(1024):
+                trellis_lut_smem[lut_i] = Uint32(trellis_lut_u32[lut_i])
+                lut_i += Int32(self.launch_block_dim)
+            cute.arch.sync_threads()
+            trellis_lut_smem_addr = trellis_lut_smem_ptr.toint()
 
         warp_id = tidx // Int32(32)
         lane = tidx % Int32(32)
@@ -2422,13 +2464,17 @@ class MoEMicroKernelBackend:
         # ===================================================================
         # PHASE 1: FC1 over route-order tasks
         # ===================================================================
-        fc1_task_count = m_val * Int32(cfg.num_topk * cfg.fc1_chunks)
+        fc1_task_count = m_val * Int32(
+            cfg.num_topk * cfg.fc1_chunks * self.trellis_ksplit
+        )
         fc1_task = Int32(bidx_x)
         if cutlass.const_expr(cfg.k_segments == 2):
             buf_idx = Int32(0)
             # Pre-loop: quantize first task into buf[0]
             if fc1_task < fc1_task_count:
-                route_idx_0 = fc1_task // Int32(cfg.fc1_chunks)
+                route_idx_0 = fc1_task // Int32(
+                    cfg.fc1_chunks * self.trellis_ksplit
+                )
                 t0 = route_idx_0 // Int32(cfg.num_topk)
                 eid_addr_0 = t0 * Int32(cfg.num_topk) + (
                     route_idx_0 - t0 * Int32(cfg.num_topk)
@@ -2501,7 +2547,13 @@ class MoEMicroKernelBackend:
                 route_count = m_val * Int32(cfg.num_topk)
                 chunk_idx = fc1_task // route_count
                 route_idx = fc1_task - chunk_idx * route_count
+            elif cutlass.const_expr(self.trellis_ksplit > 1):
+                base_task = fc1_task // Int32(self.trellis_ksplit)
+                tr_split = fc1_task - base_task * Int32(self.trellis_ksplit)
+                route_idx = base_task // Int32(cfg.fc1_chunks)
+                chunk_idx = base_task - route_idx * Int32(cfg.fc1_chunks)
             else:
+                tr_split = Int32(0)
                 route_idx = fc1_task // Int32(cfg.fc1_chunks)
                 chunk_idx = fc1_task - route_idx * Int32(cfg.fc1_chunks)
             t = route_idx // Int32(cfg.num_topk)
@@ -2609,7 +2661,10 @@ class MoEMicroKernelBackend:
                 tr_tu = 8 * tr_bits
                 tr_k16_cnt = cfg.k_dim // 16
                 tr_n16_cnt = cfg.n // 16
-                tr_k16_half = (tr_k16_cnt + 1) // 2
+                tr_span = (
+                    tr_k16_cnt + self.trellis_ksplit - 1
+                ) // self.trellis_ksplit
+                tr_k16_half = (tr_span + 1) // 2
                 tr_eu = tr_k16_cnt * tr_n16_cnt * tr_tu
                 tr_row_stride = tr_n16_cnt * tr_tu
                 tr_n16_local = warp_id & Int32(7)
@@ -2617,7 +2672,7 @@ class MoEMicroKernelBackend:
                 tr_n16g = (i_chunk_off >> Int32(4)) + tr_n16_local
                 tr_r = lane & Int32(3)
                 tr_ia, tr_ib, tr_s2 = _w4a8_trellis_lane_geom(lane, tr_bits)
-                tr_lut_addr = trellis_lut.iterator.toint()
+                tr_lut_addr = trellis_lut_smem_addr
                 tr_base_g = (
                     Int64(eid) * Int64(tr_eu)
                     + Int64(tr_n16g) * Int64(tr_tu)
@@ -2627,16 +2682,24 @@ class MoEMicroKernelBackend:
                 pg_hi = Float32(0.0)
                 pu_lo = Float32(0.0)
                 pu_hi = Float32(0.0)
-                tr_k16 = tr_khalf * Int32(tr_k16_half)
+                tr_k16_hi = tr_split * Int32(tr_span) + Int32(tr_span)
+                if tr_k16_hi > Int32(tr_k16_cnt):
+                    tr_k16_hi = Int32(tr_k16_cnt)
+                tr_k16 = tr_split * Int32(tr_span) + tr_khalf * Int32(
+                    tr_k16_half
+                )
                 tr_k16_end = tr_k16 + Int32(tr_k16_half)
-                if tr_k16_end > Int32(tr_k16_cnt):
-                    tr_k16_end = Int32(tr_k16_cnt)
+                if tr_k16_end > tr_k16_hi:
+                    tr_k16_end = tr_k16_hi
                 while tr_k16 < tr_k16_end:
+                    # Issue both projections' ring words and the shared
+                    # activation pairs up front so the two decodes overlap.
                     tr_xb = tr_k16 * Int32(8) + tr_k16 // Int32(8)
-                    x01 = Uint32(smem_xh[tr_xb + tr_r])
-                    x89 = Uint32(smem_xh[tr_xb + tr_r + Int32(4)])
                     tr_off_g = (
                         tr_base_g + Int64(tr_k16) * Int64(tr_row_stride)
+                    )
+                    tr_off_u = (
+                        tr_base_u + Int64(tr_k16) * Int64(tr_row_stride)
                     )
                     ga = ld_global_nc_u32(
                         w1_base_addr + ((tr_off_g + Int64(tr_ia)) << Int64(2))
@@ -2644,37 +2707,36 @@ class MoEMicroKernelBackend:
                     gb = ld_global_nc_u32(
                         w1_base_addr + ((tr_off_g + Int64(tr_ib)) << Int64(2))
                     )
-                    merged = (Int64(ga) << Int64(32)) | Int64(gb)
-                    win_a = Uint32(merged >> Int64(tr_s2))
-                    win_b = Uint32(merged >> Int64(tr_s2 + Int32(4 * tr_bits)))
-                    g_lo, g_hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
-                        win_a, win_b, tr_lut_addr, tr_bits
-                    )
-                    g01, g23 = fp8x4_e4m3_to_half2x2(g_lo)
-                    gh01, gh23 = fp8x4_e4m3_to_half2x2(g_hi)
-                    pg_lo += _f16x2_dot_sum_f32acc(g01, x01)
-                    pg_lo += _f16x2_dot_sum_f32acc(g23, x89)
-                    pg_hi += _f16x2_dot_sum_f32acc(gh01, x01)
-                    pg_hi += _f16x2_dot_sum_f32acc(gh23, x89)
-                    tr_off_u = (
-                        tr_base_u + Int64(tr_k16) * Int64(tr_row_stride)
-                    )
                     ua = ld_global_nc_u32(
                         w1_base_addr + ((tr_off_u + Int64(tr_ia)) << Int64(2))
                     )
                     ub = ld_global_nc_u32(
                         w1_base_addr + ((tr_off_u + Int64(tr_ib)) << Int64(2))
                     )
+                    x01 = Uint32(smem_xh[tr_xb + tr_r])
+                    x89 = Uint32(smem_xh[tr_xb + tr_r + Int32(4)])
+                    merged = (Int64(ga) << Int64(32)) | Int64(gb)
+                    win_a = Uint32(merged >> Int64(tr_s2))
+                    win_b = Uint32(merged >> Int64(tr_s2 + Int32(4 * tr_bits)))
                     merged_u = (Int64(ua) << Int64(32)) | Int64(ub)
                     win_ua = Uint32(merged_u >> Int64(tr_s2))
                     win_ub = Uint32(
                         merged_u >> Int64(tr_s2 + Int32(4 * tr_bits))
                     )
-                    u_lo, u_hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
-                        win_ua, win_ub, tr_lut_addr, tr_bits
+                    g_lo, g_hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
+                        win_a, win_b, tr_lut_addr, tr_bits, t12_in_shared=True
                     )
+                    u_lo, u_hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
+                        win_ua, win_ub, tr_lut_addr, tr_bits, t12_in_shared=True
+                    )
+                    g01, g23 = fp8x4_e4m3_to_half2x2(g_lo)
+                    gh01, gh23 = fp8x4_e4m3_to_half2x2(g_hi)
                     u01, u23 = fp8x4_e4m3_to_half2x2(u_lo)
                     uh01, uh23 = fp8x4_e4m3_to_half2x2(u_hi)
+                    pg_lo += _f16x2_dot_sum_f32acc(g01, x01)
+                    pg_lo += _f16x2_dot_sum_f32acc(g23, x89)
+                    pg_hi += _f16x2_dot_sum_f32acc(gh01, x01)
+                    pg_hi += _f16x2_dot_sum_f32acc(gh23, x89)
                     pu_lo += _f16x2_dot_sum_f32acc(u01, x01)
                     pu_lo += _f16x2_dot_sum_f32acc(u23, x89)
                     pu_hi += _f16x2_dot_sum_f32acc(uh01, x01)
@@ -2704,21 +2766,99 @@ class MoEMicroKernelBackend:
                     trellis_red[Int32(cfg.i_chunk) + tr_row_lo] = pu_lo
                     trellis_red[Int32(cfg.i_chunk) + tr_row_hi] = pu_hi
                 cute.arch.sync_threads()
-                if tr_khalf == Int32(0) and tr_leader:
-                    trellis_red[tr_row_lo] = alpha_fc1 * (
-                        trellis_red[tr_row_lo] + pg_lo
+                if cutlass.const_expr(self.trellis_ksplit > 1):
+                    # K-split merge: this CTA holds only its K16 range's
+                    # partial sums, so keep them raw (alpha waits for the
+                    # full sum), reduce them into the task's global scratch
+                    # block, and let the last-arriving CTA read the merged
+                    # values back, restore the scratch to zero, and run the
+                    # boundary.
+                    if tr_khalf == Int32(0) and tr_leader:
+                        trellis_red[tr_row_lo] = trellis_red[tr_row_lo] + pg_lo
+                        trellis_red[tr_row_hi] = trellis_red[tr_row_hi] + pg_hi
+                        trellis_red[Int32(cfg.i_chunk) + tr_row_lo] = (
+                            trellis_red[Int32(cfg.i_chunk) + tr_row_lo] + pu_lo
+                        )
+                        trellis_red[Int32(cfg.i_chunk) + tr_row_hi] = (
+                            trellis_red[Int32(cfg.i_chunk) + tr_row_hi] + pu_hi
+                        )
+                    cute.arch.sync_threads()
+                    tr_task_scr = route_idx * Int32(cfg.fc1_chunks) + chunk_idx
+                    tr_scr_word = (
+                        m_val * Int32(cfg.inter_u32)
+                        + tr_task_scr * Int32(2 * cfg.i_chunk)
+                        + tidx
                     )
-                    trellis_red[tr_row_hi] = alpha_fc1 * (
-                        trellis_red[tr_row_hi] + pg_hi
+                    if tidx < Int32(2 * cfg.i_chunk):
+                        red_add_global_f32(
+                            get_ptr_as_int64(intermediate, tr_scr_word),
+                            Float32(trellis_red[tidx]),
+                        )
+                    threadfence()
+                    cute.arch.sync_threads()
+                    tr_cnt_word = (
+                        m_val
+                        * Int32(
+                            cfg.inter_u32
+                            + cfg.num_topk * cfg.fc1_chunks * 2 * cfg.i_chunk
+                        )
+                        + tr_task_scr
                     )
-                    trellis_red[Int32(cfg.i_chunk) + tr_row_lo] = alpha_fc1 * (
-                        trellis_red[Int32(cfg.i_chunk) + tr_row_lo] + pu_lo
-                    )
-                    trellis_red[Int32(cfg.i_chunk) + tr_row_hi] = alpha_fc1 * (
-                        trellis_red[Int32(cfg.i_chunk) + tr_row_hi] + pu_hi
-                    )
-                cute.arch.sync_threads()
-                if warp_id == Int32(0):
+                    if tidx == Int32(0):
+                        arrived = atomic_add_global_i32(
+                            get_ptr_as_int64(intermediate, tr_cnt_word),
+                            Int32(1),
+                        )
+                        tr_flag = Float32(0.0)
+                        if arrived == Int32(self.trellis_ksplit - 1):
+                            tr_flag = Float32(1.0)
+                        reduce_scratch[0] = tr_flag
+                    cute.arch.sync_threads()
+                    tr_final = Int32(0)
+                    if Float32(reduce_scratch[0]) > Float32(0.5):
+                        tr_final = Int32(1)
+                    if tr_final > Int32(0):
+                        threadfence()
+                        if tidx < Int32(2 * cfg.i_chunk):
+                            tr_sum = ld_global_cg_f32(
+                                get_ptr_as_int64(intermediate, tr_scr_word)
+                            )
+                            trellis_red[tidx] = alpha_fc1 * tr_sum
+                            st_global_f32(
+                                get_ptr_as_int64(intermediate, tr_scr_word),
+                                Float32(0.0),
+                            )
+                        if tidx == Int32(0):
+                            st_global_i32(
+                                get_ptr_as_int64(intermediate, tr_cnt_word),
+                                Int32(0),
+                            )
+                    cute.arch.sync_threads()
+                else:
+                    tr_final = Int32(1)
+                    if tr_khalf == Int32(0) and tr_leader:
+                        trellis_red[tr_row_lo] = alpha_fc1 * (
+                            trellis_red[tr_row_lo] + pg_lo
+                        )
+                        trellis_red[tr_row_hi] = alpha_fc1 * (
+                            trellis_red[tr_row_hi] + pg_hi
+                        )
+                        trellis_red[Int32(cfg.i_chunk) + tr_row_lo] = (
+                            alpha_fc1
+                            * (
+                                trellis_red[Int32(cfg.i_chunk) + tr_row_lo]
+                                + pu_lo
+                            )
+                        )
+                        trellis_red[Int32(cfg.i_chunk) + tr_row_hi] = (
+                            alpha_fc1
+                            * (
+                                trellis_red[Int32(cfg.i_chunk) + tr_row_hi]
+                                + pu_hi
+                            )
+                        )
+                    cute.arch.sync_threads()
+                if tr_final > Int32(0) and warp_id == Int32(0):
                     # H128 activation boundary (ordinary transform), then
                     # per-32 a8 quantize-dequantize and the plain f16-pair
                     # intermediate store for the trellis FC2 arm.
@@ -5211,7 +5351,121 @@ class MoEMicroKernelBackend:
             topk_ids,
             topk_weights,
             scatter_output,
+            trellis_lut,
         )
+
+    @cute.jit
+    def _run_fc2_trellis(
+        self,
+        bidx_x: Int32,
+        gdim_x: Int32,
+        warp_id: Int32,
+        lane: Int32,
+        m_val: Int32,
+        w2_base_addr: Int64,
+        w2_alphas: cute.Tensor,
+        intermediate: cute.Tensor,
+        topk_ids: cute.Tensor,
+        topk_weights: cute.Tensor,
+        scatter_output: cute.Tensor,
+        trellis_lut: cute.Tensor,
+    ):
+        """Trellis FC2: one 16-row output tile per task, one K16 window of
+        the intermediate per warp step, top-k routes accumulated serially
+        against the plain f16-pair intermediate the trellis FC1 stored."""
+
+        cfg = self._cfg
+        tr_bits = self.trellis_bits
+        tr_tu = 8 * tr_bits
+        tr_k16i = cfg.n // 16
+        tr_n16k = cfg.k_dim // 16
+        tr_row2 = tr_n16k * tr_tu
+        tr_eu2 = tr_k16i * tr_row2
+        tr_r = lane & Int32(3)
+        tr_ia, tr_ib, tr_s2 = _w4a8_trellis_lane_geom(lane, tr_bits)
+        fc2_lut_ptr = cute.arch.alloc_smem(Uint32, 1024)
+        fc2_lut = cute.make_tensor(fc2_lut_ptr, cute.make_layout(1024))
+        fc2_lut_u32 = cute.recast_tensor(trellis_lut, Uint32)
+        fc2_tid = warp_id * Int32(32) + lane
+        lut_i = fc2_tid
+        while lut_i < Int32(1024):
+            fc2_lut[lut_i] = Uint32(fc2_lut_u32[lut_i])
+            lut_i += Int32(_NUM_WARPS * 32)
+        cute.arch.sync_threads()
+        tr_lut_addr = fc2_lut_ptr.toint()
+        red_ptr = cute.arch.alloc_smem(Float32, _NUM_WARPS * 16)
+        red = cute.make_tensor(red_ptr, cute.make_layout(_NUM_WARPS * 16))
+        task_count = m_val * Int32(tr_n16k)
+        fc2_task = Int32(bidx_x)
+        while fc2_task < task_count:
+            tile = fc2_task % Int32(tr_n16k)
+            t = fc2_task // Int32(tr_n16k)
+            acc_lo = Float32(0.0)
+            acc_hi = Float32(0.0)
+            kk = Int32(0)
+            while kk < Int32(cfg.num_topk):
+                eid_addr = t * Int32(cfg.num_topk) + kk
+                eid = Int32(topk_ids[eid_addr])
+                scale_lane = Float32(w2_alphas[eid]) * Float32(
+                    topk_weights[eid_addr]
+                )
+                base_e = Int64(eid) * Int64(tr_eu2) + Int64(tile) * Int64(tr_tu)
+                x_base = t * Int32(cfg.inter_u32) + kk * Int32(cfg.n // 2)
+                p_lo = Float32(0.0)
+                p_hi = Float32(0.0)
+                w16 = warp_id
+                while w16 < Int32(tr_k16i):
+                    x01 = Uint32(
+                        intermediate[x_base + w16 * Int32(8) + tr_r]
+                    )
+                    x89 = Uint32(
+                        intermediate[x_base + w16 * Int32(8) + tr_r + Int32(4)]
+                    )
+                    off = base_e + Int64(w16) * Int64(tr_row2)
+                    wa = ld_global_nc_u32(
+                        w2_base_addr + ((off + Int64(tr_ia)) << Int64(2))
+                    )
+                    wb = ld_global_nc_u32(
+                        w2_base_addr + ((off + Int64(tr_ib)) << Int64(2))
+                    )
+                    merged = (Int64(wa) << Int64(32)) | Int64(wb)
+                    win_a = Uint32(merged >> Int64(tr_s2))
+                    win_b = Uint32(
+                        merged >> Int64(tr_s2 + Int32(4 * tr_bits))
+                    )
+                    d_lo, d_hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
+                        win_a, win_b, tr_lut_addr, tr_bits, t12_in_shared=True
+                    )
+                    d01, d23 = fp8x4_e4m3_to_half2x2(d_lo)
+                    dh01, dh23 = fp8x4_e4m3_to_half2x2(d_hi)
+                    p_lo += _f16x2_dot_sum_f32acc(d01, x01)
+                    p_lo += _f16x2_dot_sum_f32acc(d23, x89)
+                    p_hi += _f16x2_dot_sum_f32acc(dh01, x01)
+                    p_hi += _f16x2_dot_sum_f32acc(dh23, x89)
+                    w16 += Int32(_NUM_WARPS)
+                acc_lo += scale_lane * p_lo
+                acc_hi += scale_lane * p_hi
+                kk += Int32(1)
+            acc_lo += Float32(cute.arch.shuffle_sync_bfly(acc_lo, offset=1))
+            acc_lo += Float32(cute.arch.shuffle_sync_bfly(acc_lo, offset=2))
+            acc_hi += Float32(cute.arch.shuffle_sync_bfly(acc_hi, offset=1))
+            acc_hi += Float32(cute.arch.shuffle_sync_bfly(acc_hi, offset=2))
+            tr_n0 = (
+                Int32(2) * (lane >> Int32(3)) + ((lane >> Int32(2)) & Int32(1))
+            )
+            if (lane & Int32(3)) == Int32(0):
+                red[warp_id * Int32(16) + tr_n0] = acc_lo
+                red[warp_id * Int32(16) + tr_n0 + Int32(8)] = acc_hi
+            cute.arch.sync_threads()
+            if warp_id == Int32(0) and lane < Int32(16):
+                total = Float32(0.0)
+                for _w in cutlass.range_constexpr(_NUM_WARPS):
+                    total += Float32(red[Int32(_w * 16) + lane])
+                scatter_output[
+                    t * Int32(cfg.k_dim) + tile * Int32(16) + lane
+                ] = BFloat16(total)
+            cute.arch.sync_threads()
+            fc2_task += Int32(gdim_x)
 
     @cute.jit
     def _run_fc2(
@@ -5228,6 +5482,7 @@ class MoEMicroKernelBackend:
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
         scatter_output: cute.Tensor,
+        trellis_lut: cute.Tensor,
     ):
         # FC2 is intentionally factored out so native NVFP4 decode can run it
         # in a second, non-cooperative launch after FC1 has materialized the
@@ -5235,8 +5490,25 @@ class MoEMicroKernelBackend:
         cfg = self._cfg
         w2_base_addr = w2_weights.iterator.toint()
         w2s_base_addr = w2_scales.iterator.toint()
+        if cutlass.const_expr(self.weight_layout_trellis256):
+            self._run_fc2_trellis(
+                bidx_x,
+                gdim_x,
+                warp_id,
+                lane,
+                m_val,
+                w2_base_addr,
+                w2_alphas,
+                intermediate,
+                topk_ids,
+                topk_weights,
+                scatter_output,
+                trellis_lut,
+            )
         # ---- m==1 FC2 rowpair ----
-        if cutlass.const_expr(self.m_const == 1):
+        if cutlass.const_expr(
+            (not self.weight_layout_trellis256) and self.m_const == 1
+        ):
             fc2_chunks_m1 = Int32(cfg.k_dim // self.m1_fc2_rows_per_cta)
             if cutlass.const_expr(self.m1_fc2_onepass):
                 fc2_task = Int32(bidx_x)
@@ -5299,7 +5571,8 @@ class MoEMicroKernelBackend:
                     fc2_task += Int32(gdim_x)
 
         # ---- m>=2 FC2 rowquad ----
-        else:
+        # (compiled out under the trellis layout)
+        elif cutlass.const_expr(not self.weight_layout_trellis256):
             if cutlass.const_expr(self.w4a16_mode and cfg.fc2_n_chunks == 1):
                 fc2_task_count = (m_val * Int32(cfg.k_dim)) // Int32(_K_PER_CTA * 2)
             else:
@@ -5502,6 +5775,8 @@ class MoEMicroKernelBackend:
         barrier_epoch: torch.Tensor,
         m: int,
         grid_x: int,
+        trellis_lut: torch.Tensor | None = None,
+        trellis_rotations: torch.Tensor | None = None,
     ):
         def ptr(dt, t):
             return make_ptr(dt, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
@@ -5528,6 +5803,19 @@ class MoEMicroKernelBackend:
             Int32(m),
             Int32(grid_x),
             stream,
+            *(
+                (
+                    ptr(cutlass.Uint8, trellis_lut),
+                    make_ptr(
+                        cutlass.Float16,
+                        trellis_rotations.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    ),
+                )
+                if trellis_lut is not None
+                else ()
+            ),
         )
 
 
