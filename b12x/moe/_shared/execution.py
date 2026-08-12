@@ -120,6 +120,7 @@ class WeightPreparationTransform(_StringEnum):
     W4A16_PACKED = "w4a16_packed"
     W4A16_TRELLIS = "w4a16_trellis"
     W4A8_QMMA = "w4a8_qmma"
+    W4A8_TRELLIS = "w4a8_trellis"
     W6A8_MXFP6 = "w6a8_mxfp6"
 
 
@@ -166,7 +167,7 @@ _QSRT_ATOMS_V2_PROFILE_COUPLED_H308 = "k3x22_k4x2_coupled_h512_h128"
 _SOURCES_BY_QUANT_MODE = {
     "nvfp4": frozenset({"modelopt_nvfp4"}),
     "w4a8_nvfp4": frozenset({"modelopt_nvfp4"}),
-    "w4a8_mx": frozenset({"fp4_e8m0_k32"}),
+    "w4a8_mx": frozenset({"fp4_e8m0_k32", "qsrt_sqg_e4m3"}),
     # W4A16 deliberately keeps its historical FP4 source trio; the packed
     # MX-FP6 source is exclusive to the w6a8_mx recipe.
     "w4a16": frozenset(
@@ -502,6 +503,16 @@ class MoEWeightPreparationPlan:
         return None
 
     @property
+    def w4a8_weight_layout(self) -> str | None:
+        """Kernel weight-layout string for the w4a8_mx recipe, if planned."""
+
+        if WeightPreparationTransform.W4A8_TRELLIS in self.transforms:
+            return "trellis3_t256"
+        if WeightPreparationTransform.W4A8_QMMA in self.transforms:
+            return "qmma_repacked"
+        return None
+
+    @property
     def w4a16_scale_format(self) -> str | None:
         if self.w4a16_weight_layout is None:
             return None
@@ -529,6 +540,8 @@ class MoEWeightPreparationPlan:
                 else PreparedWeightLayout.MMA_PACKED
             )
         if quant_mode == "w4a8_mx":
+            if WeightPreparationTransform.W4A8_TRELLIS in self.transforms:
+                return PreparedWeightLayout.TRELLIS_NATIVE
             return PreparedWeightLayout.QMMA_REPACKED
         if quant_mode == "w6a8_mx":
             # Packed MX-FP6 codes are consumed as-is; only scales are
@@ -778,6 +791,25 @@ def plan_moe_weight_preparation(
         if spec.quant_mode == "w4a8_mx":
             if spec.activation not in {"silu", "situ"}:
                 raise ValueError("W4A8-MX preparation currently requires silu or situ")
+            if source_format in _TRELLIS_SOURCE_FORMATS:
+                # Trellis payloads stay source-native (fully scaled E4M3
+                # after in-kernel decode; identity weight block scales).
+                # The w4a8 trellis kernels window K and I in 16s and run
+                # the 128-wide activation boundary per intermediate chunk.
+                if source_format != "qsrt_sqg_e4m3":
+                    raise ValueError(
+                        "W4A8-MX trellis execution requires the "
+                        "qsrt_sqg_e4m3 source format"
+                    )
+                if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+                    raise ValueError(
+                        "W4A8-MX trellis execution requires hidden_size % "
+                        "128 == 0 and intermediate_size % 128 == 0"
+                    )
+                transforms.add(WeightPreparationTransform.W4A8_TRELLIS)
+                weight_layouts.add(PreparedWeightLayout.TRELLIS_NATIVE)
+                scale_layouts.add(PreparedScaleLayout.SOURCE_NATIVE)
+                continue
             # The rp storage ceil-tiles partial 256/128 tiles (zero-filled),
             # so 32-aligned shards (352 = 2048/TP6, 192 = 3072/TP16) prepare
             # fine; consumers bound their reads by the logical sizes.
@@ -874,6 +906,7 @@ def plan_moe_weight_preparation(
     native_representation = (
         WeightPreparationTransform.W4A16_NATIVE in transforms
         or WeightPreparationTransform.W4A16_TRELLIS in transforms
+        or WeightPreparationTransform.W4A8_TRELLIS in transforms
         # W6A8-MXFP6 keeps the packed FP6 bytes unchanged and transfers
         # ownership to the prepared representation (swizzled scales replace
         # the source grids), mirroring the native W4A16 storage policy.

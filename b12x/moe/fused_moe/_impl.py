@@ -1447,6 +1447,8 @@ def _validate_fp4_source_format_for_quant_mode(
         return
     if source_format == "fp4_e8m0_k32" and quant_mode == "w4a8_mx":
         return
+    if source_format == "qsrt_sqg_e4m3" and quant_mode == "w4a8_mx":
+        return
     raise ValueError(
         f"source_format={source_format!r} with quant_mode={quant_mode!r} is "
         "unsupported; use quant_mode='w4a16' for non-NVFP4 sources, "
@@ -5014,8 +5016,14 @@ def prepare_b12x_fp4_moe_weights(
             f"params_dtype={actual_dtype!r} does not match plan dtype={plan.io_dtype!r}"
         )
     if plan.source_format == "qsrt_sqg_e4m3":
-        if plan.quant_modes != frozenset({"w4a16"}):
-            raise ValueError("QSRT weights support only quant_mode='w4a16'")
+        if len(plan.quant_modes) != 1 or not plan.quant_modes <= frozenset(
+            {"w4a16", "w4a8_mx"}
+        ):
+            raise ValueError(
+                "QSRT weights support exactly one of quant_mode='w4a16' or "
+                "quant_mode='w4a8_mx'"
+            )
+        qsrt_quant_mode = next(iter(plan.quant_modes))
         if plan.qsrt_storage_format not in {"qsrt_atoms_v1", "qsrt_atoms_v2"}:
             raise ValueError(
                 "QSRT preparation requires qsrt_atoms_v1 or qsrt_atoms_v2 storage"
@@ -5064,7 +5072,7 @@ def prepare_b12x_fp4_moe_weights(
                 dummy_scale=dummy_scale,
             )
             representation = _PreparedWeightRepresentation(
-                quant_mode="w4a16",
+                quant_mode=qsrt_quant_mode,
                 layout=PreparedWeightLayout.TRELLIS_NATIVE,
                 value=value,
             )
@@ -5167,7 +5175,7 @@ def prepare_b12x_fp4_moe_weights(
             workspace=workspace_placeholder,
         )
         representation = _PreparedWeightRepresentation(
-            quant_mode="w4a16",
+            quant_mode=qsrt_quant_mode,
             layout=PreparedWeightLayout.TRELLIS_NATIVE,
             value=value,
         )
