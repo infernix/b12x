@@ -112,10 +112,9 @@ def _run_trellis_dynamic(
     # The reference mirrors the kernel transforms exactly, so both consume
     # the same input and compare in the raw scatter basis.
     x_dyn = x
-    # Expert-major flat payloads: w13 [E][proj][K16][N16], down [E][K16][N16].
-    w13_flat = (
-        w13_i16.permute(1, 0, 2, 3, 4).contiguous().view(torch.int32).reshape(-1)
-    )
+    # Projection-major flat payloads: w13 [proj][E][K16][N16], down
+    # [E][K16][N16] (the prepared QSRT layout, shared with the micro path).
+    w13_flat = w13_i16.contiguous().view(torch.int32).reshape(-1)
     down_flat = w2_i16.contiguous().view(torch.int32).reshape(-1)
     t12_lut = sqg_xor_cheb_t12_lut_cpu().to(device)
     rot_flat = rotations.reshape(-1).contiguous()

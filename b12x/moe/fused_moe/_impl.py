@@ -8645,9 +8645,10 @@ class _DynamicMoEW4A8Launch:
         )
         num_experts = row_counts.shape[0]
         if cutlass.const_expr(getattr(self._kernel, "w4a8_trellis", False)):
-            # Expert-major trellis payloads: w13 [E][2][K16][N16] window
-            # blocks of 8*bits u32, down [E][K16(I)][N16(K)]. SFB tensors
-            # are compile-time dead (identity UE8M0 word).
+            # Projection-major trellis payloads: w13 [2][E][K16][N16]
+            # window blocks of 8*bits u32 (the prepared QSRT layout), down
+            # [E][K16(I)][N16(K)]. SFB tensors are compile-time dead
+            # (identity UE8M0 word).
             _tr_bits = int(self._kernel.trellis_bits)
             _tr_w13_u32 = (
                 2 * (self._k // 16) * ((self._w1_n // 2) // 16) * 8 * _tr_bits

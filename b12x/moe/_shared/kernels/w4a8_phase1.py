@@ -319,15 +319,17 @@ class W4A8MaterializedPhase1Kernel:
         ) * input_k128_count + k128_slice
 
         if cutlass.const_expr(self.w4a8_trellis):
-            # Expert-major [E][proj][K16][N16] trellis windows; stage the
-            # four K16 rows of this K64 epoch for gate (projection 0) and
-            # up (projection 1). B is fully scaled E4M3 after decode, so
-            # the SFB regions stay unstaged.
+            # Projection-major [proj][E][K16][N16] trellis windows (the
+            # prepared QSRT layout, shared with the micro kernel); stage
+            # the four K16 rows of this K64 epoch for gate (projection 0)
+            # and up (projection 1). B is fully scaled E4M3 after decode,
+            # so the SFB regions stay unstaged.
             tr_n16_cnt = intermediate_tiles * Int32(8)
             tr_k16_stride = tr_n16_cnt * Int32(8 * self.trellis_bits)
             tr_eu = Int64(input_k128_tiles * Int32(8)) * Int64(tr_k16_stride)
+            tr_w13_half = Int64(w13_rp.shape[0]) >> Int64(1)
             tr_common = (
-                Int64(expert_idx) * (Int64(2) * tr_eu)
+                Int64(expert_idx) * tr_eu
                 + Int64(k64_slice * Int32(4)) * Int64(tr_k16_stride)
                 + Int64(output_tile * Int32(8))
                 * Int64(8 * self.trellis_bits)
@@ -345,7 +347,7 @@ class W4A8MaterializedPhase1Kernel:
             _w4a8_stage_trellis_b_tile(
                 w13_rp,
                 up_b_base,
-                tr_common + tr_eu,
+                tr_common + tr_w13_half,
                 tr_k16_stride,
                 self.trellis_bits,
                 tid,

@@ -7795,12 +7795,13 @@ class MoEDynamicKernelBackend:
                                             need,
                                         )
                                     if cutlass.const_expr(self.w4a8_trellis):
-                                        # Trellis payload is expert-major
-                                        # [E][proj][K16][N16] window blocks;
-                                        # stage the slice's gate tile (and the
-                                        # up tile when fused; the second pass
-                                        # of the non-fused gated shape stages
-                                        # up instead).
+                                        # Trellis payload is projection-major
+                                        # [proj][E][K16][N16] window blocks
+                                        # (the prepared QSRT layout); stage
+                                        # the slice's gate tile (and the up
+                                        # tile when fused; the second pass of
+                                        # the non-fused gated shape stages up
+                                        # instead).
                                         w4a8_b_dst = (
                                             w4a8_sb0 + (w4a8_sb1 - w4a8_sb0) * par
                                         )
@@ -7814,10 +7815,13 @@ class MoEDynamicKernelBackend:
                                         tr_proj = Int32(0)
                                         if cutlass.const_expr(_pp != 0):
                                             tr_proj = Int32(1)
+                                        tr_w13_half = Int64(
+                                            w13_rp.shape[0]
+                                        ) >> Int64(1)
                                         tr_base = (
-                                            Int64(task_expert_idx)
-                                            * (Int64(2) * tr_expert_u32)
-                                            + Int64(tr_proj) * tr_expert_u32
+                                            Int64(tr_proj) * tr_w13_half
+                                            + Int64(task_expert_idx)
+                                            * tr_expert_u32
                                             + Int64(_pkt * 8)
                                             * Int64(tr_k16_stride)
                                             + Int64(cur_slice_p * Int32(8))
@@ -7839,7 +7843,7 @@ class MoEDynamicKernelBackend:
                                                 + Int32(
                                                     2048 * self.trellis_bits
                                                 ),
-                                                tr_base + tr_expert_u32,
+                                                tr_base + tr_w13_half,
                                                 tr_k16_stride,
                                                 self.trellis_bits,
                                                 Int32(lane_id),
