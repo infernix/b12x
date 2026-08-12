@@ -63,6 +63,7 @@ from b12x.moe._shared.kernels.activations import (
 )
 from b12x.moe._shared.kernels.micro import (
     _BLOCK_DIM as _DIRECT_MICRO_BLOCK_DIM,
+    MoEMicroKernelBackend,
     _direct_k_segments_for_k,
     _direct_k_segments_supported,
 )
@@ -2874,6 +2875,17 @@ def _plan_core_workspace(
             micro_intermediate_elements = max(
                 micro_intermediate_elements, max_rows * 2 * n
             )
+            if n % 128 == 0:
+                # Trellis-native micro decode: per-token f16-pair
+                # intermediate words plus the FC1 K-split scratch tail
+                # (2*i_chunk floats and one arrival counter per base task,
+                # i_chunk = 128). The workspace is zero-initialized and the
+                # kernel restores the tail to zero after each use.
+                micro_intermediate_elements = max(
+                    micro_intermediate_elements,
+                    direct_micro_tokens * num_topk * (n // 2)
+                    + direct_micro_tokens * num_topk * (n // 128) * 257,
+                )
         if direct_micro_candidate:
             fc2_n_chunks = (n // 2 + 127) // 128
             micro_intermediate_elements = max(
@@ -4661,6 +4673,44 @@ def _get_weight_views(
 # --------------------------------------------------------------------------
 
 
+def _w4a8_trellis_weight_views(
+    prepared: object,
+    w1_alphas: torch.Tensor,
+    w2_alphas: torch.Tensor,
+) -> _WeightViews:
+    """Micro-launch views for the trellis-native w4a8 representation.
+
+    The trellis payloads are opaque byte streams to the launch ABI, and the
+    micro trellis arm reads no weight block scales. The w13 scale slot
+    therefore carries the per-expert boundary rotations (fp16, [E, 3*I]
+    ordinary or [E, 6*I] coupled); the compact micro launch rebinds it as
+    the rotation operand and fetches the shared T12 staircase from the
+    per-device cache.
+    """
+
+    if not w1_alphas.is_contiguous() or not w2_alphas.is_contiguous():
+        raise ValueError("w1_alphas and w2_alphas must be contiguous")
+    rotations = prepared.intermediate_rotations
+    if rotations.dtype != torch.float16:
+        raise TypeError("trellis intermediate rotations must be fp16")
+    rotations = rotations.contiguous()
+    w13 = prepared.w13.contiguous().view(torch.uint8).reshape(-1)
+    w2 = prepared.w2.contiguous().view(torch.uint8).reshape(-1)
+    dummy = prepared.w2_scale
+    return _WeightViews(
+        w13=w13,
+        down=w2,
+        w13_sf=dummy,
+        down_sf=dummy,
+        w1_alpha=w1_alphas,
+        w2_alpha=w2_alphas,
+        w1_storage=w13,
+        w1_scale_storage=rotations,
+        w2_storage=w2,
+        w2_scale_storage=dummy,
+    )
+
+
 def _w4a8_prepared_dict(prepared: object) -> dict[str, torch.Tensor]:
     """Normalize public prepared metadata to the dynamic launch ABI."""
 
@@ -5658,6 +5708,7 @@ def _resolve_workspace_layout(
     n: int,
     activation: str,
     quant_mode: str = "nvfp4",
+    weight_layout: str | None = None,
 ) -> tuple[str, int, int]:
     routed_rows = num_tokens * num_topk
     if _normalize_quant_mode(quant_mode) == "w4a16":
@@ -5687,6 +5738,31 @@ def _resolve_workspace_layout(
         # W4A8-MX sizes so compacted checkpoints never require a second
         # source-native copy merely to enter the tiny-decode band.
         if normalized_quant_mode == "w4a8_mx":
+            if weight_layout == "trellis3_t256":
+                # Trellis-native serving: the direct micro trellis arm owns
+                # the decode band; the dynamic kernel's w4a8_trellis recipe
+                # serves every larger batch. The QMMA tiny-decode kernel
+                # cannot read trellis payloads.
+                if (
+                    num_tokens <= _MICRO_MAX_TOKENS
+                    and n % 128 == 0
+                    and MoEMicroKernelBackend.is_supported(
+                        m=num_tokens,
+                        k=k,
+                        n=n,
+                        num_topk=num_topk,
+                        weight_E=weight_E,
+                    )
+                ):
+                    return "micro", max(1, routed_rows), max(1, routed_rows)
+                tile_m, _ = _select_dynamic_tile_mn(
+                    routed_rows,
+                    _dynamic_kernel_intermediate_size(n, quant_mode),
+                    quant_mode,
+                    num_experts=weight_E,
+                    activation=activation,
+                )
+                return "dynamic", weight_E, align_up(routed_rows, tile_m)
             if _tiny_decode_enabled() and _tiny_decode_supports(
                 num_tokens=num_tokens, k=k, n=n, activation=activation
             ):
@@ -5820,6 +5896,7 @@ def plan_tp_moe_execution(
         n=n,
         activation=activation,
         quant_mode=quant_mode,
+        weight_layout=weight_plan.w4a8_weight_layout,
     )
     dynamic_physical_tiles = None
     dynamic_task_capacity = None
@@ -6837,6 +6914,10 @@ def _resolve_trellis_route_block_size(caps: TPMoEScratchCaps) -> int | None:
     if caps.w4a16_block_size_m is not None:
         return int(caps.w4a16_block_size_m)
     if caps.source_format not in _TRELLIS_SOURCE_FORMATS:
+        return None
+    if _normalize_quant_mode(caps.quant_mode) != "w4a16":
+        # Trellis sources under w4a8_mx run the micro/dynamic regimes,
+        # which do not use the w4a16 route-block geometry.
         return None
     from b12x.moe._shared.kernels.w4a16.host import select_route_block_size_m
 
@@ -8166,6 +8247,9 @@ def _get_micro_kernel(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     compile_time_phase: int = 0,
+    weight_layout: str | None = None,
+    trellis_bits: int = 0,
+    trellis_coupled: bool = False,
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
@@ -8191,6 +8275,11 @@ def _get_micro_kernel(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
     )
+    micro_trellis = weight_layout == "trellis3_t256"
+    if micro_trellis:
+        micro_kwargs["weight_layout"] = weight_layout
+        micro_kwargs["trellis_bits"] = int(trellis_bits)
+        micro_kwargs["trellis_coupled"] = bool(trellis_coupled)
     # The native NVFP4 split is currently a GLM SiLU decode specialization.
     # Keep existing activation wrappers untouched for the normal fused phase.
     if compile_time_phase:
@@ -8254,6 +8343,14 @@ def _get_micro_kernel(
         Int32(compile_m),  # m_val
         Int32(1),  # grid_x
         current_cuda_stream(),  # stream
+        *(
+            (
+                dummy(cutlass.Uint8),  # trellis_lut_ptr
+                dummy(cutlass.Float16),  # trellis_rot_ptr
+            )
+            if micro_trellis
+            else ()
+        ),
         compile_spec=KernelCompileSpec.from_key(
             "integration.tp_moe.micro_direct",
             1,
@@ -9900,6 +9997,42 @@ def _launch_compact_micro_flat(
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     micro_cls = activation_spec.micro_kernel_cls
+    # The QMMA tiny-decode band never reaches the compact op, so a w4a8_mx
+    # arrival here is the trellis-native micro path: w1_storage is the
+    # projection-major payload, w1_scale_storage carries the per-expert
+    # boundary rotations, and the trellis geometry is recovered from the
+    # operand extents.
+    w4a8_trellis = quant_mode == "w4a8_mx"
+    trellis_bits = 0
+    trellis_coupled = False
+    trellis_lut = None
+    trellis_rotations = None
+    if w4a8_trellis:
+        window_words = 2 * weight_E * (k // 16) * (n // 16) * 32
+        trellis_bits = w1_storage.numel() // window_words
+        if (
+            trellis_bits not in (2, 3, 4)
+            or trellis_bits * window_words != w1_storage.numel()
+        ):
+            raise RuntimeError(
+                "w4a8 trellis payload extent does not match the launch "
+                f"shape (E={weight_E}, k={k}, n={n}, "
+                f"payload_bytes={w1_storage.numel()})"
+            )
+        rot_elems = w1_scale_storage.numel()
+        if rot_elems == weight_E * 6 * n:
+            trellis_coupled = True
+        elif rot_elems != weight_E * 3 * n:
+            raise RuntimeError(
+                "w4a8 trellis rotation extent must be E*3n or E*6n fp16 "
+                f"values, got {rot_elems} for E={weight_E}, n={n}"
+            )
+        from b12x.moe._shared.kernels.w4a16.kernel import (
+            _trellis256_execution_lut,
+        )
+
+        trellis_lut = _trellis256_execution_lut(a.device, "sqg_xor_cheb_t12")
+        trellis_rotations = w1_scale_storage
     use_native_nvfp4_split = (
         quant_mode == "w4a8_nvfp4"
         and 1 <= m <= 8
@@ -9977,6 +10110,9 @@ def _launch_compact_micro_flat(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        weight_layout="trellis3_t256" if w4a8_trellis else None,
+        trellis_bits=trellis_bits,
+        trellis_coupled=trellis_coupled,
     )
     if not _compiled_direct_micro_accepts_block_dim(
         compiled,
@@ -10005,6 +10141,8 @@ def _launch_compact_micro_flat(
         barrier_epoch=barrier_epoch,
         m=m,
         grid_x=grid_x,
+        trellis_lut=trellis_lut,
+        trellis_rotations=trellis_rotations,
     )
 
 
@@ -10334,10 +10472,11 @@ def _launch_micro(
     swiglu_alpha: float = 1.0,
     swiglu_beta: float = 0.0,
     unit_scale_contract: bool = False,
+    w4a8_trellis: bool = False,
 ) -> None:
     del stream, unit_scale_contract
     quant_mode = _normalize_quant_mode(quant_mode)
-    if quant_mode == "w4a8_mx":
+    if quant_mode == "w4a8_mx" and not w4a8_trellis:
         # The w4a8_mx tiny band reaches the compact family only via the
         # tiny_decode resolve gate; its weights are N256/K128-repacked,
         # which direct-micro cannot read.
@@ -10369,9 +10508,17 @@ def _launch_micro(
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     micro_cls = activation_spec.micro_kernel_cls
     del routed_rows, topk_ids_dtype
+    # The trellis band is gated on the shared backend's shape predicate:
+    # activation wrappers such as SiTU keep is_supported False to hold the
+    # nvfp4-family compact path closed while serving the trellis arm.
+    shape_supported = (
+        MoEMicroKernelBackend.is_supported
+        if w4a8_trellis
+        else micro_cls.is_supported
+    )
     use_micro_direct = (
         quant_mode == "nvfp4" or _is_w4a8_quant_mode(quant_mode)
-    ) and micro_cls.is_supported(
+    ) and shape_supported(
         m=m,
         k=k,
         n=n,
@@ -10792,19 +10939,31 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         flat_ids = _flatten_routing_ids(topk_ids)
         flat_weights = _flatten_routing_weights(topk_weights)
 
-        wv = _get_weight_views(
-            w1_fp4,
-            w1_blockscale,
-            w2_fp4,
-            w2_blockscale,
-            w1_alphas,
-            w2_alphas,
-            n,
-            k,
-            activation_spec=activation_spec,
-            quant_mode=quant_mode,
-            w13_layout=w13_layout,
+        micro_w4a8_trellis = (
+            quant_mode == "w4a8_mx"
+            and getattr(prepared_payload, "weight_layout", None)
+            == "trellis3_t256"
         )
+        if micro_w4a8_trellis:
+            wv = _w4a8_trellis_weight_views(
+                prepared_payload,
+                w1_alphas,
+                w2_alphas,
+            )
+        else:
+            wv = _get_weight_views(
+                w1_fp4,
+                w1_blockscale,
+                w2_fp4,
+                w2_blockscale,
+                w1_alphas,
+                w2_alphas,
+                n,
+                k,
+                activation_spec=activation_spec,
+                quant_mode=quant_mode,
+                w13_layout=w13_layout,
+            )
         input_gs = _prepare_expert_scale(a1_gscale, weight_E)
         down_input_scale = _prepare_expert_scale(a2_gscale, weight_E)
     else:
@@ -10987,6 +11146,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             unit_scale_contract=unit_scale_contract,
+            w4a8_trellis=micro_w4a8_trellis,
         )
     return scatter_output
 

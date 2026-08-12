@@ -2421,7 +2421,9 @@ class MoEMicroKernelBackend:
         if cutlass.const_expr(self.m_const == 1):
             m1_epoch0 = ld_global_acquire_i32(get_ptr_as_int64(barrier_epoch, Int32(0)))
 
-        if cutlass.const_expr(cfg.k_segments == 2):
+        if cutlass.const_expr(
+            cfg.k_segments == 2 and not self.weight_layout_trellis256
+        ):
             smem_xh_ptr = cute.arch.alloc_smem(Uint32, 2 * cfg.smem_xh_size)
             smem_xh = cute.make_tensor(
                 smem_xh_ptr, cute.make_layout(2 * cfg.smem_xh_size)
@@ -2468,7 +2470,12 @@ class MoEMicroKernelBackend:
             cfg.num_topk * cfg.fc1_chunks * self.trellis_ksplit
         )
         fc1_task = Int32(bidx_x)
-        if cutlass.const_expr(cfg.k_segments == 2):
+        # The trellis arm stages activations into a single buffer per task
+        # (its reader applies no buffer offset), so it never uses the
+        # k_segments==2 double-buffer machinery.
+        if cutlass.const_expr(
+            cfg.k_segments == 2 and not self.weight_layout_trellis256
+        ):
             buf_idx = Int32(0)
             # Pre-loop: quantize first task into buf[0]
             if fc1_task < fc1_task_count:
@@ -2581,7 +2588,9 @@ class MoEMicroKernelBackend:
                     alpha_fc1 = alpha_fc1 * gs_fc1
 
             # ---- Input quantization ----
-            if cutlass.const_expr(cfg.k_segments != 2):
+            if cutlass.const_expr(
+                cfg.k_segments != 2 or self.weight_layout_trellis256
+            ):
                 need_quant = Int32(1)
                 if cutlass.const_expr(self.share_input_across_experts):
                     need_quant = Int32(1) if t != prev_t else Int32(0)
@@ -5454,7 +5463,9 @@ class MoEMicroKernelBackend:
                             intermediate[packed_idx] = pack_f32x2_to_f16x2(f0, f1)
 
             cute.arch.sync_threads()
-            if cutlass.const_expr(cfg.k_segments == 2):
+            if cutlass.const_expr(
+                cfg.k_segments == 2 and not self.weight_layout_trellis256
+            ):
                 if need_quant_next > Int32(0):
                     buf_idx = Int32(1) - buf_idx
             fc1_task += Int32(gdim_x)
