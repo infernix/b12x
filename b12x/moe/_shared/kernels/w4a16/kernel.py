@@ -7536,18 +7536,25 @@ class W4A16FusedMoeKernel:
         pre_block: Int32,
         lane: Int32,
     ):
-        """Cancel ordinary and coupled H128 transforms for 64 neurons."""
+        """Decode one logical 128-coordinate coupled preactivation record."""
 
-        chunk = lane >> Int32(3)
-        chunk_lane = lane & Int32(7)
-        atom = pre_block * Int32(2) + (chunk >> Int32(1))
-        if cutlass.const_expr(self.fc1_trellis_pair_kind == "P43"):
-            # P43 stores the funded K4 record first.  Coupled H308 places the
-            # logical first preactivation record in the high K3 half, so undo
-            # that storage order before cancelling the H128 boundary.
-            atom = atom ^ Int32(4)
-        slot = chunk & Int32(1)
-        coord = atom * Int32(32) + chunk_lane * Int32(4)
+        if cutlass.const_expr(self.fc1_trellis_pair_kind is None):
+            # The uniform-rate layout divides one interleaved coupled window
+            # across the two physical FC1 slots.
+            chunk = lane >> Int32(3)
+            chunk_lane = lane & Int32(7)
+            atom = pre_block * Int32(2) + (chunk >> Int32(1))
+            slot = chunk & Int32(1)
+            coord = atom * Int32(32) + chunk_lane * Int32(4)
+        else:
+            # A fixed-rate pair slot contains two complete 128-coordinate
+            # records.  Apply the record-local output Hadamard before the
+            # coupled transform by selecting one physical slot and half.
+            slot = pre_block & Int32(1)
+            half = pre_block >> Int32(1)
+            if cutlass.const_expr(self.fc1_trellis_pair_kind == "P43"):
+                half = half ^ Int32(1)
+            coord = half * Int32(128) + lane * Int32(4)
         isz = Int32(self.intermediate_size)
         fc1_base = row * Int32(2 * self.intermediate_size) + slot * isz + coord
         rot_base = expert * Int32(6 * self.intermediate_size)

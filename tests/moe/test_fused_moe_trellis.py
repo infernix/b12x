@@ -928,6 +928,7 @@ def _reference_coupled_decoded(
     coupled_signs: torch.Tensor,
     down_svh: torch.Tensor,
     *,
+    fc1_pair_kind: str | None = None,
     quantize_activations: bool = False,
 ) -> torch.Tensor:
     """Reference the exact transform order of a coupled uniform-rate path."""
@@ -968,26 +969,62 @@ def _reference_coupled_decoded(
                 (source.float() @ weights[expert].float()).to(torch.float16)
                 for weights in (slot0_weights, slot1_weights)
             ]
-            raw_pre = torch.stack(
-                (
-                    physical[0].view(1, atoms, 32),
-                    physical[1].view(1, atoms, 32),
-                ),
-                dim=2,
-            ).reshape(1, 2 * intermediate)
-            pre_scales = torch.stack(
-                (
-                    slot0_svh[expert].view(atoms, 32),
-                    slot1_svh[expert].view(atoms, 32),
-                ),
-                dim=1,
-            ).reshape(1, 2 * intermediate)
-            pre = _had128(raw_pre, hadamard, store_fp16=False)
-            pre = _had128(
-                pre * pre_scales.float(),
-                hadamard,
-                store_fp16=False,
-            )
+            if fc1_pair_kind is None:
+                atoms = intermediate // 32
+                raw = torch.stack(
+                    (
+                        physical[0].view(1, atoms, 32),
+                        physical[1].view(1, atoms, 32),
+                    ),
+                    dim=2,
+                ).reshape(1, 2 * intermediate)
+                scales = torch.stack(
+                    (
+                        slot0_svh[expert].view(atoms, 32),
+                        slot1_svh[expert].view(atoms, 32),
+                    ),
+                    dim=1,
+                ).reshape(1, 2 * intermediate)
+                pre = _had128(raw, hadamard, store_fp16=False)
+                pre = _had128(
+                    pre * scales.float(), hadamard, store_fp16=False
+                )
+            else:
+                decoded = [
+                    _had128(
+                        physical[index],
+                        hadamard,
+                        svh=(slot0_svh, slot1_svh)[index][expert],
+                        store_fp16=False,
+                    )
+                    for index in range(2)
+                ]
+            if fc1_pair_kind == "P43":
+                # P43 stores each slot's funded K4 record before its logical
+                # first K3 record.
+                logical = torch.cat(
+                    (
+                        decoded[0][:, 128:],
+                        decoded[1][:, 128:],
+                        decoded[0][:, :128],
+                        decoded[1][:, :128],
+                    ),
+                    dim=1,
+                )
+            elif fc1_pair_kind == "P33":
+                logical = torch.cat(
+                    (
+                        decoded[0][:, :128],
+                        decoded[1][:, :128],
+                        decoded[0][:, 128:],
+                        decoded[1][:, 128:],
+                    ),
+                    dim=1,
+                )
+            elif fc1_pair_kind is not None:
+                raise ValueError(f"unsupported coupled FC1 pair kind {fc1_pair_kind}")
+            if fc1_pair_kind is not None:
+                pre = _had128(logical, hadamard, store_fp16=False)
             pre = pre * pre_signs[expert].float()
             gate = pre[:, 0::2]
             up = pre[:, 1::2]
@@ -1744,6 +1781,7 @@ def test_coupled_higher_rate_w4a16_matches_transform_reference(
         ordinary_rotations,
         coupled_signs,
         down_svh,
+        fc1_pair_kind=prepared.fc1_trellis_pair_kind,
     )
     relative_a16 = (
         (actual_a16 - reference_a16).norm()
@@ -2221,10 +2259,11 @@ def test_coupled_h308_fused_moe_matches_transform_reference_and_captures(
         high = _reconstruct_native(
             w13_high[projection, 0], codebook="sqg_xor_cheb_t12"
         )
-        # P43 serializes the funded K4 record first; the coupled activation
-        # restores the logical K3/K4 block order before SiTU.
+        # The GEMM output follows the serialized record order.  For P43 that
+        # is the funded K4 record followed by the K3 record; the coupled
+        # activation restores logical order.
         slot_weights.append(
-            torch.cat((high, low) if fc1_bits == (4, 3) else (low, high), dim=1)
+            torch.cat((low, high), dim=1)
             .unsqueeze(0)
             .to(device)
         )
@@ -2291,6 +2330,7 @@ def test_coupled_h308_fused_moe_matches_transform_reference_and_captures(
         ordinary_rotations,
         coupled_signs,
         down_svh,
+        fc1_pair_kind=prepared.fc1_trellis_pair_kind,
     )
     relative_error = (
         (actual - reference).norm() / reference.norm().clamp_min(1.0e-9)
