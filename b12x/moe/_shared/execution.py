@@ -801,6 +801,18 @@ def plan_moe_weight_preparation(
                         "W4A8-MX trellis execution requires the "
                         "qsrt_sqg_e4m3 source format"
                     )
+                if qsrt_profile in {
+                    _QSRT_ATOMS_V2_PROFILE_H308,
+                    _QSRT_ATOMS_V2_PROFILE_COUPLED_H308,
+                }:
+                    # The W4A8 kernels decode one compile-time rate for the
+                    # whole payload; the mixed-rate pair machinery is
+                    # W4A16-only.
+                    raise ValueError(
+                        "W4A8-MX trellis execution supports only "
+                        "uniform-rate profiles; mixed-rate atom profiles "
+                        "require quant_mode='w4a16'"
+                    )
                 if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
                     raise ValueError(
                         "W4A8-MX trellis execution requires hidden_size % "
