@@ -3096,12 +3096,26 @@ def _prepare_qsrt_coupled_h308_atom_v2_moe_weights(
         kind: str,
         *,
         fc1: bool,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         low_bits, high_bits = pair_bits[kind]
         low_bytes = hidden_tiles * 32 * low_bits
         if low_bytes + hidden_tiles * 32 * high_bits != matrix_bytes:
             raise AssertionError("coupled H308 matrix geometry drifted")
-        parts: list[torch.Tensor] = []
+        elements_per_expert = atom_count * matrix_bytes // 2
+        if out is None:
+            out = torch.empty(
+                (num_experts, elements_per_expert),
+                dtype=torch.int16,
+                device=device,
+            )
+        elif (
+            out.dtype != torch.int16
+            or out.device != device
+            or tuple(out.shape) != (num_experts, elements_per_expert)
+            or not out.is_contiguous()
+        ):
+            raise ValueError("coupled H308 restore destination has invalid geometry")
         for first_expert in range(0, num_experts, 64):
             count = min(64, num_experts - first_expert)
             raw = source[
@@ -3131,20 +3145,31 @@ def _prepare_qsrt_coupled_h308_atom_v2_moe_weights(
                 low = low.permute(1, 0, 2, 3).reshape(count, -1)
                 high = high.permute(1, 0, 2, 3).reshape(count, -1)
                 restored = torch.cat((low, high), dim=1)
-            parts.append(restored)
-        return torch.cat(parts, dim=0).contiguous()
+            out[first_expert : first_expert + count].copy_(restored)
+        return out
 
     matrix_offsets = (0, fc1_matrix_bytes, 2 * fc1_matrix_bytes)
-    w13 = torch.stack(
-        (
-            restore_matrix(
-                matrix_offsets[0], fc1_matrix_bytes, fc1_kind, fc1=True
-            ),
-            restore_matrix(
-                matrix_offsets[1], fc1_matrix_bytes, fc1_kind, fc1=True
-            ),
-        )
-    ).reshape(-1)
+    fc1_elements_per_expert = atom_count * fc1_matrix_bytes // 2
+    w13_storage = torch.empty(
+        (2, num_experts, fc1_elements_per_expert),
+        dtype=torch.int16,
+        device=device,
+    )
+    restore_matrix(
+        matrix_offsets[0],
+        fc1_matrix_bytes,
+        fc1_kind,
+        fc1=True,
+        out=w13_storage[0],
+    )
+    restore_matrix(
+        matrix_offsets[1],
+        fc1_matrix_bytes,
+        fc1_kind,
+        fc1=True,
+        out=w13_storage[1],
+    )
+    w13 = w13_storage.reshape(-1)
     w2 = restore_matrix(
         matrix_offsets[2], fc2_matrix_bytes, fc2_kind, fc1=False
     ).reshape(-1)
