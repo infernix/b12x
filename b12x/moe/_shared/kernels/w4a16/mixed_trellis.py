@@ -20,19 +20,22 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.compiler import OptLevel
-from cutlass.cutlass_dsl import Int32
+from cutlass.cutlass_dsl import Int32, Int64
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x._lib.intrinsics import shared_ptr_to_u32
+from b12x._lib.intrinsics import get_ptr_as_int64, shared_ptr_to_u32
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
 from .host import max_packed_route_slots, packed_gemm_scratch_elements
 from .kernel import (
+    _SQG_XOR_CHEB_T12_LUT_ENTRIES,
+    _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES,
     W4A16FusedMoeKernel,
     _cutlass_element_dtype,
     _fake_m_for_specialization,
     _query_w4a16_kernel_resources,
+    _trellis256_execution_lut,
     compile_w4a16_topk_sum,
     pack_topk_routes_by_expert,
 )
@@ -42,6 +45,7 @@ from .kernel import (
 class MixedTrellisCompileResult:
     compiled: object
     topk_sum: object
+    trellis_lut: torch.Tensor
     size_m: int
     hidden_size: int
     intermediate_size: int
@@ -50,6 +54,7 @@ class MixedTrellisCompileResult:
     tier1_num_experts: int
     tier0_bits: int
     tier1_bits: int
+    trellis_codebook: str
     fc1_tile_k: int
     fc1_tile_n: int
     fc2_tile_k: int
@@ -57,7 +62,6 @@ class MixedTrellisCompileResult:
     moe_block_size: int
     fc2_moe_block_size: int
     fc2_schedule_route_block_factor: int
-    fc2_paired_m8_routes: bool
     max_m_blocks: int
     blocks_per_sm: int
     sms: int
@@ -115,7 +119,7 @@ class MixedTrellisTier(Protocol):
 class W4A16MixedTrellisKernel:
     """One cooperative grid over two native Trellis bitrates."""
 
-    ABI_VERSION = 6
+    ABI_VERSION = 7
 
     def __init__(
         self,
@@ -143,6 +147,7 @@ class W4A16MixedTrellisKernel:
             "activation",
             "rotation_input_dtype",
             "broadcast_suh",
+            "trellis_codebook",
             "cta_threads",
             "sms",
         ):
@@ -160,7 +165,6 @@ class W4A16MixedTrellisKernel:
                     g.cta_threads,
                     g.moe_block_size,
                     g.schedule_route_block_factor,
-                    g.paired_m8_routes,
                 )
                 for g in gemms
             )
@@ -174,13 +178,6 @@ class W4A16MixedTrellisKernel:
             raise ValueError(
                 "mixed Trellis FC2 schedule factor must divide one packed "
                 f"route block: factor={fc2_factor}, maximum={expected_factor}"
-            )
-        expected_pair = fc2_factor == 2 and driver.fc2.moe_block_size == 8
-        if bool(driver.fc2.paired_m8_routes) != expected_pair:
-            raise ValueError(
-                "mixed Trellis FC2 pair contract mismatch: "
-                f"factor={fc2_factor}, m={driver.fc2.moe_block_size}, "
-                f"paired={driver.fc2.paired_m8_routes}"
             )
         if tier0.num_experts > 256 or tier1.num_experts > 256:
             raise ValueError("tier-local expert ids must fit in eight bits")
@@ -230,6 +227,7 @@ class W4A16MixedTrellisKernel:
         topk_weights: cute.Tensor,
         c_tmp: cute.Tensor,
         locks: cute.Tensor,
+        trellis_lut_addr: Int64,
         smem_base: Int32,
         tid: Int32,
         route_block_idx: Int32,
@@ -245,8 +243,8 @@ class W4A16MixedTrellisKernel:
         factor = gemm.schedule_route_block_factor
         first_route_block = route_block_idx * Int32(factor)
         first_lock_slot = lock_slot * Int32(factor)
-        if cutlass.const_expr(gemm.paired_m8_routes):
-            gemm._run_tile_m8_pair(
+        for subtile in cutlass.range_constexpr(factor):
+            gemm._run_tile(
                 a_flat,
                 a_alt_flat,
                 b_flat,
@@ -257,43 +255,19 @@ class W4A16MixedTrellisKernel:
                 topk_weights,
                 c_tmp,
                 locks,
+                trellis_lut_addr,
                 smem_base,
                 tid,
-                first_route_block,
+                first_route_block + Int32(subtile),
                 local_expert,
                 output_n_tile,
                 reduce_k_tile,
                 reduce_tile_count,
                 reduce_slice_count,
                 reduce_slice_idx,
-                first_lock_slot,
+                first_lock_slot + Int32(subtile),
                 active_size_m,
             )
-        else:
-            for subtile in cutlass.range_constexpr(factor):
-                gemm._run_tile(
-                    a_flat,
-                    a_alt_flat,
-                    b_flat,
-                    c_flat,
-                    scales_flat,
-                    global_scale,
-                    packed_route_indices,
-                    topk_weights,
-                    c_tmp,
-                    locks,
-                    smem_base,
-                    tid,
-                    first_route_block + Int32(subtile),
-                    local_expert,
-                    output_n_tile,
-                    reduce_k_tile,
-                    reduce_tile_count,
-                    reduce_slice_count,
-                    reduce_slice_idx,
-                    first_lock_slot + Int32(subtile),
-                    active_size_m,
-                )
 
     @cute.jit
     def _emit_tier_tile(
@@ -314,6 +288,7 @@ class W4A16MixedTrellisKernel:
         topk_weights: cute.Tensor,
         c_tmp: cute.Tensor,
         locks: cute.Tensor,
+        trellis_lut_addr: Int64,
         smem_base: Int32,
         tid: Int32,
         active_size_m: Int32,
@@ -360,6 +335,7 @@ class W4A16MixedTrellisKernel:
                         topk_weights,
                         c_tmp,
                         locks,
+                        trellis_lut_addr,
                         smem_base,
                         tid,
                         route_block_idx,
@@ -389,6 +365,7 @@ class W4A16MixedTrellisKernel:
                         topk_weights,
                         c_tmp,
                         locks,
+                        trellis_lut_addr,
                         smem_base,
                         tid,
                         route_block_idx,
@@ -434,6 +411,7 @@ class W4A16MixedTrellisKernel:
         intermediate_rotations_ptr: cute.Pointer,
         gate_suh_ptr: cute.Pointer,
         up_suh_ptr: cute.Pointer,
+        trellis_lut_ptr: cute.Pointer,
         tier0_num_experts: cutlass.Int32,
         tier1_num_experts: cutlass.Int32,
         active_m: cutlass.Int32,
@@ -592,6 +570,12 @@ class W4A16MixedTrellisKernel:
                 stride=(1,),
             ),
         )
+        trellis_lut = cute.make_tensor(
+            trellis_lut_ptr,
+            layout=cute.make_layout(
+                (cutlass.Int64(_SQG_XOR_CHEB_T12_LUT_ENTRIES),), stride=(1,)
+            ),
+        )
         self.kernel(
             rotation_input,
             rotation_gate,
@@ -622,6 +606,7 @@ class W4A16MixedTrellisKernel:
             intermediate_rotations,
             gate_suh,
             up_suh,
+            trellis_lut,
             tier0_num_experts,
             tier1_num_experts,
             active_m,
@@ -665,6 +650,7 @@ class W4A16MixedTrellisKernel:
         intermediate_rotations: cute.Tensor,
         gate_suh: cute.Tensor,
         up_suh: cute.Tensor,
+        trellis_lut: cute.Tensor,
         tier0_num_experts: cutlass.Int32,
         tier1_num_experts: cutlass.Int32,
         active_m: cutlass.Int32,
@@ -686,6 +672,19 @@ class W4A16MixedTrellisKernel:
 
         storage = smem.allocate(Storage)
         smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+        trellis_lut_addr = get_ptr_as_int64(trellis_lut, Int32(0))
+        phase_lut_addr = trellis_lut_addr
+        if cutlass.const_expr(self.driver.sqg_xor_cheb_t12_smem):
+            self.driver._sqg_smem_copy(
+                trellis_lut_addr,
+                smem_base + Int32(self.driver.sqg_xor_cheb_t12_smem_off),
+                _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES,
+                tid,
+            )
+            cute.arch.sync_threads()
+            phase_lut_addr = Int64(
+                smem_base + Int32(self.driver.sqg_xor_cheb_t12_smem_off)
+            )
         fc1_emit = partial(
             self._emit_tier_tile,
             True,
@@ -704,6 +703,7 @@ class W4A16MixedTrellisKernel:
             topk_weights,
             fc1_scratch,
             workspace,
+            phase_lut_addr,
             smem_base,
             tid,
             active_m,
@@ -728,6 +728,7 @@ class W4A16MixedTrellisKernel:
             topk_weights,
             fc2_scratch,
             workspace,
+            phase_lut_addr,
             smem_base,
             tid,
             active_m * Int32(self.top_k),
@@ -761,6 +762,8 @@ class W4A16MixedTrellisKernel:
             gate_suh,
             up_suh,
             descriptor_map,
+            trellis_lut_addr,
+            trellis_lut_addr,
             total_experts,
             total_experts,
             smem_base,
@@ -790,6 +793,7 @@ def compile_mixed_trellis(
     force_tile_config: tuple[int, int, int, int],
     tier0_bits: int = 3,
     tier1_bits: int = 4,
+    trellis_codebook: str = "mcg",
     moe_block_size: int = 8,
     rotation_input_dtype: str = "bf16",
     route_ids_dtype: torch.dtype = torch.int32,
@@ -803,13 +807,14 @@ def compile_mixed_trellis(
     fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (
         int(value) for value in force_tile_config
     )
+    trellis_codebook = str(trellis_codebook).lower()
     if fc1_tile_k < 128:
         raise ValueError(
             "mixed Trellis FC1 requires tile_k >= 128; narrower K tiles lose "
             "large-M cross-tier partial reductions"
         )
     total_experts = int(tier0_num_experts) + int(tier1_num_experts)
-    paired_m8_fc2 = int(moe_block_size) in (32, 64)
+    grouped_m8_fc2 = int(moe_block_size) in (32, 64)
 
     def make_kernel(num_experts: int, bits: int) -> W4A16FusedMoeKernel:
         return W4A16FusedMoeKernel(
@@ -827,13 +832,14 @@ def compile_mixed_trellis(
             fc2_tile_k=fc2_tile_k,
             moe_block_size=moe_block_size,
             max_m_blocks=max_m_blocks,
-            fc2_moe_block_size=(8 if paired_m8_fc2 else moe_block_size),
-            fc2_schedule_route_block_factor=(2 if paired_m8_fc2 else 1),
+            fc2_moe_block_size=(8 if grouped_m8_fc2 else moe_block_size),
+            fc2_schedule_route_block_factor=(2 if grouped_m8_fc2 else 1),
             element_dtype="fp16",
             weight_layout="trellis3_t256",
             scale_format="e4m3_k32",
             w13_layout="trellis3_t256_proj",
             trellis_bits=bits,
+            trellis_codebook=trellis_codebook,
             intermediate_rotation=True,
             full_rotation=True,
             rotation_input_dtype=rotation_input_dtype,
@@ -938,6 +944,7 @@ def compile_mixed_trellis(
         make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
         Int32(tier0_num_experts),
         Int32(tier1_num_experts),
         1,
@@ -968,6 +975,9 @@ def compile_mixed_trellis(
     result = MixedTrellisCompileResult(
         compiled=compiled,
         topk_sum=topk_sum,
+        trellis_lut=_trellis256_execution_lut(
+            torch.device("cuda", device), trellis_codebook
+        ),
         size_m=int(size_m),
         hidden_size=int(hidden_size),
         intermediate_size=int(intermediate_size),
@@ -976,6 +986,7 @@ def compile_mixed_trellis(
         tier1_num_experts=int(tier1_num_experts),
         tier0_bits=int(tier0_bits),
         tier1_bits=int(tier1_bits),
+        trellis_codebook=trellis_codebook,
         fc1_tile_k=fc1_tile_k,
         fc1_tile_n=fc1_tile_n,
         fc2_tile_k=fc2_tile_k,
@@ -985,7 +996,6 @@ def compile_mixed_trellis(
         fc2_schedule_route_block_factor=int(
             kernel.driver.fc2.schedule_route_block_factor
         ),
-        fc2_paired_m8_routes=bool(kernel.driver.fc2.paired_m8_routes),
         max_m_blocks=int(max_m_blocks),
         blocks_per_sm=int(kernel.blocks_per_sm),
         sms=int(sms),
@@ -1457,6 +1467,12 @@ def run_mixed_trellis(
         make_ptr(
             cutlass.Float16,
             rotations.up_suh.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Uint8,
+            launch.trellis_lut.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
         ),

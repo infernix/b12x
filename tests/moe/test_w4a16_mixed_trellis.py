@@ -145,8 +145,10 @@ def test_mixed_kernel_tracks_shared_moe_body_contract() -> None:
 
     driver_parameters = inspect.signature(W4A16FusedMoeKernel._moe_body).parameters
     assert len(calls[0].args) + len(calls[0].keywords) == len(driver_parameters) - 1
-    assert [ast.unparse(arg) for arg in calls[0].args[-10:]] == [
+    assert [ast.unparse(arg) for arg in calls[0].args[-12:]] == [
         "descriptor_map",
+        "trellis_lut_addr",
+        "trellis_lut_addr",
         "total_experts",
         "total_experts",
         "smem_base",
@@ -184,6 +186,26 @@ def test_mixed_runtime_tracks_topk_sum_contract() -> None:
     ]
 
 
+def test_mixed_dispatch_calls_shared_tile_primitive() -> None:
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(W4A16MixedTrellisKernel._dispatch_tier_gemm))
+    )
+    tile_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr.startswith("_run_tile")
+    ]
+
+    assert [node.func.attr for node in tile_calls] == ["_run_tile"]
+    assert [ast.unparse(arg) for arg in tile_calls[0].args[10:13]] == [
+        "trellis_lut_addr",
+        "smem_base",
+        "tid",
+    ]
+
+
 def _prepared(
     *,
     experts: int,
@@ -194,6 +216,7 @@ def _prepared(
     device: torch.device,
     tile_config: tuple[int, int, int, int] = (128, 128, 128, 128),
     shared_h: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    codebook: str = "mcg",
 ):
     generator = torch.Generator(device=device).manual_seed(seed)
 
@@ -222,6 +245,7 @@ def _prepared(
         params_dtype=torch.float16,
         w13_layout="trellis3_t256_proj",
         trellis_bits=bits,
+        codebook=codebook,
         gate_suh=gate_suh,
         up_suh=up_suh,
         intermediate_rotations=intermediate_rotations,
@@ -282,8 +306,10 @@ def _serial_tier(
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("route_ids_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("codebook", ["mcg", "sqg_xor_cheb_t12"])
 def test_mixed_k3_k4_matches_serial_and_captures(
     route_ids_dtype: torch.dtype,
+    codebook: str,
 ) -> None:
     torch.manual_seed(20260730)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -295,6 +321,7 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         bits=3,
         seed=301,
         device=device,
+        codebook=codebook,
     )
     tier1 = _prepared(
         experts=2,
@@ -303,6 +330,7 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         bits=4,
         seed=401,
         device=device,
+        codebook=codebook,
     )
     x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
     # Global expert ids deliberately interleave K3 and K4 tiers. The combined
@@ -330,6 +358,7 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         max_shared_mem=int(props.shared_memory_per_block_optin),
         force_tile_config=(128, 128, 128, 128),
         route_ids_dtype=route_ids_dtype,
+        trellis_codebook=codebook,
     )
     assert launch.local_memory_bytes == 0
     global_to_combined, descriptor = build_tiered_maps((2, 0), (3, 1), device=device)
@@ -832,7 +861,7 @@ def test_build_tiered_maps_rejects_invalid_partitions() -> None:
 def test_one_grid_large_blocks_avoid_serial_prefill_drift(
     candidate_block_size: int,
 ) -> None:
-    """Large route blocks with paired-M8 FC2 preserve one-grid arithmetic."""
+    """Large route blocks with M8 FC2 subtiles preserve one-grid arithmetic."""
 
     torch.manual_seed(20260801)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -933,7 +962,6 @@ def test_one_grid_large_blocks_avoid_serial_prefill_drift(
     assert candidate_launch.moe_block_size == candidate_block_size
     assert candidate_launch.fc2_moe_block_size == 8
     assert candidate_launch.fc2_schedule_route_block_factor == 2
-    assert candidate_launch.fc2_paired_m8_routes is True
     assert phase_equal == (True, True, True), geometry
     assert torch.equal(candidate, reference), geometry
     assert candidate_launch.local_memory_bytes == 0
@@ -949,7 +977,7 @@ def test_glm52_large_m_mixed_k3_k4_matches_serial() -> None:
     torch.manual_seed(20260730)
     device = torch.device("cuda", torch.cuda.current_device())
     m, hidden, intermediate, topk = 3072, 6144, 512, 8
-    tile_config = (128, 128, 32, 512)
+    tile_config = (128, 128, 64, 256)
     tier0_experts, tier1_experts = 192, 64
     tier0 = _prepared(
         experts=tier0_experts,
