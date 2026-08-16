@@ -3246,6 +3246,11 @@ class MoEDynamicKernelBackend:
                                                     packed64,
                                                 )
                                             else:
+                                                # The offset needs a concrete
+                                                # type on the inactive-route
+                                                # fall-through path of the
+                                                # dynamic guard below.
+                                                output_offset = Int32(0)
                                                 for cache_slot in cutlass.range_constexpr(
                                                     8
                                                 ):
