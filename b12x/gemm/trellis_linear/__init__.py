@@ -29,9 +29,9 @@ META = OpMeta(
     ),
     dtypes=("bf16", "fp16"),
     recipes=(
-        "w4a16/exl3_trellis_mcg",
-        "w4a16/exl3_trellis_sqg_cheb_e4m3",
-        "w4a8/exl3_trellis_sqg_cheb_e4m3",
+        "w4a16/trellis_mcg",
+        "w4a16/trellis_sqg_e4m3",
+        "w4a8/trellis_sqg_e4m3",
     ),
     provenance=Provenance(
         repo="https://github.com/local-inference-lab/b12x",

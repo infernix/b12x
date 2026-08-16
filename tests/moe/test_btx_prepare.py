@@ -158,7 +158,8 @@ def test_btx_uniform_k2_coupled_matches_legacy_atoms_v2_reader(
     assert btx_prepared.trellis.bits == 2
     assert btx_prepared.coupled_hadamard
     assert btx_prepared.tile_config == legacy_prepared.tile_config
-    assert btx_prepared.source_format == legacy_prepared.source_format
+    assert btx_prepared.source_format == "btx"
+    assert legacy_prepared.source_format == "qsrt_sqg_e4m3"
 
 
 @requires_cuda
@@ -239,7 +240,7 @@ def test_btx_uniform_mcg_matches_direct_binder(tmp_path) -> None:
         binder_prepared.intermediate_rotations,
     )
     assert btx_prepared.trellis_codebook == "mcg"
-    assert btx_prepared.source_format == "exl3_trellis_mcg"
+    assert btx_prepared.source_format == "btx"
 
 
 def _per_expert_config(kinds: dict[int, tuple[int, int]]) -> BtxSynthConfig:

@@ -426,10 +426,11 @@ def prepare_btx_moe_weights(
             workspace=workspace,
         )
         if not manifest.hadamard.coupled:
-            return prepared
+            return replace(prepared, source_format="btx")
         assert prepared.trellis is not None
         return replace(
             prepared,
+            source_format="btx",
             trellis=replace(
                 prepared.trellis,
                 coupled_hadamard=True,
@@ -437,17 +438,20 @@ def prepare_btx_moe_weights(
             ),
         )
 
-    return _prepare_btx_pair_extent(
-        layer,
-        device=device,
-        gate_suh=gate_suh,
-        up_suh=up_suh,
-        down_svh=down_svh,
-        rotations=rotations,
-        params_dtype=params_dtype,
-        tile_config=tile_config or (64, 256, 64, 256),
-        dummy_scale=dummy_scale,
-        workspace=workspace,
+    return replace(
+        _prepare_btx_pair_extent(
+            layer,
+            device=device,
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            down_svh=down_svh,
+            rotations=rotations,
+            params_dtype=params_dtype,
+            tile_config=tile_config or (64, 256, 64, 256),
+            dummy_scale=dummy_scale,
+            workspace=workspace,
+        ),
+        source_format="btx",
     )
 
 

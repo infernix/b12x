@@ -80,6 +80,10 @@ from b12x.moe._shared.execution import (
     make_moe_spec,
     plan_moe_weight_preparation,
 )
+from b12x.moe._shared.execution import (
+    _SOURCE_FORMATS as _EXECUTION_SOURCE_FORMATS,
+    _TRELLIS_SOURCE_FORMATS as _EXECUTION_TRELLIS_SOURCE_FORMATS,
+)
 from b12x.moe._shared.trellis_codebooks import MCG, SQG_E4M3, SQG_FP16
 from b12x.moe._shared.tuning import lookup_max_active_clusters
 from b12x._lib.runtime_control import (
@@ -124,25 +128,10 @@ _DYNAMIC_W4A8_SHARE_INPUT_ENV = "B12X_DYNAMIC_W4A8_SHARE_INPUT"
 _DYNAMIC_W4A8_MATERIALIZED_ENV = "B12X_DYNAMIC_W4A8_MATERIALIZED"
 _W4A8_CONVERT_SCRATCH_MB_ENV = "B12X_W4A8_CONVERT_SCRATCH_MB"
 _W4A8_CONVERT_SCRATCH_MB_DEFAULT = 64
-_FP4_SOURCE_FORMATS = {
-    "modelopt_nvfp4": "modelopt_nvfp4",
-    "fp4_e8m0_k32": "fp4_e8m0_k32",
-    "compressed_tensors": "compressed_tensors",
-    # Packed MX-FP6 E2M3 codes with UE8M0 K/32 grids; exclusive to the
-    # w6a8_mx recipe (see _validate_fp4_source_format_for_quant_mode).
-    "mxfp6_e2m3": "mxfp6_e2m3",
-    # Native fixed-payload QSRT with finite E4M3 reconstruction.
-    "qsrt_sqg_e4m3": "qsrt_sqg_e4m3",
-    # Existing general EXL3 full-rotation MCG source contract.
-    "exl3_trellis_mcg": "exl3_trellis_mcg",
-    # Uniform K5/K6 SQG with the frozen 416-byte FP16-D3L scalar law.
-    "sqg_fp16_d3l": "sqg_fp16_d3l",
-}
-_TRELLIS_SOURCE_FORMATS = {
-    "exl3_trellis_mcg",
-    "qsrt_sqg_e4m3",
-    "sqg_fp16_d3l",
-}
+# The source-format vocabulary is owned by b12x.moe._shared.execution;
+# these views keep the historical local names.
+_FP4_SOURCE_FORMATS = {name: name for name in _EXECUTION_SOURCE_FORMATS}
+_TRELLIS_SOURCE_FORMATS = frozenset(_EXECUTION_TRELLIS_SOURCE_FORMATS)
 _W4A16_SCALE_FORMATS = {
     "e4m3_k16": "e4m3_k16",
     "e4m3_k32": "e4m3_k32",
@@ -282,6 +271,7 @@ class TPW4A16Workspace:
     trellis_bits: int = 3
     trellis_tile_config: tuple[int, int, int, int] | None = None
     qsrt_storage_format: str | None = None
+    trellis_pair_kinds: frozenset[str] | None = None
     coupled_hadamard: bool = False
     route_block_size_m: int | None = None
     planned_token_counts: frozenset[int] = field(default_factory=frozenset)
@@ -703,6 +693,7 @@ class _TPCoreWorkspacePlan:
     trellis_bits: int = 3
     trellis_tile_config: tuple[int, int, int, int] | None = None
     qsrt_storage_format: str | None = None
+    trellis_pair_kinds: frozenset[str] | None = None
     coupled_hadamard: bool = False
     route_block_size_m: int | None = None
     tensor_specs: Tuple[_TensorAllocSpec, ...] = ()
@@ -1328,10 +1319,8 @@ def _normalize_fp4_source_format(source_format: str) -> str:
         return _FP4_SOURCE_FORMATS[source_format.lower()]
     except KeyError as exc:
         raise ValueError(
-            "source_format must be one of 'modelopt_nvfp4', "
-            "'fp4_e8m0_k32', 'compressed_tensors', 'mxfp6_e2m3', or "
-            "'exl3_trellis_mcg', 'qsrt_sqg_e4m3', or 'sqg_fp16_d3l', "
-            f"got {source_format!r}"
+            "source_format must be one of "
+            f"{sorted(_FP4_SOURCE_FORMATS)}, got {source_format!r}"
         ) from exc
 
 
@@ -1426,6 +1415,27 @@ def _normalize_swiglu_params(
     )
 
 
+def _fc_trellis_pair_kind(workspace) -> str | None:
+    """Compile-time pair kind from declared rates or legacy storage ids.
+
+    BTX plans declare the pair-kind summary directly; the legacy atom
+    schemas imply it (atoms-v2 pairs are compact P33/P43 descriptors at the
+    bits-3 anchor, atoms-v1 pairs are PDYNAMIC mode tables).
+    """
+
+    kinds = workspace.trellis_pair_kinds
+    if kinds:
+        return "P33_P43" if "P43" in kinds else "PDYNAMIC"
+    if (
+        workspace.qsrt_storage_format == "qsrt_atoms_v2"
+        and workspace.trellis_bits == 3
+    ):
+        return "P33_P43"
+    if workspace.qsrt_storage_format == "qsrt_atoms_v1":
+        return "PDYNAMIC"
+    return None
+
+
 def _validate_fp4_source_format_for_quant_mode(
     *, source_format: str, quant_mode: str
 ) -> None:
@@ -1449,7 +1459,7 @@ def _validate_fp4_source_format_for_quant_mode(
         return
     if source_format == "fp4_e8m0_k32" and quant_mode == "w4a8_mx":
         return
-    if source_format == "qsrt_sqg_e4m3" and quant_mode == "w4a8_mx":
+    if source_format in {"qsrt_sqg_e4m3", "btx"} and quant_mode == "w4a8_mx":
         return
     raise ValueError(
         f"source_format={source_format!r} with quant_mode={quant_mode!r} is "
@@ -2536,6 +2546,7 @@ def _plan_core_workspace(
     trellis_bits: int = 3,
     trellis_tile_config: tuple[int, int, int, int] | None = None,
     qsrt_storage_format: str | None = None,
+    trellis_pair_kinds: frozenset[str] | None = None,
     coupled_hadamard: bool = False,
     apply_router_weight_on_input: bool = False,
     deterministic_output: bool = False,
@@ -2833,6 +2844,7 @@ def _plan_core_workspace(
             trellis_bits=int(trellis_bits),
             trellis_tile_config=trellis_tile_config,
             qsrt_storage_format=qsrt_storage_format,
+            trellis_pair_kinds=trellis_pair_kinds,
             coupled_hadamard=bool(coupled_hadamard),
             route_block_size_m=w4a16_block_size_m,
             tensor_specs=tuple(tensor_specs),
@@ -3271,6 +3283,7 @@ def _materialize_workspace_from_core_arena(
             trellis_bits=plan.trellis_bits,
             trellis_tile_config=plan.trellis_tile_config,
             qsrt_storage_format=plan.qsrt_storage_format,
+            trellis_pair_kinds=plan.trellis_pair_kinds,
             coupled_hadamard=plan.coupled_hadamard,
             route_block_size_m=plan.route_block_size_m,
             volatile_launch_state=bool(volatile_launch_state),
@@ -5011,6 +5024,10 @@ def plan_b12x_fp4_moe_weights(
     qsrt_storage_format: str | None = None,
     qsrt_profile: str | None = None,
     coupled_hadamard: bool | None = None,
+    trellis_codebook: str | None = None,
+    trellis_rate_structure: str | None = None,
+    trellis_pair_kinds: Sequence[str] | frozenset[str] | None = None,
+    coupled_hadamard_blocks: tuple[int, int] | None = None,
 ) -> MoEWeightPreparationPlan:
     """Plan the one canonical weight allocation used by selected recipes."""
 
@@ -5041,6 +5058,10 @@ def plan_b12x_fp4_moe_weights(
         qsrt_storage_format=qsrt_storage_format,
         qsrt_profile=qsrt_profile,
         coupled_hadamard=coupled_hadamard,
+        trellis_codebook=trellis_codebook,
+        trellis_rate_structure=trellis_rate_structure,
+        trellis_pair_kinds=trellis_pair_kinds,
+        coupled_hadamard_blocks=coupled_hadamard_blocks,
     )
 
 
@@ -5067,6 +5088,8 @@ def prepare_b12x_fp4_moe_weights(
     qsrt_expert_ids: torch.Tensor | None = None,
     qsrt_format_codes: torch.Tensor | None = None,
     qsrt_rotation_draws: torch.Tensor | None = None,
+    btx_layer: object | None = None,
+    btx_device: torch.device | str | None = None,
     dummy_scale: torch.Tensor | None = None,
 ) -> B12XFP4ExpertWeights:
     """Transfer source tensors into the planner-selected runtime owner."""
@@ -5077,6 +5100,103 @@ def prepare_b12x_fp4_moe_weights(
     if actual_dtype != plan.io_dtype:
         raise ValueError(
             f"params_dtype={actual_dtype!r} does not match plan dtype={plan.io_dtype!r}"
+        )
+    if plan.source_format == "btx":
+        from b12x.moe._shared.kernels.w4a16.btx import (
+            BtxLayer,
+            prepare_btx_moe_weights,
+        )
+
+        if not isinstance(btx_layer, BtxLayer):
+            raise ValueError(
+                "btx preparation requires btx_layer, a BtxLayer extent from "
+                "read_btx_layer"
+            )
+        if btx_device is None:
+            raise ValueError(
+                "btx preparation requires btx_device, the CUDA device that "
+                "owns the prepared weights"
+            )
+        if len(plan.quant_modes) != 1 or not plan.quant_modes <= frozenset(
+            {"w4a16", "w4a8_mx"}
+        ):
+            raise ValueError(
+                "btx weights support exactly one of quant_mode='w4a16' or "
+                "quant_mode='w4a8_mx'"
+            )
+        manifest = btx_layer.manifest
+        if manifest.codebook != plan.trellis_codebook:
+            raise ValueError(
+                f"btx manifest codebook {manifest.codebook!r} does not match "
+                f"the plan's trellis_codebook {plan.trellis_codebook!r}"
+            )
+        if (
+            manifest.rates.bits is not None
+            and manifest.rates.bits != plan.trellis_bits
+        ):
+            raise ValueError(
+                f"btx manifest declares bits={manifest.rates.bits}; the plan "
+                f"declares trellis_bits={plan.trellis_bits}"
+            )
+        if manifest.rates.structure != (
+            plan.trellis_rate_structure or "uniform"
+        ):
+            raise ValueError(
+                "btx manifest rate structure "
+                f"{manifest.rates.structure!r} does not match the plan's "
+                f"{plan.trellis_rate_structure!r}"
+            )
+        if (manifest.rates.pair_kinds or None) != plan.trellis_pair_kinds:
+            raise ValueError(
+                "btx manifest pair kinds do not match the plan's "
+                "trellis_pair_kinds"
+            )
+        if manifest.hadamard.coupled != plan.coupled_hadamard:
+            raise ValueError(
+                "btx manifest coupled-Hadamard declaration does not match "
+                "the plan"
+            )
+        if (
+            manifest.geometry.num_experts != plan.num_experts
+            or manifest.geometry.hidden_size != plan.hidden_size
+        ):
+            raise ValueError(
+                "btx manifest geometry does not match the plan's expert "
+                "count or hidden size"
+            )
+        if btx_layer.local_intermediate_size != plan.intermediate_size:
+            raise ValueError(
+                f"btx extent covers {btx_layer.local_intermediate_size} "
+                "intermediate channels; the plan declares "
+                f"{plan.intermediate_size}"
+            )
+        value = prepare_btx_moe_weights(
+            btx_layer,
+            activation=plan.activation,
+            device=btx_device,
+            params_dtype=torch.float16,
+            tile_config=plan.trellis_tile_config,
+            dummy_scale=dummy_scale,
+        )
+        representation = _PreparedWeightRepresentation(
+            quant_mode=next(iter(plan.quant_modes)),
+            layout=PreparedWeightLayout.TRELLIS_NATIVE,
+            value=value,
+        )
+        input_scale = torch.ones(
+            (), dtype=torch.float32, device=value.w13.device
+        )
+        return B12XFP4ExpertWeights(
+            plan=plan,
+            a1_gscale=a1_gscale if a1_gscale is not None else input_scale,
+            w1_fp4=value.w13,
+            w1_blockscale=value.w13_scale,
+            w1_alphas=value.w13_global_scale,
+            a2_gscale=a2_gscale if a2_gscale is not None else input_scale,
+            w2_fp4=value.w2,
+            w2_blockscale=value.w2_scale,
+            w2_alphas=value.w2_global_scale,
+            representation=representation,
         )
     if plan.source_format == "qsrt_sqg_e4m3":
         if len(plan.quant_modes) != 1 or not plan.quant_modes <= frozenset(
@@ -6692,6 +6812,7 @@ def plan_tp_moe_arena_layout(
             trellis_bits=weight_plan.trellis_bits or 3,
             trellis_tile_config=weight_plan.trellis_tile_config,
             qsrt_storage_format=weight_plan.qsrt_storage_format,
+            trellis_pair_kinds=weight_plan.trellis_pair_kinds,
             coupled_hadamard=weight_plan.coupled_hadamard,
             apply_router_weight_on_input=apply_router_weight_on_input,
             deterministic_output=plan.deterministic_output,
@@ -7026,6 +7147,7 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         trellis_bits=caps.weight_plan.trellis_bits or 3,
         trellis_tile_config=caps.weight_plan.trellis_tile_config,
         qsrt_storage_format=caps.weight_plan.qsrt_storage_format,
+        trellis_pair_kinds=caps.weight_plan.trellis_pair_kinds,
         coupled_hadamard=caps.weight_plan.coupled_hadamard,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         deterministic_output=launch_plan.deterministic_output,
@@ -7189,22 +7311,8 @@ def _prewarm_w4a16_planned_launches(
                     w13_layout=w13_layout,
                     collect_activation_amax=collect_activation_amax,
                     trellis_bits=workspace.trellis_bits,
-                    fc1_trellis_pair_kind=(
-                        "P33_P43"
-                        if workspace.qsrt_storage_format == "qsrt_atoms_v2"
-                        and workspace.trellis_bits == 3
-                        else "PDYNAMIC"
-                        if workspace.qsrt_storage_format == "qsrt_atoms_v1"
-                        else None
-                    ),
-                    fc2_trellis_pair_kind=(
-                        "P33_P43"
-                        if workspace.qsrt_storage_format == "qsrt_atoms_v2"
-                        and workspace.trellis_bits == 3
-                        else "PDYNAMIC"
-                        if workspace.qsrt_storage_format == "qsrt_atoms_v1"
-                        else None
-                    ),
+                    fc1_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
+                    fc2_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
                     force_tile_config=workspace.trellis_tile_config,
                     intermediate_rotation=full_rotation,
                     full_rotation=full_rotation,
@@ -7366,21 +7474,11 @@ def _prewarm_w4a16_planned_launches(
                         w13_layout=w13_layout,
                         collect_activation_amax=False,
                         trellis_bits=workspace.trellis_bits,
-                        fc1_trellis_pair_kind=(
-                            "P33_P43"
-                            if workspace.qsrt_storage_format == "qsrt_atoms_v2"
-                            and workspace.trellis_bits == 3
-                            else "PDYNAMIC"
-                            if workspace.qsrt_storage_format == "qsrt_atoms_v1"
-                            else None
+                        fc1_trellis_pair_kind=_fc_trellis_pair_kind(
+                            workspace
                         ),
-                        fc2_trellis_pair_kind=(
-                            "P33_P43"
-                            if workspace.qsrt_storage_format == "qsrt_atoms_v2"
-                            and workspace.trellis_bits == 3
-                            else "PDYNAMIC"
-                            if workspace.qsrt_storage_format == "qsrt_atoms_v1"
-                            else None
+                        fc2_trellis_pair_kind=_fc_trellis_pair_kind(
+                            workspace
                         ),
                         force_tile_config=workspace.trellis_tile_config,
                         direct_topk_routes=True,
@@ -7547,6 +7645,7 @@ def materialize_tp_moe_arena_workspaces(
             trellis_bits=weight_plan.trellis_bits or 3,
             trellis_tile_config=weight_plan.trellis_tile_config,
             qsrt_storage_format=weight_plan.qsrt_storage_format,
+            trellis_pair_kinds=weight_plan.trellis_pair_kinds,
             coupled_hadamard=weight_plan.coupled_hadamard,
             apply_router_weight_on_input=apply_router_weight_on_input,
             deterministic_output=plan.deterministic_output,

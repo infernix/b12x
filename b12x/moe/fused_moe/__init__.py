@@ -80,6 +80,8 @@ META = OpMeta(
         "w4a8_nvfp4",
         "w6a8_mx",
         "w4a16",
+        "w4a16/btx",
+        "w4a8_mx/btx",
         "w4a16/exl3_trellis_mcg",
         "w4a16/qsrt_sqg_e4m3",
         "w4a16/sqg_fp16_d3l",
