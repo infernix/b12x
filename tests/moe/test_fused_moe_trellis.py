@@ -652,7 +652,7 @@ def test_sqg_fp16_d3l_uniform_w4a16_matches_reference_and_captures(
         fc1_tile_n=128,
         fc2_tile_n=128,
         params_dtype=torch.float16,
-        w13_layout="trellis3_t256_proj",
+        w13_layout="trellis_t256_proj",
         trellis_bits=bits,
         codebook="sqg_fp16",
         gate_suh=gate_suh,
@@ -1706,7 +1706,7 @@ def test_coupled_higher_rate_w4a16_matches_transform_reference(
         params_dtype=torch.float16,
         fc1_tile_n=128,
         fc2_tile_n=128,
-        w13_layout="trellis3_t256_proj",
+        w13_layout="trellis_t256_proj",
         trellis_bits=bits,
         codebook="sqg_e4m3",
         gate_suh=source_suh,
@@ -1715,12 +1715,16 @@ def test_coupled_higher_rate_w4a16_matches_transform_reference(
         down_svh=down_svh,
         tile_config=(128, 128, 128, 128),
     )
+    assert prepared.trellis is not None
     prepared = replace(
         prepared,
-        coupled_hadamard=True,
-        intermediate_rotations=torch.cat(
-            (ordinary_rotations, coupled_signs), dim=1
-        ).contiguous(),
+        trellis=replace(
+            prepared.trellis,
+            coupled_hadamard=True,
+            intermediate_rotations=torch.cat(
+                (ordinary_rotations, coupled_signs), dim=1
+            ).contiguous(),
+        ),
     )
 
     slot0_weights = _reconstruct_native(
@@ -2517,12 +2521,16 @@ def test_qsrt_atoms_v2_prepared_p33_p43_matches_full_rotation_reference(
     )
     if mode_values == (0, 0):
         legacy_modes = torch.zeros(experts, dtype=torch.int32, device=device)
+        assert prepared.trellis is not None
         legacy_prepared = replace(
             prepared,
-            fc1_trellis_pair_kind="PDYNAMIC",
-            fc2_trellis_pair_kind="PDYNAMIC",
-            fc1_trellis_pair_modes=legacy_modes,
-            fc2_trellis_pair_modes=legacy_modes,
+            trellis=replace(
+                prepared.trellis,
+                fc1_pair_kind="PDYNAMIC",
+                fc2_pair_kind="PDYNAMIC",
+                fc1_pair_modes=legacy_modes,
+                fc2_pair_modes=legacy_modes,
+            ),
         )
         legacy_buffers = make_w4a16_packed_buffers(
             legacy_prepared,
@@ -3115,9 +3123,9 @@ def test_qsrt_pdynamic_cache_key_ignores_expert_count() -> None:
             moe_block_size=8,
             max_m_blocks=4,
             element_dtype="fp16",
-            weight_layout="trellis3_t256",
+            weight_layout="trellis_t256",
             scale_format="e4m3_k32",
-            w13_layout="trellis3_t256_proj",
+            w13_layout="trellis_t256_proj",
             trellis_bits=3,
             trellis_codebook="sqg_e4m3",
             fc1_trellis_pair_kind=pair_kind,

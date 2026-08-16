@@ -495,7 +495,7 @@ class MoEWeightPreparationPlan:
     @property
     def w4a16_weight_layout(self) -> str | None:
         if WeightPreparationTransform.W4A16_TRELLIS in self.transforms:
-            return "trellis3_t256"
+            return "trellis_t256"
         if WeightPreparationTransform.W4A16_NATIVE in self.transforms:
             return "modelopt"
         if WeightPreparationTransform.W4A16_PACKED in self.transforms:
@@ -507,7 +507,7 @@ class MoEWeightPreparationPlan:
         """Kernel weight-layout string for the w4a8_mx recipe, if planned."""
 
         if WeightPreparationTransform.W4A8_TRELLIS in self.transforms:
-            return "trellis3_t256"
+            return "trellis_t256"
         if WeightPreparationTransform.W4A8_QMMA in self.transforms:
             return "qmma_repacked"
         return None

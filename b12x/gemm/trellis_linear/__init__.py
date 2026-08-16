@@ -1,6 +1,6 @@
 """Trellis-coded dense linear for SM12x.
 
-The operation consumes the checkpoint-native ``trellis3_t256`` payload
+The operation consumes the checkpoint-native ``trellis_t256`` payload
 (MCG or SQG-XOR-Cheb-T12 codebooks) and
 its two Hadamard sign vectors.  Preparation validates and records zero-copy
 views; execution performs input rotation, a W4A16 or direct E4M3-W4A8 GEMM,

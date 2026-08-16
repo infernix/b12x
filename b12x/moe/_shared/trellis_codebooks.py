@@ -1,6 +1,6 @@
 """Trellis codebook registry shared by preparation, planning, and kernels.
 
-A ``trellis3_t256`` tile stores 256 tail-biting codes whose 16-bit decode
+A ``trellis_t256`` tile stores 256 tail-biting codes whose 16-bit decode
 windows are interpreted by one codebook. The codebook is a model-level
 setting; three are defined:
 

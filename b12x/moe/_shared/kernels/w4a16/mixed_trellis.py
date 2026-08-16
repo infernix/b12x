@@ -1,4 +1,4 @@
-"""One-launch mixed-bitrate ``trellis3_t256`` MoE execution.
+"""One-launch mixed-bitrate ``trellis_t256`` MoE execution.
 
 The route packer assigns every global expert to one combined expert namespace.
 Input/intermediate rotations therefore run once. Per-tile dispatch resolves the
@@ -135,7 +135,7 @@ class W4A16MixedTrellisKernel:
                 raise ValueError(f"mixed Trellis {name} requires full rotation")
             if moe.direct_topk_routes or moe.tc_decode_fused_sum:
                 raise ValueError(f"mixed Trellis {name} requires route packing")
-            if moe.weight_layout != "trellis3_t256":
+            if moe.weight_layout != "trellis_t256":
                 raise ValueError(f"mixed Trellis {name} requires native t256 weights")
             if moe.element_dtype != "fp16":
                 raise ValueError(f"mixed Trellis {name} requires fp16 GEMM operands")
@@ -837,9 +837,9 @@ def compile_mixed_trellis(
             fc2_moe_block_size=(8 if grouped_m8_fc2 else moe_block_size),
             fc2_schedule_route_block_factor=(2 if grouped_m8_fc2 else 1),
             element_dtype="fp16",
-            weight_layout="trellis3_t256",
+            weight_layout="trellis_t256",
             scale_format="e4m3_k32",
-            w13_layout="trellis3_t256_proj",
+            w13_layout="trellis_t256_proj",
             trellis_bits=bits,
             trellis_codebook=trellis_codebook,
             intermediate_rotation=True,

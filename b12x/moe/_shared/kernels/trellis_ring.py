@@ -1,6 +1,6 @@
 """t256 tail-biting ring window geometry shared by the W4A16 and W4A8 kernels.
 
-One ``trellis3_t256`` tile packs 256 codes into a ring of ``8*bits`` uint32
+One ``trellis_t256`` tile packs 256 codes into a ring of ``8*bits`` uint32
 words (``256*bits`` bits total). Weight ``j`` of lane ``l`` occupies the
 16-bit window ending at bit ``(8*l + j + 257) * bits``, taken modulo the
 ring; consecutive weights overlap by ``16 - bits`` bits. The geometry

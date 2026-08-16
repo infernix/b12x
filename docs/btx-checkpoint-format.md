@@ -14,7 +14,7 @@ Storage schema id: `btx-atoms-v1`. The in-repo schema implementation is
 
 ## Concepts
 
-**Atom slot.** Weights are quantized as `trellis3_t256` tiles over the
+**Atom slot.** Weights are quantized as `trellis_t256` tiles over the
 model's global intermediate axis. That axis is divided into 32-channel
 *atom slots*; a slot is the resharding grain. Every per-channel datum a
 rank needs is stored slot-major, so a rank extent — a contiguous, aligned

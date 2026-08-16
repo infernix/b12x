@@ -155,7 +155,7 @@ _W13_LAYOUTS = {
     # in-place W13 row rotation ("w13"), "gate_up" is already kernel-native.
     "up_gate": "w13",
     "gate_up": "w31",
-    "trellis3_t256_proj": "trellis3_t256_proj",
+    "trellis_t256_proj": "trellis_t256_proj",
 }
 
 _DEVICE_CAPABILITY_CACHE: dict[int, tuple[int, int]] = {}
@@ -1378,10 +1378,10 @@ def _w4a16_weight_layout_for_source(source_format: str) -> str:
     just not auto-routed here.)
     """
     source_format = _normalize_fp4_source_format(source_format)
-    return "trellis3_t256" if source_format in _TRELLIS_SOURCE_FORMATS else "packed"
+    return "trellis_t256" if source_format in _TRELLIS_SOURCE_FORMATS else "packed"
 
 
-_W4A16_WEIGHT_LAYOUTS = {"packed", "modelopt", "trellis3_t256"}
+_W4A16_WEIGHT_LAYOUTS = {"packed", "modelopt", "trellis_t256"}
 
 
 def _normalize_w4a16_weight_layout(weight_layout: str) -> str:
@@ -2578,12 +2578,12 @@ def _plan_core_workspace(
             else _w4a16_weight_layout_for_source(source_format)
         )
         requested_route_E = int(route_num_experts or weight_E)
-        full_rotation = weight_layout == "trellis3_t256"
+        full_rotation = weight_layout == "trellis_t256"
         route_E = requested_route_E if full_rotation else int(weight_E)
         if full_rotation:
             if source_format not in _TRELLIS_SOURCE_FORMATS:
                 raise ValueError(
-                    "trellis3_t256 workspace requires a trellis source format"
+                    "trellis_t256 workspace requires a trellis source format"
                 )
             if int(k) % 128 != 0 or int(n) % 128 != 0:
                 raise ValueError(
@@ -4717,7 +4717,7 @@ def _w4a8_prepared_dict(prepared: object) -> dict[str, torch.Tensor]:
 
     if isinstance(prepared, dict):
         values = prepared
-    elif getattr(prepared, "weight_layout", None) == "trellis3_t256":
+    elif getattr(prepared, "weight_layout", None) == "trellis_t256":
         # Trellis-native representation: the rp slots carry the
         # projection-major payloads and the sfb slots carry the fp16
         # boundary rotations. The dynamic launch keys trellis mode off
@@ -5337,7 +5337,7 @@ def prepare_b12x_fp4_moe_weights(
             params_dtype=torch.float16,
             fc1_tile_n=tile_config[1],
             fc2_tile_n=tile_config[3],
-            w13_layout="trellis3_t256_proj",
+            w13_layout="trellis_t256_proj",
             trellis_bits=plan.trellis_bits,
             dummy_scale=dummy_scale,
             codebook=SQG_FP16 if is_d3l else MCG,
@@ -5751,7 +5751,7 @@ def _resolve_workspace_layout(
         # W4A8-MX sizes so compacted checkpoints never require a second
         # source-native copy merely to enter the tiny-decode band.
         if normalized_quant_mode == "w4a8_mx":
-            if weight_layout == "trellis3_t256":
+            if weight_layout == "trellis_t256":
                 # Trellis-native serving: the direct micro trellis arm owns
                 # the decode band; the dynamic kernel's w4a8_trellis recipe
                 # serves every larger batch. The QMMA tiny-decode kernel
@@ -6765,13 +6765,13 @@ def _plan_full_rotation_w4a16_launches(
     scale_format = _normalize_w4a16_scale_format(
         caps.w4a16_scale_format or _w4a16_scale_format_for_source(caps.source_format)
     )
-    if weight_layout != "trellis3_t256" or scale_format != "e4m3_k32":
+    if weight_layout != "trellis_t256" or scale_format != "e4m3_k32":
         raise RuntimeError(
             "full-rotation Trellis launch planning requires "
-            "weight_layout='trellis3_t256' and scale_format='e4m3_k32'; "
+            "weight_layout='trellis_t256' and scale_format='e4m3_k32'; "
             f"got weight_layout={weight_layout!r}, scale_format={scale_format!r}"
         )
-    w13_layout = "trellis3_t256_proj"
+    w13_layout = "trellis_t256_proj"
     _, capacity_route_slots, capacity_m_blocks = route_pack_capacity(
         capacity_tokens * core_plan.num_topk,
         block_size_m,
@@ -7093,7 +7093,7 @@ def _prewarm_w4a16_planned_launches(
     weight_layout = _normalize_w4a16_weight_layout(weight_layout)
     full_rotation = bool(workspace.full_rotation)
     if full_rotation:
-        w13_layout = "trellis3_t256_proj"
+        w13_layout = "trellis_t256_proj"
     else:
         w13_layout = _normalize_w13_layout(w13_layout)
     collect_activation_amax = bool(collect_activation_amax)
@@ -8288,7 +8288,7 @@ def _get_micro_kernel(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
     )
-    micro_trellis = weight_layout == "trellis3_t256"
+    micro_trellis = weight_layout == "trellis_t256"
     if micro_trellis:
         micro_kwargs["weight_layout"] = weight_layout
         micro_kwargs["trellis_bits"] = int(trellis_bits)
@@ -10191,7 +10191,7 @@ def _launch_compact_micro_flat(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
-        weight_layout="trellis3_t256" if w4a8_trellis else None,
+        weight_layout="trellis_t256" if w4a8_trellis else None,
         trellis_bits=trellis_bits,
         trellis_coupled=trellis_coupled,
     )
@@ -10869,7 +10869,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             raise RuntimeError(
                 "the W4A16 weight plan did not materialize its required representation"
             )
-        full_rotation = getattr(prepared, "weight_layout", "") == "trellis3_t256"
+        full_rotation = getattr(prepared, "weight_layout", "") == "trellis_t256"
         output_dtype = torch.float32 if full_rotation else a.dtype
         if output is None:
             if torch.cuda.is_current_stream_capturing():
@@ -11019,7 +11019,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         micro_w4a8_trellis = (
             quant_mode == "w4a8_mx"
             and getattr(prepared_payload, "weight_layout", None)
-            == "trellis3_t256"
+            == "trellis_t256"
         )
         if micro_w4a8_trellis:
             wv = _w4a8_trellis_weight_views(

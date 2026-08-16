@@ -172,9 +172,9 @@ _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT = 64
 _DEVICE_MAX_REG_BYTES = 255 * 1024
 _DEFAULT_MAX_SHARED_MEM = 101_376
 _SCALAR_ACC_FRAGMENT_WIDTH = 1
-_WEIGHT_LAYOUTS = {"packed", "modelopt", "trellis3_t256"}
+_WEIGHT_LAYOUTS = {"packed", "modelopt", "trellis_t256"}
 _MODEL_OPT_W13_LAYOUTS = {"w13", "w31"}
-_TRELLIS256_W13_LAYOUTS = {"packed", "trellis3_t256_proj"}
+_TRELLIS256_W13_LAYOUTS = {"packed", "trellis_t256_proj"}
 # Native QSRT t256 tiles contain 256 tail-biting codes at one compile-time
 # bitrate. Their exact storage is [16*bits] int16 == [8*bits] uint32 per tile.
 _TRELLIS256_BITS = (2, 3, 4, 5, 6)
@@ -819,27 +819,27 @@ class W4A16GemmKernel:
         if weight_layout == "modelopt":
             if w13_layout not in _MODEL_OPT_W13_LAYOUTS:
                 raise ValueError(f"unsupported W4A16 w13_layout {w13_layout!r}")
-        elif weight_layout == "trellis3_t256":
+        elif weight_layout == "trellis_t256":
             if w13_layout not in _TRELLIS256_W13_LAYOUTS:
-                raise ValueError(f"unsupported trellis3_t256 w13_layout {w13_layout!r}")
+                raise ValueError(f"unsupported trellis_t256 w13_layout {w13_layout!r}")
         else:
             w13_layout = "packed"
             source_n_rotation = 0
-        if weight_layout == "trellis3_t256":
+        if weight_layout == "trellis_t256":
             if trellis_codebook not in _TRELLIS256_CODEBOOKS:
                 raise ValueError(
-                    "trellis3_t256 codebook must be one of "
+                    "trellis_t256 codebook must be one of "
                     f"{sorted(_TRELLIS256_CODEBOOKS)}, got {trellis_codebook!r}"
                 )
             if trellis_bits not in _TRELLIS256_BITS:
                 raise ValueError(
-                    "trellis3_t256 bits must be one of "
+                    "trellis_t256 bits must be one of "
                     f"{_TRELLIS256_BITS}, got {trellis_bits}"
                 )
             validate_codebook_bits(trellis_codebook, trellis_bits)
             if scale_format != "e4m3_k32":
                 raise ValueError(
-                    "trellis3_t256 W4A16 weights require scale_format='e4m3_k32'"
+                    "trellis_t256 W4A16 weights require scale_format='e4m3_k32'"
                 )
         trellis_pair_kind = (
             None if trellis_pair_kind is None else str(trellis_pair_kind).upper()
@@ -852,8 +852,8 @@ class W4A16GemmKernel:
                 "trellis_pair_kind and trellis_rate_axis must be supplied together"
             )
         if trellis_pair_kind is not None:
-            if weight_layout != "trellis3_t256":
-                raise ValueError("trellis pairs require trellis3_t256 weights")
+            if weight_layout != "trellis_t256":
+                raise ValueError("trellis pairs require trellis_t256 weights")
             if trellis_pair_kind not in {
                 "P24",
                 "P33",
@@ -942,11 +942,11 @@ class W4A16GemmKernel:
         self.dynamic_num_experts = bool(dynamic_num_experts)
         if self.dynamic_num_experts and weight_layout not in {
             "packed",
-            "trellis3_t256",
+            "trellis_t256",
         }:
             raise ValueError(
                 "dynamic_num_experts is only supported for packed and "
-                "trellis3_t256 weights"
+                "trellis_t256 weights"
             )
         self.top_k = int(top_k)
         self.mul_topk_weights = bool(mul_topk_weights)
@@ -981,15 +981,15 @@ class W4A16GemmKernel:
         # so decode-heavy small-M phases spread each mn-tile's K range across
         # multiple CTAs (existing tail scheduling plus cross-CTA finalize).
         self.small_m_splitk = _w4a16_small_m_splitk_enabled()
-        self.weight_layout_trellis256 = weight_layout == "trellis3_t256"
+        self.weight_layout_trellis256 = weight_layout == "trellis_t256"
         self.weight_layout_trellis256_proj = (
-            self.weight_layout_trellis256 and w13_layout == "trellis3_t256_proj"
+            self.weight_layout_trellis256 and w13_layout == "trellis_t256_proj"
         )
         if self.weight_layout_trellis256_proj and (
             self.size_n % 2 != 0 or (self.size_n // 2) % self.tile_n != 0
         ):
             raise ValueError(
-                "trellis3_t256_proj requires each FC1 projection to contain "
+                "trellis_t256_proj requires each FC1 projection to contain "
                 "an integral number of CTA N tiles"
             )
         self.b_region_variable = self.weight_layout_trellis256
@@ -1034,7 +1034,7 @@ class W4A16GemmKernel:
         self.dual_a = bool(dual_a)
         if self.dual_a and not self.weight_layout_trellis256_proj:
             raise ValueError(
-                "dual_a is only valid for projection-major trellis3_t256 FC1"
+                "dual_a is only valid for projection-major trellis_t256 FC1"
             )
         self.route_major_a = bool(route_major_a)
         if self.route_major_a and not self.dual_a:
@@ -1064,7 +1064,7 @@ class W4A16GemmKernel:
             and not self.weight_layout_trellis256
         ):
             raise ValueError(
-                "schedule_whole_tiles requires direct_topk_routes or trellis3_t256"
+                "schedule_whole_tiles requires direct_topk_routes or trellis_t256"
             )
         if self.fused_topk_sum and not self.direct_topk_routes:
             raise ValueError("fused_topk_sum requires direct_topk_routes")
@@ -4461,7 +4461,7 @@ class W4A16GemmKernel:
                     Int32(i * self.cta_threads) + tid,
                 )
 
-        # trellis3_t256 has no per-weight scale and its register-load arm returns
+        # trellis_t256 has no per-weight scale and its register-load arm returns
         # before touching scale SMEM.  Const-expr-elide the otherwise dead HBM
         # reads so every layer can share a four-byte aligned dummy scale tensor
         # instead of retaining 54 MiB of packed ones.
@@ -5576,9 +5576,9 @@ class W4A16FusedMoeKernel:
         if weight_layout == "modelopt":
             if w13_layout not in _MODEL_OPT_W13_LAYOUTS:
                 raise ValueError(f"unsupported W4A16 w13_layout {w13_layout!r}")
-        elif weight_layout == "trellis3_t256":
+        elif weight_layout == "trellis_t256":
             if w13_layout not in _TRELLIS256_W13_LAYOUTS:
-                raise ValueError(f"unsupported trellis3_t256 w13_layout {w13_layout!r}")
+                raise ValueError(f"unsupported trellis_t256 w13_layout {w13_layout!r}")
         else:
             w13_layout = "packed"
         self.tc_decode_fused_sum = bool(tc_decode_fused_sum)
@@ -5610,7 +5610,7 @@ class W4A16FusedMoeKernel:
         # the launch boundary.
         self.dynamic_num_experts = weight_layout in {
             "packed",
-            "trellis3_t256",
+            "trellis_t256",
         }
         self.top_k = int(top_k)
         self.moe_block_size = int(moe_block_size)
@@ -5655,10 +5655,10 @@ class W4A16FusedMoeKernel:
         self.weight_layout = weight_layout
         self.trellis_bits = int(trellis_bits)
         self.trellis_codebook = str(trellis_codebook).lower()
-        if self.weight_layout == "trellis3_t256":
+        if self.weight_layout == "trellis_t256":
             if self.trellis_codebook not in _TRELLIS256_CODEBOOKS:
                 raise ValueError(
-                    "trellis3_t256 codebook must be one of "
+                    "trellis_t256 codebook must be one of "
                     f"{sorted(_TRELLIS256_CODEBOOKS)}, got {self.trellis_codebook!r}"
                 )
         self.fc1_trellis_pair_kind = (
@@ -5678,8 +5678,8 @@ class W4A16FusedMoeKernel:
                 "fused trellis pair weights require both FC1 and FC2 pair kinds"
             )
         if self.fc1_trellis_pair_kind is not None:
-            if weight_layout != "trellis3_t256":
-                raise ValueError("fused trellis pairs require trellis3_t256 weights")
+            if weight_layout != "trellis_t256":
+                raise ValueError("fused trellis pairs require trellis_t256 weights")
             if self.trellis_bits != 3:
                 raise ValueError(
                     "fused QSRT pairs require the trellis_bits=3 base "
@@ -5712,14 +5712,14 @@ class W4A16FusedMoeKernel:
         if self.use_expert_map and not self.direct_topk_routes:
             raise ValueError("use_expert_map requires direct_topk_routes")
         self.schedule_whole_tiles = bool(
-            (schedule_whole_tiles or weight_layout == "trellis3_t256")
+            (schedule_whole_tiles or weight_layout == "trellis_t256")
             and not self.small_m_splitk
         )
         self.intermediate_rotation = bool(intermediate_rotation)
         if self.intermediate_rotation:
-            if weight_layout != "trellis3_t256":
+            if weight_layout != "trellis_t256":
                 raise ValueError(
-                    "intermediate_rotation is only supported for trellis3_t256"
+                    "intermediate_rotation is only supported for trellis_t256"
                 )
             if not is_gated or self.activation_is_swigluoai or self.has_swiglu_limit:
                 raise ValueError(
@@ -5763,8 +5763,8 @@ class W4A16FusedMoeKernel:
                 )
         self.dual_a = bool(
             self.intermediate_rotation
-            and weight_layout == "trellis3_t256"
-            and w13_layout == "trellis3_t256_proj"
+            and weight_layout == "trellis_t256"
+            and w13_layout == "trellis_t256_proj"
         )
         fc1_source_n_rotation = (
             int(intermediate_size)
@@ -5819,7 +5819,7 @@ class W4A16FusedMoeKernel:
             element_dtype=element_dtype,
             weight_layout=weight_layout,
             scale_format=scale_format,
-            w13_layout=("packed" if weight_layout == "trellis3_t256" else w13_layout),
+            w13_layout=("packed" if weight_layout == "trellis_t256" else w13_layout),
             trellis_bits=self.trellis_bits,
             trellis_codebook=self.trellis_codebook,
             trellis_pair_kind=self.fc2_trellis_pair_kind,
@@ -7455,7 +7455,7 @@ class W4A16FusedMoeKernel:
         active_m: cutlass.Int32,
     ):
         if cutlass.const_expr(self.intermediate_rotation):
-            # Rotation-aware epilogue (trellis3_t256 tail).  Warp-cooperative over
+            # Rotation-aware epilogue (trellis_t256 tail).  Warp-cooperative over
             # (routed-row, 128-block) units; each warp owns one 128-wide block of
             # a row's intermediate.  Per row r the FC1 output is [gate(I) | up(I)]
             # (fc1_cols = 2I) and rot_scales_flat[r] = [svh_gate(I)|svh_up(I)|
@@ -8715,7 +8715,7 @@ def compile_w4a16_gemm(
         trellis_pair_kind=trellis_pair_kind,
         trellis_rate_axis=trellis_rate_axis,
         dense_route_fast_path=bool(dense_route_fast_path),
-        schedule_whole_tiles=weight_layout == "trellis3_t256",
+        schedule_whole_tiles=weight_layout == "trellis_t256",
     )
     cache_key = (
         "w4a16_gemm",
@@ -8734,7 +8734,7 @@ def compile_w4a16_gemm(
     compile_route_blocks = 1
     compile_route_slots = compile_route_blocks * int(moe_block_size)
     a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    if weight_layout == "trellis3_t256":
+    if weight_layout == "trellis_t256":
         b_fake_elements = (
             num_experts * (size_k // 16) * (size_n // 16) * (8 * int(trellis_bits))
         )
@@ -8909,16 +8909,16 @@ def compile_w4a16_fused_moe(
     if weight_layout not in _WEIGHT_LAYOUTS:
         raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
     trellis_bits = int(trellis_bits)
-    if weight_layout == "trellis3_t256":
+    if weight_layout == "trellis_t256":
         if trellis_bits not in _TRELLIS256_BITS:
             raise ValueError(
-                f"trellis3_t256 bits must be one of {_TRELLIS256_BITS}, got {trellis_bits}"
+                f"trellis_t256 bits must be one of {_TRELLIS256_BITS}, got {trellis_bits}"
             )
     elif trellis_bits != 3:
-        raise ValueError("trellis_bits is only valid for trellis3_t256 weights")
+        raise ValueError("trellis_bits is only valid for trellis_t256 weights")
     # Existing 3-bpw scheduling was conservatively planned as 4 bpw. Keep that
     # grid contract stable for D6; widen only the 5/6-bpw specializations.
-    weight_bits = max(4, trellis_bits) if weight_layout == "trellis3_t256" else 4
+    weight_bits = max(4, trellis_bits) if weight_layout == "trellis_t256" else 4
     # GATE 5: the PRODUCTION 256-weight-tile fused-megakernel B-staging is now
     # wired (per-warp native [K/16,N/16,8*bits u32] tile staging + the per-lane
     # bitrate-specialized read) and ADMITTED at 3 bpw against a full-GEMM
@@ -8928,9 +8928,9 @@ def compile_w4a16_fused_moe(
     if weight_layout == "modelopt":
         if w13_layout not in _MODEL_OPT_W13_LAYOUTS:
             raise ValueError(f"unsupported W4A16 w13_layout {w13_layout!r}")
-    elif weight_layout == "trellis3_t256":
+    elif weight_layout == "trellis_t256":
         if w13_layout not in _TRELLIS256_W13_LAYOUTS:
-            raise ValueError(f"unsupported trellis3_t256 w13_layout {w13_layout!r}")
+            raise ValueError(f"unsupported trellis_t256 w13_layout {w13_layout!r}")
     else:
         w13_layout = "packed"
     direct_topk_routes = bool(direct_topk_routes)
@@ -8950,8 +8950,8 @@ def compile_w4a16_fused_moe(
     if full_rotation:
         if not intermediate_rotation:
             raise ValueError("full_rotation requires intermediate_rotation")
-        if weight_layout != "trellis3_t256":
-            raise ValueError("full_rotation is only supported for trellis3_t256")
+        if weight_layout != "trellis_t256":
+            raise ValueError("full_rotation is only supported for trellis_t256")
         if element_dtype != "fp16":
             raise ValueError("full_rotation requires element_dtype='fp16'")
         if rotation_input_dtype not in {"bf16", "fp16"}:
@@ -8966,9 +8966,9 @@ def compile_w4a16_fused_moe(
             )
     if coupled_hadamard and not full_rotation:
         raise ValueError("coupled_hadamard requires full_rotation")
-    if collect_activation_amax and weight_layout == "trellis3_t256":
+    if collect_activation_amax and weight_layout == "trellis_t256":
         raise NotImplementedError(
-            "trellis3_t256 activation-amax collection is not exposed through the "
+            "trellis_t256 activation-amax collection is not exposed through the "
             "registered launch ABI; refusing to compile a bitrate-ambiguous kernel"
         )
     # The TC-decode path validates M in {1,2,4,8} itself and uses direct-topk
@@ -8979,7 +8979,7 @@ def compile_w4a16_fused_moe(
         else _MAX_DIRECT_TOPK_ROUTE_M
     )
     direct_weight_layout_ok = weight_layout == "packed" or (
-        full_rotation and weight_layout == "trellis3_t256"
+        full_rotation and weight_layout == "trellis_t256"
     )
     if direct_topk_routes and (
         int(size_m) > direct_topk_m_cap
@@ -10263,7 +10263,7 @@ def _w4a16_fused_moe_launch_flat(
         packed_route_indices.data_ptr() if expert_map is None else expert_map.data_ptr()
     )
     route_num_experts = 0 if expert_map is None else int(expert_map.numel())
-    if weight_layout == "trellis3_t256" and trellis_codebook != "mcg":
+    if weight_layout == "trellis_t256" and trellis_codebook != "mcg":
         trellis_rank_lut = _trellis256_execution_lut(
             a_input.device, trellis_codebook
         )
@@ -11052,7 +11052,7 @@ def _compile_w4a16_gemm_launch(
     force_tile_config: tuple[int, int] | None = None,
 ) -> _W4A16GemmLaunch:
     planner_weight_bits = (
-        max(4, int(trellis_bits)) if weight_layout == "trellis3_t256" else 4
+        max(4, int(trellis_bits)) if weight_layout == "trellis_t256" else 4
     )
     if force_tile_config is None:
         tile_k, tile_n, _, _ = _select_tile_config(
@@ -11163,7 +11163,7 @@ def pack_topk_routes_by_expert(
 def _trellis256_dense_tile_config(size_k: int, size_n: int) -> tuple[int, int]:
     """Return an m-invariant t256 tile so dense row bits cannot drift with m."""
     if int(size_k) % 64 != 0:
-        raise ValueError(f"trellis3_t256 dense K must be divisible by 64, got {size_k}")
+        raise ValueError(f"trellis_t256 dense K must be divisible by 64, got {size_k}")
     if int(size_n) % 256 == 0:
         return (64, 256)
     if int(size_n) % 128 == 0:
@@ -11173,7 +11173,7 @@ def _trellis256_dense_tile_config(size_k: int, size_n: int) -> tuple[int, int]:
         # 256-thread 4/8/8 register entry and fail before compilation.
         return (64, 128)
     raise ValueError(
-        "trellis3_t256 dense N must be divisible by 128 (or 256 for the wide tile), "
+        "trellis_t256 dense N must be divisible by 128 (or 256 for the wide tile), "
         f"got N={size_n}"
     )
 
@@ -11285,8 +11285,8 @@ def _run_trellis256_dense_current_device(
     Outer rotations follow EXL3 order exactly: fp16 ``suh`` multiply before the
     input H128, and fp16 ``svh`` multiply after the output H128.
     """
-    if getattr(prepared_dense, "weight_layout", None) != "trellis3_t256":
-        raise ValueError("run_trellis256_dense requires prepared trellis3_t256 weights")
+    if getattr(prepared_dense, "weight_layout", None) != "trellis_t256":
+        raise ValueError("run_trellis256_dense requires prepared trellis_t256 weights")
     if int(getattr(prepared_dense, "num_experts", 0)) != 1:
         raise ValueError("run_trellis256_dense requires an honest E=1 prepared weight")
     trellis_codebook = str(
@@ -11419,7 +11419,7 @@ def _run_trellis256_dense_current_device(
         max_shared_mem=max_shared_mem,
         device=x.device,
         c_tmp=c_tmp,
-        weight_layout="trellis3_t256",
+        weight_layout="trellis_t256",
         scale_format="e4m3_k32",
         w13_layout="packed",
         trellis_bits=trellis_bits,
@@ -11676,15 +11676,15 @@ def run_w4a16_moe(
     prepared_tile_config = getattr(prepared, "tile_config", None)
     if (fc1_trellis_pair_kind is None) != (fc2_trellis_pair_kind is None):
         raise ValueError("prepared trellis pair weights have incomplete pair metadata")
-    if weight_layout == "trellis3_t256":
+    if weight_layout == "trellis_t256":
         if trellis_bits not in _TRELLIS256_BITS:
             raise ValueError(
-                f"prepared trellis3_t256 bitrate must be in {_TRELLIS256_BITS}, "
+                f"prepared trellis_t256 bitrate must be in {_TRELLIS256_BITS}, "
                 f"got {trellis_bits}"
             )
         if trellis_codebook not in _TRELLIS256_CODEBOOKS:
             raise NotImplementedError(
-                "trellis3_t256 execution has no decoder for codebook "
+                "trellis_t256 execution has no decoder for codebook "
                 f"{trellis_codebook!r}"
             )
         if fc1_trellis_pair_kind is not None:
@@ -11735,7 +11735,7 @@ def run_w4a16_moe(
                         )
         if activation_amax is not None:
             raise NotImplementedError(
-                "trellis3_t256 activation-amax collection is not exposed through "
+                "trellis_t256 activation-amax collection is not exposed through "
                 "the registered launch ABI"
             )
     if coupled_hadamard and not full_rotation:
@@ -11770,15 +11770,15 @@ def run_w4a16_moe(
     if weight_layout == "modelopt":
         if w13_layout not in _MODEL_OPT_W13_LAYOUTS:
             raise ValueError(f"unsupported W4A16 w13_layout {w13_layout!r}")
-    elif weight_layout == "trellis3_t256":
+    elif weight_layout == "trellis_t256":
         if w13_layout not in _TRELLIS256_W13_LAYOUTS:
-            raise ValueError(f"unsupported trellis3_t256 w13_layout {w13_layout!r}")
+            raise ValueError(f"unsupported trellis_t256 w13_layout {w13_layout!r}")
     else:
         w13_layout = "packed"
     dual_a_required = bool(
         intermediate_rotation_scales is not None
-        and weight_layout == "trellis3_t256"
-        and w13_layout == "trellis3_t256_proj"
+        and weight_layout == "trellis_t256"
+        and w13_layout == "trellis_t256_proj"
     )
     if full_rotation and not dual_a_required:
         raise ValueError(
@@ -11786,11 +11786,11 @@ def run_w4a16_moe(
         )
     if dual_a_required and a_input_up is None and not full_rotation:
         raise ValueError(
-            "exact projection-major trellis3_t256 rotation requires a_input_up"
+            "exact projection-major trellis_t256 rotation requires a_input_up"
         )
     if a_input_up is not None and (not dual_a_required or full_rotation):
         raise ValueError(
-            "a_input_up is only valid for exact projection-major trellis3_t256 rotation"
+            "a_input_up is only valid for exact projection-major trellis_t256 rotation"
         )
     if a_input_up is not None:
         if (
@@ -12055,7 +12055,7 @@ def run_w4a16_moe(
         _W4A16_SMALL_M_DIRECT_MAX_M if mapped_direct else _MAX_DIRECT_TOPK_ROUTE_M
     )
     direct_layout_ok = weight_layout == "packed" or (
-        mapped_direct and full_rotation and weight_layout == "trellis3_t256"
+        mapped_direct and full_rotation and weight_layout == "trellis_t256"
     )
     direct_topk_eligible = (
         (not collect_activation_amax)
@@ -12468,10 +12468,10 @@ def run_w4a16_moe(
         collect_activation_amax
         or use_tc_decode
         or (use_direct_topk_routes and not full_rotation)
-        or weight_layout != "trellis3_t256"
+        or weight_layout != "trellis_t256"
     ):
         raise ValueError(
-            "intermediate_rotation_scales requires the trellis3_t256 fused path "
+            "intermediate_rotation_scales requires the trellis_t256 fused path "
             "(no calibration / tc-decode; direct routing requires full_rotation)"
         )
     if _intermediate_rotation:
@@ -12505,7 +12505,7 @@ def run_w4a16_moe(
         )
     elif (
         _intermediate_rotation
-        or weight_layout == "trellis3_t256"
+        or weight_layout == "trellis_t256"
         or (mapped_direct and use_direct_topk_routes)
     ):
         # Native t256 bypasses the registered torch op so its shape-derived

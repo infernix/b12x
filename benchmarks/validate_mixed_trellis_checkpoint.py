@@ -116,7 +116,7 @@ def _load_tier(
         fc1_tile_n=tile_config[1],
         fc2_tile_n=tile_config[3],
         params_dtype=torch.float16,
-        w13_layout="trellis3_t256_proj",
+        w13_layout="trellis_t256_proj",
         trellis_bits=bits,
         codebook="mcg",
         gate_suh=gate_suh,

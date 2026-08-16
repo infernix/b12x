@@ -140,12 +140,49 @@ class W4A16FC2Weights:
 
 
 @dataclass(frozen=True)
+class TrellisWeightState:
+    """Trellis-specific prepared-weight state.
+
+    ``codebook``/``bits`` select the decode law of the native tiles. The
+    optional pair specialization keeps every matrix at a fixed payload
+    size: FC1's pair lies on N (one pair in each projection) and FC2's on
+    K, selected separately per matrix. The fixed-size K3/K3 versus K2/K4
+    representation uses one int32 mode per local expert (zero selects
+    K3/K3); the K3/K3 versus K4/K3 representation uses one int64
+    descriptor per local expert whose bit zero selects K4/K3 and whose
+    remaining bits store the exact uint32 offset into that matrix's
+    compact payload pool.
+
+    ``gate_suh``/``up_suh``/``down_svh`` are the projection-specific input
+    incoherence values; ``intermediate_rotations`` holds the
+    intermediate-boundary values, and coupled transforms append the
+    activation-boundary sign rows so each rotation row reads
+    ``[gate I, up I, down I, preactivation 2I, postactivation I]``.
+    """
+
+    codebook: str
+    bits: int
+    fc1_pair_kind: str | None = None
+    fc2_pair_kind: str | None = None
+    fc1_pair_modes: torch.Tensor | None = None
+    fc2_pair_modes: torch.Tensor | None = None
+    gate_suh: torch.Tensor | None = None
+    up_suh: torch.Tensor | None = None
+    intermediate_rotations: torch.Tensor | None = None
+    down_svh: torch.Tensor | None = None
+    coupled_hadamard: bool = False
+    tile_config: tuple[int, int, int, int] | None = None
+
+
+@dataclass(frozen=True)
 class PreparedW4A16MoeWeights:
     """Runtime native-codebook W4A16 expert weights.
 
     Trellis-coded sources (MCG, SQG-XOR-Cheb-T12, or FP16-D3L codebooks) keep
     native codebook tiles and persistent full-rotation tables, sharing the
     W4A16 host ABI and retaining the tile configuration used at preparation.
+    The trellis annex lives in one :class:`TrellisWeightState`; the accessor
+    properties expose its members under the host-ABI names.
     """
 
     w13: torch.Tensor
@@ -164,37 +201,61 @@ class PreparedW4A16MoeWeights:
     fc2_tile_n: int
     source_format: str = "qsrt_sqg_e4m3"
     w13_layout: str = "packed"
-    weight_layout: str = "trellis3_t256"
+    weight_layout: str = "trellis_t256"
     scale_format: str = "e4m3_k32"
-    # Native tiles use mcg, K2/K3/K4 sqg_e4m3, or K5/K6 sqg_fp16 codebooks.
-    trellis_codebook: str | None = None
-    trellis_bits: int = 3
-    # Optional compact fixed-payload pair specialization.  FC1's pair lies on
-    # N (one pair in each projection); FC2's lies on K.  The two kinds may be
-    # selected separately while every matrix remains exactly three bpw.
-    fc1_trellis_pair_kind: str | None = None
-    fc2_trellis_pair_kind: str | None = None
-    # The fixed-size K3/K3 versus K2/K4 representation uses one int32 mode per
-    # local expert: zero selects K3/K3 and one selects K2/K4. The K3/K3 versus
-    # K4/K3 representation uses one int64 descriptor per local expert. Bit
-    # zero selects K4/K3 and the remaining bits store the exact uint32 offset
-    # into that matrix's compact payload pool.
-    fc1_trellis_pair_modes: torch.Tensor | None = None
-    fc2_trellis_pair_modes: torch.Tensor | None = None
-    # Projection-specific input incoherence scales.  They remain optional
-    # for non-trellis and synthetic oracle preparation, but the coherent
-    # projection-major runtime binds both so gate/up can stage distinct rotated
-    # A operands without copying either table.
-    gate_suh: torch.Tensor | None = None
-    up_suh: torch.Tensor | None = None
-    intermediate_rotations: torch.Tensor | None = None
-    down_svh: torch.Tensor | None = None
-    # Coupled transforms add an exact activation-boundary reparameterization
-    # around the per-matrix incoherence transforms. The rotation rows contain
-    # [gate I, up I, down I, preactivation 2I, postactivation I]. The 512-wide
-    # residual transforms use a fixed all-positive draw and need no table.
-    coupled_hadamard: bool = False
-    tile_config: tuple[int, int, int, int] | None = None
+    trellis: TrellisWeightState | None = None
+
+    @property
+    def trellis_codebook(self) -> str | None:
+        return None if self.trellis is None else self.trellis.codebook
+
+    @property
+    def trellis_bits(self) -> int:
+        return 3 if self.trellis is None else self.trellis.bits
+
+    @property
+    def fc1_trellis_pair_kind(self) -> str | None:
+        return None if self.trellis is None else self.trellis.fc1_pair_kind
+
+    @property
+    def fc2_trellis_pair_kind(self) -> str | None:
+        return None if self.trellis is None else self.trellis.fc2_pair_kind
+
+    @property
+    def fc1_trellis_pair_modes(self) -> torch.Tensor | None:
+        return None if self.trellis is None else self.trellis.fc1_pair_modes
+
+    @property
+    def fc2_trellis_pair_modes(self) -> torch.Tensor | None:
+        return None if self.trellis is None else self.trellis.fc2_pair_modes
+
+    @property
+    def gate_suh(self) -> torch.Tensor | None:
+        return None if self.trellis is None else self.trellis.gate_suh
+
+    @property
+    def up_suh(self) -> torch.Tensor | None:
+        return None if self.trellis is None else self.trellis.up_suh
+
+    @property
+    def intermediate_rotations(self) -> torch.Tensor | None:
+        return (
+            None
+            if self.trellis is None
+            else self.trellis.intermediate_rotations
+        )
+
+    @property
+    def down_svh(self) -> torch.Tensor | None:
+        return None if self.trellis is None else self.trellis.down_svh
+
+    @property
+    def coupled_hadamard(self) -> bool:
+        return self.trellis is not None and self.trellis.coupled_hadamard
+
+    @property
+    def tile_config(self) -> tuple[int, int, int, int] | None:
+        return None if self.trellis is None else self.trellis.tile_config
 
 
 @dataclass(frozen=True)
@@ -220,7 +281,7 @@ class PreparedTrellis256DenseWeight:
     mcg: torch.Tensor | None = None
     mul1_e4m3: torch.Tensor | None = None
     num_experts: int = 1
-    weight_layout: str = "trellis3_t256"
+    weight_layout: str = "trellis_t256"
     scale_format: str = "e4m3_k32"
     w13_layout: str = "packed"
     # Optional fixed-size 256-channel pair container. The payload still averages
@@ -1507,7 +1568,7 @@ def make_w4a16_packed_buffers(
     )
 
 
-_TRELLIS256_W13_LAYOUTS = {"packed", "trellis3_t256_proj"}
+_TRELLIS256_W13_LAYOUTS = {"packed", "trellis_t256_proj"}
 def _normalize_trellis256_codebook(
     codebook: str | int, *, accept_legacy_ids: bool = False
 ) -> str:
@@ -1536,23 +1597,23 @@ def _trellis256_random_native_tensor(
 def _trellis256_bits_from_native_tensor(tensor: torch.Tensor, *, name: str) -> int:
     """Recover the trellis bitrate from the native tile's final dimension."""
     if tensor.ndim < 1:
-        raise ValueError(f"trellis3_t256 {name} must have at least one dimension")
+        raise ValueError(f"trellis_t256 {name} must have at least one dimension")
     words_per_bit = 16 if tensor.dtype == torch.int16 else 8
     if tensor.dtype not in (torch.int16, torch.int32):
         raise TypeError(
-            f"trellis3_t256 {name} must use native int16 or int32 storage, "
+            f"trellis_t256 {name} must use native int16 or int32 storage, "
             f"got {tensor.dtype}"
         )
     last = int(tensor.shape[-1])
     if last % words_per_bit != 0:
         raise ValueError(
-            f"trellis3_t256 {name} final dimension {last} is not a native "
+            f"trellis_t256 {name} final dimension {last} is not a native "
             f"{tensor.dtype} tile width"
         )
     bits = last // words_per_bit
     if bits not in (2, 3, 4, 5, 6):
         raise ValueError(
-            f"trellis3_t256 {name} encodes unsupported {bits}-bpw storage; "
+            f"trellis_t256 {name} encodes unsupported {bits}-bpw storage; "
             "expected 2, 3, 4, 5, or 6"
         )
     return bits
@@ -1571,7 +1632,7 @@ def _trellis256_flat_native_view(
     expected_i32_shape = (*expected_prefix_shape, 8 * trellis_bits)
     if tensor.device != device:
         raise ValueError(
-            f"trellis3_t256 {name} must be on {device}, got {tensor.device}"
+            f"trellis_t256 {name} must be on {device}, got {tensor.device}"
         )
     if tensor.dtype == torch.int16:
         expected_shape = expected_i16_shape
@@ -1579,19 +1640,19 @@ def _trellis256_flat_native_view(
         expected_shape = expected_i32_shape
     else:
         raise TypeError(
-            f"trellis3_t256 {name} must be native int16 tiles ({16 * trellis_bits} words) "
+            f"trellis_t256 {name} must be native int16 tiles ({16 * trellis_bits} words) "
             f"or the identical int32 view ({8 * trellis_bits} words), got {tensor.dtype}"
         )
     if tuple(tensor.shape) != expected_shape:
         raise ValueError(
-            f"trellis3_t256 {name} requires native {trellis_bits}-bit tile shape "
+            f"trellis_t256 {name} requires native {trellis_bits}-bit tile shape "
             f"{expected_shape} for dtype {tensor.dtype}, got {tuple(tensor.shape)}"
         )
     if not tensor.is_contiguous():
-        raise ValueError(f"trellis3_t256 {name} must be contiguous")
+        raise ValueError(f"trellis_t256 {name} must be contiguous")
     if int(tensor.data_ptr()) % 16 != 0:
         raise ValueError(
-            f"trellis3_t256 {name} must be at least 16-byte aligned for cp.async"
+            f"trellis_t256 {name} must be at least 16-byte aligned for cp.async"
         )
     return tensor.view(torch.int32).reshape(-1)
 
@@ -1620,7 +1681,7 @@ def prepare_trellis256_moe_weights(
     tile_config: tuple[int, int, int, int] | None = None,
     workspace: torch.Tensor | None = None,
 ) -> PreparedW4A16MoeWeights:
-    """Wrap or synthesize native ``trellis3_t256`` tiles for any codebook.
+    """Wrap or synthesize native ``trellis_t256`` tiles for any codebook.
 
     Supplying both ``w13`` and ``w2`` is the production path: no bytes are
     copied or permuted; each tensor is only viewed as contiguous int32 words and
@@ -1631,7 +1692,7 @@ def prepare_trellis256_moe_weights(
     the weight device.
 
     Plain FC1 storage is expert-major
-    ``[E,H/16,FC1_N/16,16*bits]i16``. ``trellis3_t256_proj`` instead requires one
+    ``[E,H/16,FC1_N/16,16*bits]i16``. ``trellis_t256_proj`` instead requires one
     projection-major backing ``[2,E,H/16,I/16,16*bits]i16`` so gate/up fallback views
     can continue to alias the same live storage.  FC2 is always the plain native
     ``[E,I/16,H/16,16*bits]i16`` layout.
@@ -1642,7 +1703,7 @@ def prepare_trellis256_moe_weights(
     fc1_tile_n = int(fc1_tile_n)
     fc2_tile_n = int(fc2_tile_n)
     if params_dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("trellis3_t256 W4A16 weights require fp16 or bf16 activations")
+        raise ValueError("trellis_t256 W4A16 weights require fp16 or bf16 activations")
     requested_trellis_bits = None if trellis_bits is None else int(trellis_bits)
     if requested_trellis_bits is not None and requested_trellis_bits not in (
         2,
@@ -1652,14 +1713,14 @@ def prepare_trellis256_moe_weights(
         6,
     ):
         raise ValueError(
-            "trellis3_t256 bits must be one of 2, 3, 4, 5, or 6, "
+            "trellis_t256 bits must be one of 2, 3, 4, 5, or 6, "
             f"got {requested_trellis_bits}"
         )
     if num_experts <= 0:
-        raise ValueError(f"trellis3_t256 requires num_experts > 0, got {num_experts}")
+        raise ValueError(f"trellis_t256 requires num_experts > 0, got {num_experts}")
     if hidden_size <= 0 or intermediate_size <= 0:
         raise ValueError(
-            "trellis3_t256 requires positive hidden_size and intermediate_size, "
+            "trellis_t256 requires positive hidden_size and intermediate_size, "
             f"got H={hidden_size} I={intermediate_size}"
         )
     if hidden_size % 16 != 0 or intermediate_size % 16 != 0:
@@ -1669,14 +1730,14 @@ def prepare_trellis256_moe_weights(
         )
     if hidden_size % 32 != 0 or intermediate_size % 32 != 0:
         raise ValueError(
-            "trellis3_t256 uses E4M3 K/32 kernel plumbing and therefore requires "
+            "trellis_t256 uses E4M3 K/32 kernel plumbing and therefore requires "
             "hidden_size and intermediate_size to be multiples of 32; "
             f"got H={hidden_size} I={intermediate_size}"
         )
     for name, tile_n in (("fc1_tile_n", fc1_tile_n), ("fc2_tile_n", fc2_tile_n)):
         if tile_n < 64 or tile_n % 16 != 0:
             raise ValueError(
-                f"trellis3_t256 {name} must be a multiple of 16 and at least "
+                f"trellis_t256 {name} must be a multiple of 16 and at least "
                 f"64 for the current W4A16 kernel, got {tile_n}"
             )
 
@@ -1684,29 +1745,29 @@ def prepare_trellis256_moe_weights(
     w13_rows = intermediate_size * (2 if is_gated else 1)
     if w13_layout not in _TRELLIS256_W13_LAYOUTS:
         raise ValueError(
-            f"unsupported trellis3_t256 w13_layout {w13_layout!r}; expected "
-            "'packed' or 'trellis3_t256_proj'"
+            f"unsupported trellis_t256 w13_layout {w13_layout!r}; expected "
+            "'packed' or 'trellis_t256_proj'"
         )
-    if w13_layout == "trellis3_t256_proj":
+    if w13_layout == "trellis_t256_proj":
         if not is_gated:
             raise ValueError(
-                "trellis3_t256_proj requires a gated activation with separate "
+                "trellis_t256_proj requires a gated activation with separate "
                 "gate/up FC1 projections"
             )
         if intermediate_size % fc1_tile_n != 0:
             raise ValueError(
-                "trellis3_t256_proj requires each FC1 projection to contain an "
+                "trellis_t256_proj requires each FC1 projection to contain an "
                 f"integral number of CTA N tiles: I={intermediate_size}, "
                 f"fc1_tile_n={fc1_tile_n}"
             )
     elif w13_rows % fc1_tile_n != 0:
         raise ValueError(
-            "trellis3_t256 has no FC1 logical-tail path: "
+            "trellis_t256 has no FC1 logical-tail path: "
             f"FC1_N={w13_rows} must be divisible by fc1_tile_n={fc1_tile_n}"
         )
     if hidden_size % fc2_tile_n != 0:
         raise ValueError(
-            "trellis3_t256 has no FC2 logical-tail path: "
+            "trellis_t256 has no FC2 logical-tail path: "
             f"FC2_N={hidden_size} must be divisible by fc2_tile_n={fc2_tile_n}"
         )
     normalized_codebook = _normalize_trellis256_codebook(codebook)
@@ -1714,13 +1775,13 @@ def prepare_trellis256_moe_weights(
     have_w13 = w13 is not None
     have_w2 = w2 is not None
     if have_w13 != have_w2:
-        raise ValueError("trellis3_t256 requires both w13 and w2, or neither")
+        raise ValueError("trellis_t256 requires both w13 and w2, or neither")
     synthetic = not have_w13
     if synthetic:
         resolved_trellis_bits = requested_trellis_bits or 3
         if device is None:
             raise ValueError(
-                "device is required when synthesizing trellis3_t256 oracle weights"
+                "device is required when synthesizing trellis_t256 oracle weights"
             )
         if isinstance(device, int):
             resolved_device = torch.device("cuda", int(device))
@@ -1728,14 +1789,14 @@ def prepare_trellis256_moe_weights(
             resolved_device = torch.device(device)
         if resolved_device.type != "cuda":
             raise ValueError(
-                "trellis3_t256 W4A16 weights require a CUDA device, got "
+                "trellis_t256 W4A16 weights require a CUDA device, got "
                 f"{resolved_device}"
             )
         if resolved_device.index is None:
             resolved_device = torch.device("cuda", torch.cuda.current_device())
         generator = torch.Generator(device=resolved_device)
         generator.manual_seed(int(seed))
-        if w13_layout == "trellis3_t256_proj":
+        if w13_layout == "trellis_t256_proj":
             w13_i32_shape = (
                 2,
                 num_experts,
@@ -1768,12 +1829,12 @@ def prepare_trellis256_moe_weights(
         w2_bits = _trellis256_bits_from_native_tensor(w2, name="w2")
         if w13_bits != w2_bits:
             raise ValueError(
-                f"trellis3_t256 w13/w2 bitrate mismatch: {w13_bits} vs {w2_bits}"
+                f"trellis_t256 w13/w2 bitrate mismatch: {w13_bits} vs {w2_bits}"
             )
         resolved_trellis_bits = w13_bits
         if resolved_trellis_bits not in (2, 3, 4, 5, 6):
             raise ValueError(
-                "trellis3_t256 tensors must encode 2, 3, 4, 5, or "
+                "trellis_t256 tensors must encode 2, 3, 4, 5, or "
                 f"6 bpw, got {resolved_trellis_bits}"
             )
         if (
@@ -1787,7 +1848,7 @@ def prepare_trellis256_moe_weights(
         resolved_device = w13.device
         if resolved_device.type != "cuda":
             raise ValueError(
-                "trellis3_t256 W4A16 weights require CUDA storage, got "
+                "trellis_t256 W4A16 weights require CUDA storage, got "
                 f"{resolved_device}"
             )
         if device is not None:
@@ -1802,10 +1863,10 @@ def prepare_trellis256_moe_weights(
             )
             if not device_matches:
                 raise ValueError(
-                    "explicit trellis3_t256 device does not match supplied weights: "
+                    "explicit trellis_t256 device does not match supplied weights: "
                     f"device={requested_device}, weights={resolved_device}"
                 )
-        if w13_layout == "trellis3_t256_proj":
+        if w13_layout == "trellis_t256_proj":
             expected_w13_prefix = (
                 2,
                 num_experts,
@@ -1842,23 +1903,23 @@ def prepare_trellis256_moe_weights(
     have_up_suh = up_suh is not None
     if have_gate_suh != have_up_suh:
         raise ValueError(
-            "trellis3_t256 projection input scales require both gate_suh and up_suh"
+            "trellis_t256 projection input scales require both gate_suh and up_suh"
         )
     if have_gate_suh:
-        if w13_layout != "trellis3_t256_proj":
+        if w13_layout != "trellis_t256_proj":
             raise ValueError(
-                "trellis3_t256 gate_suh/up_suh bindings require "
-                "w13_layout='trellis3_t256_proj'"
+                "trellis_t256 gate_suh/up_suh bindings require "
+                "w13_layout='trellis_t256_proj'"
             )
         assert gate_suh is not None and up_suh is not None
         for name, scale in (("gate_suh", gate_suh), ("up_suh", up_suh)):
             if scale.device != resolved_device:
                 raise ValueError(
-                    f"trellis3_t256 {name} must be on {resolved_device}, got {scale.device}"
+                    f"trellis_t256 {name} must be on {resolved_device}, got {scale.device}"
                 )
             if scale.dtype != torch.float16:
                 raise TypeError(
-                    f"trellis3_t256 {name} must be torch.float16, got {scale.dtype}"
+                    f"trellis_t256 {name} must be torch.float16, got {scale.dtype}"
                 )
             # (1, hidden_size) is a broadcast row shared by all experts
             # (kquant shared-su artifacts); kernels index it with expert
@@ -1868,15 +1929,15 @@ def prepare_trellis256_moe_weights(
                 (1, hidden_size),
             ):
                 raise ValueError(
-                    f"trellis3_t256 {name} must have shape "
+                    f"trellis_t256 {name} must have shape "
                     f"{(num_experts, hidden_size)} or {(1, hidden_size)}, "
                     f"got {tuple(scale.shape)}"
                 )
             if not scale.is_contiguous():
-                raise ValueError(f"trellis3_t256 {name} must be contiguous")
+                raise ValueError(f"trellis_t256 {name} must be contiguous")
         if (gate_suh.shape[0] == 1) != (up_suh.shape[0] == 1):
             raise ValueError(
-                "trellis3_t256 gate_suh and up_suh must both be per-expert "
+                "trellis_t256 gate_suh and up_suh must both be per-expert "
                 "or both broadcast"
             )
 
@@ -1889,7 +1950,7 @@ def prepare_trellis256_moe_weights(
         for value in (gate_suh, up_suh, intermediate_rotations, down_svh)
     ):
         raise ValueError(
-            "full-rotation trellis3_t256 requires gate_suh, up_suh, "
+            "full-rotation trellis_t256 requires gate_suh, up_suh, "
             "intermediate_rotations, and down_svh"
         )
     if have_full_rotation:
@@ -1912,19 +1973,19 @@ def prepare_trellis256_moe_weights(
         ):
             if scale.device != resolved_device:
                 raise ValueError(
-                    f"trellis3_t256 {name} must be on {resolved_device}, got {scale.device}"
+                    f"trellis_t256 {name} must be on {resolved_device}, got {scale.device}"
                 )
             if scale.dtype != torch.float16:
                 raise TypeError(
-                    f"trellis3_t256 {name} must be torch.float16, got {scale.dtype}"
+                    f"trellis_t256 {name} must be torch.float16, got {scale.dtype}"
                 )
             if tuple(scale.shape) not in shapes:
                 raise ValueError(
-                    f"trellis3_t256 {name} must have shape {shapes}, "
+                    f"trellis_t256 {name} must have shape {shapes}, "
                     f"got {tuple(scale.shape)}"
                 )
             if not scale.is_contiguous():
-                raise ValueError(f"trellis3_t256 {name} must be contiguous")
+                raise ValueError(f"trellis_t256 {name} must be contiguous")
 
     if tile_config is not None:
         tile_config = tuple(int(value) for value in tile_config)
@@ -1932,18 +1993,18 @@ def prepare_trellis256_moe_weights(
             value <= 0 or value % 16 != 0 for value in tile_config
         ):
             raise ValueError(
-                "trellis3_t256 tile_config must contain four positive multiples of 16"
+                "trellis_t256 tile_config must contain four positive multiples of 16"
             )
         fc1_tile_k, configured_fc1_n, fc2_tile_k, configured_fc2_n = tile_config
         if configured_fc1_n != fc1_tile_n or configured_fc2_n != fc2_tile_n:
             raise ValueError(
-                "trellis3_t256 tile_config N dimensions disagree with preparation: "
+                "trellis_t256 tile_config N dimensions disagree with preparation: "
                 f"tile_config={tile_config}, fc1_tile_n={fc1_tile_n}, "
                 f"fc2_tile_n={fc2_tile_n}"
             )
         if hidden_size % fc1_tile_k != 0 or intermediate_size % fc2_tile_k != 0:
             raise ValueError(
-                "trellis3_t256 tile_config K dimensions must divide the model geometry"
+                "trellis_t256 tile_config K dimensions must divide the model geometry"
             )
 
     validate_codebook_bits(normalized_codebook, resolved_trellis_bits)
@@ -1952,21 +2013,21 @@ def prepare_trellis256_moe_weights(
     else:
         if dummy_scale.device != resolved_device:
             raise ValueError(
-                "trellis3_t256 dummy_scale must share the weight device, got "
+                "trellis_t256 dummy_scale must share the weight device, got "
                 f"{dummy_scale.device} and {resolved_device}"
             )
         if dummy_scale.dtype != torch.uint8:
             raise TypeError(
-                f"trellis3_t256 dummy_scale must be torch.uint8, got {dummy_scale.dtype}"
+                f"trellis_t256 dummy_scale must be torch.uint8, got {dummy_scale.dtype}"
             )
         if not dummy_scale.is_contiguous() or tuple(dummy_scale.shape) != (4,):
             raise ValueError(
-                "trellis3_t256 dummy_scale must be a contiguous four-byte "
+                "trellis_t256 dummy_scale must be a contiguous four-byte "
                 f"tensor with shape (4,), got {tuple(dummy_scale.shape)}"
             )
         if int(dummy_scale.data_ptr()) % 16 != 0:
             raise ValueError(
-                "trellis3_t256 dummy_scale must be at least 16-byte aligned"
+                "trellis_t256 dummy_scale must be at least 16-byte aligned"
             )
 
     global_scale = torch.ones(
@@ -1975,7 +2036,7 @@ def prepare_trellis256_moe_weights(
     if workspace is None:
         workspace = _make_workspace(resolved_device, max_blocks_per_sm=4)
     elif workspace.device != resolved_device or workspace.dtype != torch.int32:
-        raise ValueError("trellis3_t256 workspace must be int32 on the weight device")
+        raise ValueError("trellis_t256 workspace must be int32 on the weight device")
     return PreparedW4A16MoeWeights(
         w13=packed_w13,
         w13_scale=dummy_scale,
@@ -1999,15 +2060,17 @@ def prepare_trellis256_moe_weights(
             else "sqg_fp16_d3l"
         ),
         w13_layout=w13_layout,
-        weight_layout="trellis3_t256",
+        weight_layout="trellis_t256",
         scale_format="e4m3_k32",
-        trellis_codebook=normalized_codebook,
-        trellis_bits=resolved_trellis_bits,
-        gate_suh=gate_suh,
-        up_suh=up_suh,
-        intermediate_rotations=intermediate_rotations,
-        down_svh=down_svh,
-        tile_config=tile_config,
+        trellis=TrellisWeightState(
+            codebook=normalized_codebook,
+            bits=resolved_trellis_bits,
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            intermediate_rotations=intermediate_rotations,
+            down_svh=down_svh,
+            tile_config=tile_config,
+        ),
     )
 
 
@@ -2070,15 +2133,15 @@ def prepare_trellis256_dense_weight(
     bytes are copied, permuted, stacked, or concatenated.
     """
     if params_dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("trellis3_t256 dense compute requires fp16 or bf16 MMA inputs")
+        raise ValueError("trellis_t256 dense compute requires fp16 or bf16 MMA inputs")
     if trellis.ndim not in (3, 4):
         raise ValueError(
-            "trellis3_t256 dense payload must have rank 3 or a leading E=1 axis"
+            "trellis_t256 dense payload must have rank 3 or a leading E=1 axis"
         )
     if trellis.ndim == 4:
         if int(trellis.shape[0]) != 1:
             raise ValueError(
-                f"trellis3_t256 dense payload requires E=1, got {int(trellis.shape[0])}"
+                f"trellis_t256 dense payload requires E=1, got {int(trellis.shape[0])}"
             )
         k16, n16 = int(trellis.shape[1]), int(trellis.shape[2])
     else:
@@ -2088,18 +2151,18 @@ def prepare_trellis256_dense_weight(
     out_features = n16 * 16
     if in_features <= 0 or out_features <= 0:
         raise ValueError(
-            f"trellis3_t256 dense dimensions must be positive, got {in_features}x{out_features}"
+            f"trellis_t256 dense dimensions must be positive, got {in_features}x{out_features}"
         )
     if in_features % 128 != 0 or out_features % 128 != 0:
         raise ValueError(
-            "trellis3_t256 dense rotations require K and N divisible by 128; "
+            "trellis_t256 dense rotations require K and N divisible by 128; "
             f"got K={in_features} N={out_features}"
         )
     expected_prefix_shape = (1, k16, n16) if trellis.ndim == 4 else (k16, n16)
     device = trellis.device
     if device.type != "cuda":
         raise ValueError(
-            f"trellis3_t256 dense weights require CUDA storage, got {device}"
+            f"trellis_t256 dense weights require CUDA storage, got {device}"
         )
     packed = _trellis256_flat_native_view(
         trellis,
@@ -2113,18 +2176,18 @@ def prepare_trellis256_dense_weight(
         ("svh", svh, out_features),
     ):
         if scale.device != device:
-            raise ValueError(f"trellis3_t256 dense {name} must be on {device}")
+            raise ValueError(f"trellis_t256 dense {name} must be on {device}")
         if scale.dtype != torch.float16:
             raise TypeError(
-                f"trellis3_t256 dense {name} must be torch.float16, got {scale.dtype}"
+                f"trellis_t256 dense {name} must be torch.float16, got {scale.dtype}"
             )
         if tuple(scale.shape) != (width,):
             raise ValueError(
-                f"trellis3_t256 dense {name} must have shape {(width,)}, "
+                f"trellis_t256 dense {name} must have shape {(width,)}, "
                 f"got {tuple(scale.shape)}"
             )
         if not scale.is_contiguous():
-            raise ValueError(f"trellis3_t256 dense {name} must be contiguous")
+            raise ValueError(f"trellis_t256 dense {name} must be contiguous")
     normalized_codebook = _trellis256_marker_codebook(
         mcg=mcg,
         mul1_e4m3=mul1_e4m3,
@@ -2142,7 +2205,7 @@ def prepare_trellis256_dense_weight(
             or int(dummy_scale.data_ptr()) % 16 != 0
         ):
             raise ValueError(
-                "trellis3_t256 dense dummy_scale must be a contiguous, 16-byte-"
+                "trellis_t256 dense dummy_scale must be a contiguous, 16-byte-"
                 "aligned four-byte uint8 tensor on the weight device"
             )
     return PreparedTrellis256DenseWeight(
@@ -2197,7 +2260,7 @@ def prepare_trellis256_pair_dense_weight(
     if rate_axis not in {"k", "n"}:
         raise ValueError(f"trellis pair rate_axis must be 'k' or 'n', got {rate_axis!r}")
     if params_dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("trellis3_t256 pair compute requires fp16 or bf16 MMA inputs")
+        raise ValueError("trellis_t256 pair compute requires fp16 or bf16 MMA inputs")
     if payload.dtype != torch.int16:
         raise TypeError(f"trellis pair payload must use torch.int16, got {payload.dtype}")
     if payload.ndim != 1 or not payload.is_contiguous():
@@ -2318,6 +2381,153 @@ def prepare_trellis256_pair_dense_weight(
     )
 
 
+def _restore_plane_words(
+    low: torch.Tensor, high: torch.Tensor, *, fc1: bool
+) -> torch.Tensor:
+    """Assemble low/high record planes into the runtime pair word order.
+
+    ``low``/``high`` are int16 ``[count, atoms, hidden_tiles, 16*bits]``.
+    FC1 places both 128-channel records under each K16 tile; FC2 keeps its
+    K-major low-plane/high-plane ordering. Returns ``[count, words]``.
+    """
+
+    count = low.shape[0]
+    if fc1:
+        low = low.permute(0, 2, 1, 3).reshape(count, low.shape[2], -1)
+        high = high.permute(0, 2, 1, 3).reshape(count, high.shape[2], -1)
+        return torch.cat((low, high), dim=2).reshape(count, -1)
+    return torch.cat(
+        (low.reshape(count, -1), high.reshape(count, -1)), dim=1
+    )
+
+
+def _finalize_prepared_trellis_weights(
+    *,
+    context: str,
+    device: torch.device,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    params_dtype: torch.dtype,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    gate_suh: torch.Tensor,
+    up_suh: torch.Tensor,
+    intermediate_rotations: torch.Tensor,
+    down_svh: torch.Tensor,
+    rotation_columns: int,
+    tile_config: tuple[int, int, int, int],
+    required_fc1_tile_n: int,
+    dummy_scale: torch.Tensor | None,
+    workspace: torch.Tensor | None,
+    codebook: str,
+    trellis_bits: int,
+    fc1_pair_kind: str | None,
+    fc2_pair_kind: str | None,
+    fc1_pair_modes: torch.Tensor | None,
+    fc2_pair_modes: torch.Tensor | None,
+    coupled_hadamard: bool = False,
+) -> PreparedW4A16MoeWeights:
+    """Shared validation and construction tail of the trellis preparers."""
+
+    for name, scale, shapes in (
+        ("gate_suh", gate_suh, ((1, hidden_size), (num_experts, hidden_size))),
+        ("up_suh", up_suh, ((1, hidden_size), (num_experts, hidden_size))),
+        (
+            "intermediate_rotations",
+            intermediate_rotations,
+            ((num_experts, rotation_columns),),
+        ),
+        ("down_svh", down_svh, ((1, hidden_size), (num_experts, hidden_size))),
+    ):
+        if (
+            scale.device != device
+            or scale.dtype != torch.float16
+            or tuple(scale.shape) not in shapes
+            or not scale.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must be contiguous fp16 {shapes} on {device}; got "
+                f"{tuple(scale.shape)}/{scale.dtype}/{scale.device}"
+            )
+        if not bool(torch.all(torch.isfinite(scale))):
+            raise ValueError(f"{name} contains non-finite values")
+    if (gate_suh.shape[0] == 1) != (up_suh.shape[0] == 1):
+        raise ValueError("gate_suh and up_suh must both be broadcast or per-expert")
+
+    tile_config = tuple(int(value) for value in tile_config)
+    if len(tile_config) != 4:
+        raise ValueError("tile_config must contain fc1_k, fc1_n, fc2_k, fc2_n")
+    fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = tile_config
+    if fc1_tile_n != required_fc1_tile_n:
+        raise ValueError(f"{context} requires fc1_tile_n={required_fc1_tile_n}")
+    if fc1_tile_k <= 0 or hidden_size % fc1_tile_k:
+        raise ValueError("fc1_tile_k must divide hidden_size")
+    if fc2_tile_k <= 0 or fc2_tile_k > 128 or 128 % fc2_tile_k:
+        raise ValueError("fc2_tile_k must be a positive divisor of 128")
+    if fc2_tile_n <= 0 or hidden_size % fc2_tile_n:
+        raise ValueError("fc2_tile_n must divide hidden_size")
+    if (fc1_tile_k * fc1_tile_n) // 64 != (fc2_tile_k * fc2_tile_n) // 64:
+        raise ValueError("FC1 and FC2 pair tiles must use the same CTA thread count")
+
+    if dummy_scale is None:
+        dummy_scale = torch.zeros(4, dtype=torch.uint8, device=device)
+    elif (
+        dummy_scale.device != device
+        or dummy_scale.dtype != torch.uint8
+        or tuple(dummy_scale.shape) != (4,)
+        or not dummy_scale.is_contiguous()
+        or int(dummy_scale.data_ptr()) % 16
+    ):
+        raise ValueError(
+            "dummy_scale must be contiguous aligned uint8[4] on the weight device"
+        )
+    if workspace is None:
+        workspace = _make_workspace(device, max_blocks_per_sm=4)
+    elif (
+        workspace.device != device
+        or workspace.dtype != torch.int32
+        or not workspace.is_contiguous()
+    ):
+        raise ValueError("workspace must be contiguous int32 on the weight device")
+
+    global_scale = torch.ones((num_experts,), dtype=torch.float32, device=device)
+    return PreparedW4A16MoeWeights(
+        w13=w13.view(torch.int32) if w13.dtype == torch.int16 else w13,
+        w13_scale=dummy_scale,
+        w13_global_scale=global_scale,
+        w2=w2.view(torch.int32) if w2.dtype == torch.int16 else w2,
+        w2_scale=dummy_scale,
+        w2_global_scale=global_scale,
+        workspace=workspace,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        is_gated=True,
+        params_dtype=params_dtype,
+        fc1_tile_n=fc1_tile_n,
+        fc2_tile_n=fc2_tile_n,
+        source_format="qsrt_sqg_e4m3",
+        w13_layout="trellis_t256_proj",
+        weight_layout="trellis_t256",
+        scale_format="e4m3_k32",
+        trellis=TrellisWeightState(
+            codebook=codebook,
+            bits=trellis_bits,
+            fc1_pair_kind=fc1_pair_kind,
+            fc2_pair_kind=fc2_pair_kind,
+            fc1_pair_modes=fc1_pair_modes,
+            fc2_pair_modes=fc2_pair_modes,
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            intermediate_rotations=intermediate_rotations,
+            down_svh=down_svh,
+            coupled_hadamard=coupled_hadamard,
+            tile_config=tile_config,
+        ),
+    )
+
+
 def prepare_qsrt_pair_moe_weights(
     w13_payload: torch.Tensor,
     w2_payload: torch.Tensor,
@@ -2427,98 +2637,30 @@ def prepare_qsrt_pair_moe_weights(
         )
         prepared_w13.index_copy_(1, ids, swizzled)
 
-    for name, scale, shapes in (
-        ("gate_suh", gate_suh, ((1, hidden_size), (num_experts, hidden_size))),
-        ("up_suh", up_suh, ((1, hidden_size), (num_experts, hidden_size))),
-        (
-            "intermediate_rotations",
-            intermediate_rotations,
-            ((num_experts, 3 * intermediate_size),),
-        ),
-        ("down_svh", down_svh, ((1, hidden_size), (num_experts, hidden_size))),
-    ):
-        if (
-            scale.device != device
-            or scale.dtype != torch.float16
-            or tuple(scale.shape) not in shapes
-            or not scale.is_contiguous()
-        ):
-            raise ValueError(
-                f"{name} must be contiguous fp16 {shapes} on {device}; got "
-                f"{tuple(scale.shape)}/{scale.dtype}/{scale.device}"
-            )
-        if not bool(torch.all(torch.isfinite(scale))):
-            raise ValueError(f"{name} contains non-finite values")
-    if (gate_suh.shape[0] == 1) != (up_suh.shape[0] == 1):
-        raise ValueError("gate_suh and up_suh must both be broadcast or per-expert")
-
-    tile_config = tuple(int(value) for value in tile_config)
-    if len(tile_config) != 4:
-        raise ValueError("tile_config must contain fc1_k, fc1_n, fc2_k, fc2_n")
-    fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = tile_config
-    if fc1_tile_n != 256:
-        raise ValueError("FC1 pair decode requires fc1_tile_n=256")
-    if fc1_tile_k <= 0 or hidden_size % fc1_tile_k:
-        raise ValueError("fc1_tile_k must divide hidden_size")
-    if fc2_tile_k <= 0 or fc2_tile_k > 128 or 128 % fc2_tile_k:
-        raise ValueError("fc2_tile_k must be a positive divisor of 128")
-    if fc2_tile_n <= 0 or hidden_size % fc2_tile_n:
-        raise ValueError("fc2_tile_n must divide hidden_size")
-    if (fc1_tile_k * fc1_tile_n) // 64 != (fc2_tile_k * fc2_tile_n) // 64:
-        raise ValueError("FC1 and FC2 pair tiles must use the same CTA thread count")
-
-    if dummy_scale is None:
-        dummy_scale = torch.zeros(4, dtype=torch.uint8, device=device)
-    elif (
-        dummy_scale.device != device
-        or dummy_scale.dtype != torch.uint8
-        or tuple(dummy_scale.shape) != (4,)
-        or not dummy_scale.is_contiguous()
-        or int(dummy_scale.data_ptr()) % 16
-    ):
-        raise ValueError(
-            "dummy_scale must be contiguous aligned uint8[4] on the weight device"
-        )
-    if workspace is None:
-        workspace = _make_workspace(device, max_blocks_per_sm=4)
-    elif (
-        workspace.device != device
-        or workspace.dtype != torch.int32
-        or not workspace.is_contiguous()
-    ):
-        raise ValueError("workspace must be contiguous int32 on the weight device")
-
-    global_scale = torch.ones((num_experts,), dtype=torch.float32, device=device)
-    return PreparedW4A16MoeWeights(
-        w13=prepared_w13.reshape(-1).view(torch.int32),
-        w13_scale=dummy_scale,
-        w13_global_scale=global_scale,
-        w2=w2_payload.reshape(-1).view(torch.int32),
-        w2_scale=dummy_scale,
-        w2_global_scale=global_scale,
-        workspace=workspace,
+    return _finalize_prepared_trellis_weights(
+        context="FC1 pair decode",
+        device=device,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
-        is_gated=True,
         params_dtype=params_dtype,
-        fc1_tile_n=fc1_tile_n,
-        fc2_tile_n=fc2_tile_n,
-        source_format="qsrt_sqg_e4m3",
-        w13_layout="trellis3_t256_proj",
-        weight_layout="trellis3_t256",
-        scale_format="e4m3_k32",
-        trellis_codebook=SQG_E4M3,
-        trellis_bits=3,
-        fc1_trellis_pair_kind="PDYNAMIC",
-        fc2_trellis_pair_kind="PDYNAMIC",
-        fc1_trellis_pair_modes=fc1_modes,
-        fc2_trellis_pair_modes=fc2_modes,
+        w13=prepared_w13.reshape(-1),
+        w2=w2_payload.reshape(-1),
         gate_suh=gate_suh,
         up_suh=up_suh,
         intermediate_rotations=intermediate_rotations,
         down_svh=down_svh,
+        rotation_columns=3 * intermediate_size,
         tile_config=tile_config,
+        required_fc1_tile_n=256,
+        dummy_scale=dummy_scale,
+        workspace=workspace,
+        codebook=SQG_E4M3,
+        trellis_bits=3,
+        fc1_pair_kind="PDYNAMIC",
+        fc2_pair_kind="PDYNAMIC",
+        fc1_pair_modes=fc1_modes,
+        fc2_pair_modes=fc2_modes,
     )
 
 
@@ -2644,98 +2786,30 @@ def _prepare_qsrt_p33_p43_moe_weights(
         )
     descriptors = ((pair_offsets_u32 << 1) | modes).contiguous()
 
-    for name, scale, shapes in (
-        ("gate_suh", gate_suh, ((1, hidden_size), (num_experts, hidden_size))),
-        ("up_suh", up_suh, ((1, hidden_size), (num_experts, hidden_size))),
-        (
-            "intermediate_rotations",
-            intermediate_rotations,
-            ((num_experts, 3 * intermediate_size),),
-        ),
-        ("down_svh", down_svh, ((1, hidden_size), (num_experts, hidden_size))),
-    ):
-        if (
-            scale.device != device
-            or scale.dtype != torch.float16
-            or tuple(scale.shape) not in shapes
-            or not scale.is_contiguous()
-        ):
-            raise ValueError(
-                f"{name} must be contiguous fp16 {shapes} on {device}; got "
-                f"{tuple(scale.shape)}/{scale.dtype}/{scale.device}"
-            )
-        if not bool(torch.all(torch.isfinite(scale))):
-            raise ValueError(f"{name} contains non-finite values")
-    if (gate_suh.shape[0] == 1) != (up_suh.shape[0] == 1):
-        raise ValueError("gate_suh and up_suh must both be broadcast or per-expert")
-
-    tile_config = tuple(int(value) for value in tile_config)
-    if len(tile_config) != 4:
-        raise ValueError("tile_config must contain fc1_k, fc1_n, fc2_k, fc2_n")
-    fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = tile_config
-    if fc1_tile_n != 256:
-        raise ValueError("QSRT P33/P43 preparation requires fc1_tile_n=256")
-    if fc1_tile_k <= 0 or hidden_size % fc1_tile_k:
-        raise ValueError("fc1_tile_k must divide hidden_size")
-    if fc2_tile_k <= 0 or fc2_tile_k > 128 or 128 % fc2_tile_k:
-        raise ValueError("fc2_tile_k must be a positive divisor of 128")
-    if fc2_tile_n <= 0 or hidden_size % fc2_tile_n:
-        raise ValueError("fc2_tile_n must divide hidden_size")
-    if (fc1_tile_k * fc1_tile_n) // 64 != (fc2_tile_k * fc2_tile_n) // 64:
-        raise ValueError("FC1 and FC2 pair tiles must use the same CTA thread count")
-
-    if dummy_scale is None:
-        dummy_scale = torch.zeros(4, dtype=torch.uint8, device=device)
-    elif (
-        dummy_scale.device != device
-        or dummy_scale.dtype != torch.uint8
-        or tuple(dummy_scale.shape) != (4,)
-        or not dummy_scale.is_contiguous()
-        or int(dummy_scale.data_ptr()) % 16
-    ):
-        raise ValueError(
-            "dummy_scale must be contiguous aligned uint8[4] on the weight device"
-        )
-    if workspace is None:
-        workspace = _make_workspace(device, max_blocks_per_sm=4)
-    elif (
-        workspace.device != device
-        or workspace.dtype != torch.int32
-        or not workspace.is_contiguous()
-    ):
-        raise ValueError("workspace must be contiguous int32 on the weight device")
-
-    global_scale = torch.ones((num_experts,), dtype=torch.float32, device=device)
-    return PreparedW4A16MoeWeights(
-        w13=w13_payload.view(torch.int32),
-        w13_scale=dummy_scale,
-        w13_global_scale=global_scale,
-        w2=w2_payload.view(torch.int32),
-        w2_scale=dummy_scale,
-        w2_global_scale=global_scale,
-        workspace=workspace,
+    return _finalize_prepared_trellis_weights(
+        context="QSRT P33/P43 preparation",
+        device=device,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
-        is_gated=True,
         params_dtype=params_dtype,
-        fc1_tile_n=fc1_tile_n,
-        fc2_tile_n=fc2_tile_n,
-        source_format="qsrt_sqg_e4m3",
-        w13_layout="trellis3_t256_proj",
-        weight_layout="trellis3_t256",
-        scale_format="e4m3_k32",
-        trellis_codebook=SQG_E4M3,
-        trellis_bits=3,
-        fc1_trellis_pair_kind="P33_P43",
-        fc2_trellis_pair_kind="P33_P43",
-        fc1_trellis_pair_modes=descriptors,
-        fc2_trellis_pair_modes=descriptors,
+        w13=w13_payload,
+        w2=w2_payload,
         gate_suh=gate_suh,
         up_suh=up_suh,
         intermediate_rotations=intermediate_rotations,
         down_svh=down_svh,
+        rotation_columns=3 * intermediate_size,
         tile_config=tile_config,
+        required_fc1_tile_n=256,
+        dummy_scale=dummy_scale,
+        workspace=workspace,
+        codebook=SQG_E4M3,
+        trellis_bits=3,
+        fc1_pair_kind="P33_P43",
+        fc2_pair_kind="P33_P43",
+        fc1_pair_modes=descriptors,
+        fc2_pair_modes=descriptors,
     )
 
 
@@ -2952,7 +3026,7 @@ def _prepare_qsrt_p22_atom_v2_moe_weights(
         params_dtype=params_dtype,
         fc1_tile_n=tile_config[1],
         fc2_tile_n=tile_config[3],
-        w13_layout="trellis3_t256_proj",
+        w13_layout="trellis_t256_proj",
         trellis_bits=2,
         dummy_scale=dummy_scale,
         codebook=codebook,
@@ -2963,12 +3037,16 @@ def _prepare_qsrt_p22_atom_v2_moe_weights(
         tile_config=tile_config,
         workspace=workspace,
     )
+    assert prepared.trellis is not None
     return replace(
         prepared,
-        coupled_hadamard=True,
-        intermediate_rotations=torch.cat(
-            (intermediate_rotations, coupled_signs), dim=1
-        ).contiguous(),
+        trellis=replace(
+            prepared.trellis,
+            coupled_hadamard=True,
+            intermediate_rotations=torch.cat(
+                (intermediate_rotations, coupled_signs), dim=1
+            ).contiguous(),
+        ),
     )
 
 
@@ -3108,15 +3186,13 @@ def _prepare_qsrt_coupled_h308_atom_v2_moe_weights(
                 .view(torch.int16)
                 .reshape(atom_count, count, hidden_tiles, 16 * high_bits)
             )
-            if fc1:
-                low = low.permute(1, 2, 0, 3).reshape(count, hidden_tiles, -1)
-                high = high.permute(1, 2, 0, 3).reshape(count, hidden_tiles, -1)
-                restored = torch.cat((low, high), dim=2).reshape(count, -1)
-            else:
-                low = low.permute(1, 0, 2, 3).reshape(count, -1)
-                high = high.permute(1, 0, 2, 3).reshape(count, -1)
-                restored = torch.cat((low, high), dim=1)
-            out[first_expert : first_expert + count].copy_(restored)
+            out[first_expert : first_expert + count].copy_(
+                _restore_plane_words(
+                    low.permute(1, 0, 2, 3),
+                    high.permute(1, 0, 2, 3),
+                    fc1=fc1,
+                )
+            )
         return out
 
     matrix_offsets = (0, fc1_matrix_bytes, 2 * fc1_matrix_bytes)
@@ -3200,60 +3276,35 @@ def _prepare_qsrt_coupled_h308_atom_v2_moe_weights(
         (intermediate_scales, signs.to(device=device, non_blocking=True)), dim=1
     ).contiguous()
 
-    if dummy_scale is None:
-        dummy_scale = torch.zeros(4, dtype=torch.uint8, device=device)
-    if (
-        dummy_scale.device != device
-        or dummy_scale.dtype != torch.uint8
-        or tuple(dummy_scale.shape) != (4,)
-        or not dummy_scale.is_contiguous()
-        or dummy_scale.data_ptr() % 16
-    ):
-        raise ValueError(
-            "dummy_scale must be contiguous aligned uint8[4] on the weight device"
-        )
-    if workspace is None:
-        workspace = _make_workspace(device, max_blocks_per_sm=4)
-    if (
-        workspace.device != device
-        or workspace.dtype != torch.int32
-        or not workspace.is_contiguous()
-    ):
-        raise ValueError("workspace must be contiguous int32 on the weight device")
     normalized_codebook = _trellis256_marker_codebook(
         mcg=None, mul1_e4m3=None, codebook=codebook
     )
-    global_scale = torch.ones((num_experts,), dtype=torch.float32, device=device)
     source_suh = gate_suh if physical_pair < 6 else up_suh
-    return PreparedW4A16MoeWeights(
-        w13=w13.view(torch.int32),
-        w13_scale=dummy_scale,
-        w13_global_scale=global_scale,
-        w2=w2.view(torch.int32),
-        w2_scale=dummy_scale,
-        w2_global_scale=global_scale,
-        workspace=workspace,
+    return _finalize_prepared_trellis_weights(
+        context="coupled H308 preparation",
+        device=device,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
-        is_gated=True,
         params_dtype=params_dtype,
-        fc1_tile_n=256,
-        fc2_tile_n=256,
-        source_format="qsrt_sqg_e4m3",
-        w13_layout="trellis3_t256_proj",
-        weight_layout="trellis3_t256",
-        scale_format="e4m3_k32",
-        trellis_codebook=normalized_codebook,
-        trellis_bits=3,
-        fc1_trellis_pair_kind=fc1_kind,
-        fc2_trellis_pair_kind=fc2_kind,
+        w13=w13,
+        w2=w2,
         gate_suh=source_suh,
         up_suh=source_suh,
         intermediate_rotations=rotations,
         down_svh=down_svh,
-        coupled_hadamard=True,
+        rotation_columns=6 * intermediate_size,
         tile_config=(64, 256, 64, 256),
+        required_fc1_tile_n=256,
+        dummy_scale=dummy_scale,
+        workspace=workspace,
+        codebook=normalized_codebook,
+        trellis_bits=3,
+        fc1_pair_kind=fc1_kind,
+        fc2_pair_kind=fc2_kind,
+        fc1_pair_modes=None,
+        fc2_pair_modes=None,
+        coupled_hadamard=True,
     )
 
 
@@ -3440,29 +3491,9 @@ def prepare_qsrt_atom_v2_moe_weights(
                 hidden_tiles,
                 16 * high_bits,
             )
-            target = destination[first_expert : first_expert + chunk_count]
-            if fc1:
-                target = target.reshape(chunk_count, hidden_tiles, -1)
-                target[..., : _QSRT_ATOMS_PER_PAIR * 16 * low_bits].reshape(
-                    chunk_count,
-                    hidden_tiles,
-                    _QSRT_ATOMS_PER_PAIR,
-                    16 * low_bits,
-                ).copy_(low.permute(0, 2, 1, 3))
-                target[..., _QSRT_ATOMS_PER_PAIR * 16 * low_bits :].reshape(
-                    chunk_count,
-                    hidden_tiles,
-                    _QSRT_ATOMS_PER_PAIR,
-                    16 * high_bits,
-                ).copy_(high.permute(0, 2, 1, 3))
-            else:
-                low_words_per_expert = low.numel() // chunk_count
-                target[:, :low_words_per_expert].copy_(
-                    low.reshape(chunk_count, -1)
-                )
-                target[:, low_words_per_expert:].copy_(
-                    high.reshape(chunk_count, -1)
-                )
+            destination[first_expert : first_expert + chunk_count].copy_(
+                _restore_plane_words(low, high, fc1=fc1)
+            )
 
     group_matrix_words = []
     for ids, _source, p43, _bundle in groups:
@@ -3725,27 +3756,9 @@ def prepare_qsrt_atom_moe_weights(
             high = selected[..., low_words:].reshape(
                 -1, _QSRT_ATOMS_PER_PAIR, hidden_tiles, 16 * high_bits
             )
-            if fc1:
-                low = low.permute(0, 2, 1, 3).reshape(
-                    ids.numel(), hidden_tiles, -1
-                )
-                high = high.permute(0, 2, 1, 3).reshape(
-                    ids.numel(), hidden_tiles, -1
-                )
-                # FC1 places both 128-channel records under each K16 tile.
-                restored = torch.cat((low, high), dim=-1).reshape(
-                    ids.numel(), -1
-                )
-            else:
-                # FC2 retains its K-major low-plane/high-plane ordering.
-                restored = torch.cat(
-                    (
-                        low.reshape(ids.numel(), -1),
-                        high.reshape(ids.numel(), -1),
-                    ),
-                    dim=1,
-                )
-            output.index_copy_(0, ids, restored)
+            output.index_copy_(
+                0, ids, _restore_plane_words(low, high, fc1=fc1)
+            )
         return output
 
     prepared_w13_i16 = torch.stack(
@@ -3784,103 +3797,35 @@ def prepare_qsrt_atom_moe_weights(
         codebook=codebook,
     )
 
-    for name, scale, shapes in (
-        ("gate_suh", gate_suh, ((1, hidden_size), (num_experts, hidden_size))),
-        ("up_suh", up_suh, ((1, hidden_size), (num_experts, hidden_size))),
-        (
-            "intermediate_rotations",
-            intermediate_rotations,
-            ((num_experts, 3 * intermediate_size),),
-        ),
-        ("down_svh", down_svh, ((1, hidden_size), (num_experts, hidden_size))),
-    ):
-        if (
-            scale.device != device
-            or scale.dtype != torch.float16
-            or tuple(scale.shape) not in shapes
-            or not scale.is_contiguous()
-        ):
-            raise ValueError(
-                f"{name} must be contiguous fp16 {shapes} on {device}; got "
-                f"{tuple(scale.shape)}/{scale.dtype}/{scale.device}"
-            )
-        if not bool(torch.all(torch.isfinite(scale))):
-            raise ValueError(f"{name} contains non-finite values")
-    if (gate_suh.shape[0] == 1) != (up_suh.shape[0] == 1):
-        raise ValueError("gate_suh and up_suh must both be broadcast or per-expert")
-
-    tile_config = tuple(int(value) for value in tile_config)
-    if len(tile_config) != 4:
-        raise ValueError("tile_config must contain fc1_k, fc1_n, fc2_k, fc2_n")
-    fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = tile_config
-    if fc1_tile_n != 256:
-        raise ValueError("QSRT pair decode requires fc1_tile_n=256")
-    if fc1_tile_k <= 0 or hidden_size % fc1_tile_k:
-        raise ValueError("fc1_tile_k must divide hidden_size")
-    if fc2_tile_k <= 0 or fc2_tile_k > 128 or 128 % fc2_tile_k:
-        raise ValueError("fc2_tile_k must be a positive divisor of 128")
-    if fc2_tile_n <= 0 or hidden_size % fc2_tile_n:
-        raise ValueError("fc2_tile_n must divide hidden_size")
-    if (fc1_tile_k * fc1_tile_n) // 64 != (fc2_tile_k * fc2_tile_n) // 64:
-        raise ValueError("FC1 and FC2 pair tiles must use the same CTA thread count")
-
-    if dummy_scale is None:
-        dummy_scale = torch.zeros(4, dtype=torch.uint8, device=device)
-    elif (
-        dummy_scale.device != device
-        or dummy_scale.dtype != torch.uint8
-        or tuple(dummy_scale.shape) != (4,)
-        or not dummy_scale.is_contiguous()
-        or int(dummy_scale.data_ptr()) % 16
-    ):
-        raise ValueError(
-            "dummy_scale must be contiguous aligned uint8[4] on the weight device"
-        )
-    if workspace is None:
-        workspace = _make_workspace(device, max_blocks_per_sm=4)
-    elif (
-        workspace.device != device
-        or workspace.dtype != torch.int32
-        or not workspace.is_contiguous()
-    ):
-        raise ValueError("workspace must be contiguous int32 on the weight device")
-
-    global_scale = torch.ones((num_experts,), dtype=torch.float32, device=device)
-    return PreparedW4A16MoeWeights(
-        w13=prepared_w13_i16.view(torch.int32),
-        w13_scale=dummy_scale,
-        w13_global_scale=global_scale,
-        w2=prepared_w2_i16.view(torch.int32),
-        w2_scale=dummy_scale,
-        w2_global_scale=global_scale,
-        workspace=workspace,
+    return _finalize_prepared_trellis_weights(
+        context="QSRT pair decode",
+        device=device,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
-        is_gated=True,
         params_dtype=params_dtype,
-        fc1_tile_n=fc1_tile_n,
-        fc2_tile_n=fc2_tile_n,
-        source_format="qsrt_sqg_e4m3",
-        w13_layout="trellis3_t256_proj",
-        weight_layout="trellis3_t256",
-        scale_format="e4m3_k32",
-        trellis_codebook=normalized_codebook,
-        trellis_bits=3,
-        fc1_trellis_pair_kind=fc1_pair_kind,
-        fc2_trellis_pair_kind=fc2_pair_kind,
-        fc1_trellis_pair_modes=fc1_pair_modes,
-        fc2_trellis_pair_modes=fc2_pair_modes,
+        w13=prepared_w13_i16,
+        w2=prepared_w2_i16,
         gate_suh=gate_suh,
         up_suh=up_suh,
         intermediate_rotations=intermediate_rotations,
         down_svh=down_svh,
+        rotation_columns=3 * intermediate_size,
         tile_config=tile_config,
+        required_fc1_tile_n=256,
+        dummy_scale=dummy_scale,
+        workspace=workspace,
+        codebook=normalized_codebook,
+        trellis_bits=3,
+        fc1_pair_kind=fc1_pair_kind,
+        fc2_pair_kind=fc2_pair_kind,
+        fc1_pair_modes=fc1_pair_modes,
+        fc2_pair_modes=fc2_pair_modes,
     )
-
 
 __all__ = [
     "PreparedW4A16MoeWeights",
+    "TrellisWeightState",
     "PreparedTrellis256DenseWeight",
     "W4A16PackedBuffers",
     "W4A16FC2Weights",

@@ -367,8 +367,8 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
         swiglu_alpha=1.0,
         swiglu_beta=1.0,
         scale_format="e4m3_k32",
-        weight_layout="trellis3_t256",
-        w13_layout="trellis3_t256_proj",
+        weight_layout="trellis_t256",
+        w13_layout="trellis_t256_proj",
         collect_activation_amax=False,
     )
 
@@ -384,7 +384,7 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
         for direct_m in range(1, _W4A16_SMALL_M_DIRECT_MAX_M + 1)
     )
     assert (
-        workspace.planned_fused_moe_launches[("trellis3_t256", "e4m3_k32", 3072, False)]
+        workspace.planned_fused_moe_launches[("trellis_t256", "e4m3_k32", 3072, False)]
         is resolved_fused
     )
 
