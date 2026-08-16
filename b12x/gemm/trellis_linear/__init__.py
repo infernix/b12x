@@ -1,6 +1,7 @@
-"""Native EXL3 Trellis dense linear for SM12x.
+"""Trellis-coded dense linear for SM12x.
 
-The operation consumes the checkpoint-native ``trellis3_t256`` payload and
+The operation consumes the checkpoint-native ``trellis3_t256`` payload
+(MCG or SQG-XOR-Cheb-T12 codebooks) and
 its two Hadamard sign vectors.  Preparation validates and records zero-copy
 views; execution performs input rotation, a W4A16 or direct E4M3-W4A8 GEMM,
 and output rotation.
@@ -29,9 +30,7 @@ META = OpMeta(
     dtypes=("bf16", "fp16"),
     recipes=(
         "w4a16/exl3_trellis_mcg",
-        "w4a16/exl3_trellis_mul1_e4m3",
         "w4a16/exl3_trellis_sqg_cheb_e4m3",
-        "w4a8/exl3_trellis_mul1_e4m3",
         "w4a8/exl3_trellis_sqg_cheb_e4m3",
     ),
     provenance=Provenance(
@@ -44,7 +43,7 @@ META = OpMeta(
     ),
     test_path="tests/gemm/test_trellis_linear.py",
     since="1.0.1",
-    notes="Native EXL3 Trellis dense W4A16 and direct E4M3-W4A8 linear.",
+    notes="Trellis-coded dense W4A16 and direct E4M3-W4A8 linear.",
 )
 
 if TYPE_CHECKING:

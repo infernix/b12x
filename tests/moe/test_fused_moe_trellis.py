@@ -3095,7 +3095,9 @@ def test_qsrt_pdynamic_cache_key_ignores_expert_count() -> None:
     from b12x.moe._shared.kernels.w4a16.kernel import W4A16FusedMoeKernel
 
     def make_kernel(
-        num_experts: int, pair_kind: str = "PDYNAMIC"
+        num_experts: int,
+        pair_kind: str = "PDYNAMIC",
+        fc2_pair_kind: str | None = None,
     ) -> W4A16FusedMoeKernel:
         return W4A16FusedMoeKernel(
             size_m=2,
@@ -3119,7 +3121,9 @@ def test_qsrt_pdynamic_cache_key_ignores_expert_count() -> None:
             trellis_bits=3,
             trellis_codebook="sqg_xor_cheb_t12",
             fc1_trellis_pair_kind=pair_kind,
-            fc2_trellis_pair_kind=pair_kind,
+            fc2_trellis_pair_kind=(
+                pair_kind if fc2_pair_kind is None else fc2_pair_kind
+            ),
             schedule_whole_tiles=True,
             intermediate_rotation=True,
             full_rotation=True,
@@ -3136,8 +3140,19 @@ def test_qsrt_pdynamic_cache_key_ignores_expert_count() -> None:
     assert compact.fc1.__cache_key__ == complete.fc1.__cache_key__
     assert compact.fc2.__cache_key__ == complete.fc2.__cache_key__
 
-    with pytest.raises(ValueError, match="matching runtime mode tables"):
-        make_kernel(27, "P24")
+    # Static pair kinds are part of the fused contract (coupled H308 extents
+    # run P43/P33 and P43/P44), so a static selection constructs; the fused
+    # kernel fails closed only on mismatched dynamic kinds.
+    make_kernel(27, "P24")
+    make_kernel(27, "P43", "P33")
+    with pytest.raises(
+        ValueError, match="dynamic fused trellis pair kinds must match"
+    ):
+        make_kernel(27, "PDYNAMIC", "P33_P43")
+    with pytest.raises(
+        ValueError, match="dynamic fused trellis pair kinds must match"
+    ):
+        make_kernel(27, "P24", "PDYNAMIC")
 
 
 def test_x4t_fc2_direct_uses_bounded_expert_capacity() -> None:

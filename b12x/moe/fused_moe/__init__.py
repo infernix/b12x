@@ -1,9 +1,9 @@
 """Fused tensor-parallel MoE for SM12x: route -> FC1 -> activation -> FC2 ->
 scatter, in one launch family.
 
-Recipes (``META.recipes``) are arguments, not separate ops: nvfp4, mxfp4,
-w4a8_mx, w4a8_nvfp4, w4a16 (weight layouts packed/modelopt and the
-legacy ``exl3_trellis_mcg`` or TP-independent ``qsrt_sqg_e4m3``
+Recipes (``META.recipes``) are arguments, not separate ops: nvfp4,
+w4a8_mx, w4a8_nvfp4, w6a8_mx, w4a16 (weight layouts packed/modelopt and the
+per-rank ``exl3_trellis_mcg`` or TP-independent ``qsrt_sqg_e4m3``
 full-rotation sources, plus uniform-K5/K6 ``sqg_fp16_d3l`` W4A16).
 Activations: silu, situ, relu2,
 swigluoai_uninterleave. Kernel
@@ -76,9 +76,9 @@ META = OpMeta(
     dtypes=("bf16", "fp16"),
     recipes=(
         "nvfp4",
-        "mxfp4",
         "w4a8_mx",
         "w4a8_nvfp4",
+        "w6a8_mx",
         "w4a16",
         "w4a16/exl3_trellis_mcg",
         "w4a16/qsrt_sqg_e4m3",

@@ -1,9 +1,11 @@
-"""One-launch mixed-bitrate EXL3 Trellis MoE execution.
+"""One-launch mixed-bitrate ``trellis3_t256`` MoE execution.
 
 The route packer assigns every global expert to one combined expert namespace.
 Input/intermediate rotations therefore run once. Per-tile dispatch resolves the
 combined expert to a bitrate-specialized K3 or K4 decoder while preserving the
-single cooperative FC1/activation/FC2 grid used by homogeneous Trellis.
+single cooperative FC1/activation/FC2 grid used by homogeneous trellis
+execution. The decoder codebook (MCG or SQG-XOR-Cheb-T12) is a compile-time
+parameter shared with the fused W4A16 kernel ABI.
 
 The module stays internal because checkpoint interpretation and runtime planning
 belong to the serving framework; B12X owns only the prepared kernel path.

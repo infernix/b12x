@@ -138,9 +138,9 @@ class W4A16FC2Weights:
 class PreparedW4A16MoeWeights:
     """Runtime native-codebook W4A16 expert weights.
 
-    EXL3 Trellis keeps native codebook tiles and persistent full-rotation
-    tables, sharing the W4A16 host ABI and retaining the tile configuration
-    used at preparation.
+    Trellis-coded sources (MCG, SQG-XOR-Cheb-T12, or FP16-D3L codebooks) keep
+    native codebook tiles and persistent full-rotation tables, sharing the
+    W4A16 host ABI and retaining the tile configuration used at preparation.
     """
 
     w13: torch.Tensor
@@ -176,7 +176,7 @@ class PreparedW4A16MoeWeights:
     # into that matrix's compact payload pool.
     fc1_trellis_pair_modes: torch.Tensor | None = None
     fc2_trellis_pair_modes: torch.Tensor | None = None
-    # Projection-specific EXL3 input incoherence scales.  They remain optional
+    # Projection-specific input incoherence scales.  They remain optional
     # for non-trellis and synthetic oracle preparation, but the coherent
     # projection-major runtime binds both so gate/up can stage distinct rotated
     # A operands without copying either table.
@@ -1561,7 +1561,7 @@ def _trellis256_random_native_tensor(
 
 
 def _trellis256_bits_from_native_tensor(tensor: torch.Tensor, *, name: str) -> int:
-    """Recover the EXL3 bitrate from the native tile's final dimension."""
+    """Recover the trellis bitrate from the native tile's final dimension."""
     if tensor.ndim < 1:
         raise ValueError(f"trellis3_t256 {name} must have at least one dimension")
     words_per_bit = 16 if tensor.dtype == torch.int16 else 8
@@ -1611,7 +1611,7 @@ def _trellis256_flat_native_view(
         )
     if tuple(tensor.shape) != expected_shape:
         raise ValueError(
-            f"trellis3_t256 {name} requires native {trellis_bits}-bit EXL3 shape "
+            f"trellis3_t256 {name} requires native {trellis_bits}-bit tile shape "
             f"{expected_shape} for dtype {tensor.dtype}, got {tuple(tensor.shape)}"
         )
     if not tensor.is_contiguous():
@@ -1647,13 +1647,13 @@ def prepare_trellis256_moe_weights(
     tile_config: tuple[int, int, int, int] | None = None,
     workspace: torch.Tensor | None = None,
 ) -> PreparedW4A16MoeWeights:
-    """Wrap or synthesize native EXL3 tiles for ``trellis3_t256``.
+    """Wrap or synthesize native ``trellis3_t256`` tiles for any codebook.
 
     Supplying both ``w13`` and ``w2`` is the production path: no bytes are
     copied or permuted; each tensor is only viewed as contiguous int32 words and
     flattened.  Omitting both tensors is the deterministic full-GEMM-oracle
     path selected by ``device`` and ``seed``.  ``gate_suh`` and ``up_suh`` are
-    optional zero-copy bindings for the two projection-specific EXL3 input
+    optional zero-copy bindings for the two projection-specific input
     rotations; when supplied, both must be contiguous fp16 ``[E,H]`` tensors on
     the weight device.
 
@@ -1691,7 +1691,7 @@ def prepare_trellis256_moe_weights(
         )
     if hidden_size % 16 != 0 or intermediate_size % 16 != 0:
         raise ValueError(
-            "native EXL3 tiles require hidden_size and intermediate_size to be "
+            "native trellis tiles require hidden_size and intermediate_size to be "
             f"multiples of 16, got H={hidden_size} I={intermediate_size}"
         )
     if hidden_size % 32 != 0 or intermediate_size % 32 != 0:
@@ -2091,7 +2091,7 @@ def prepare_trellis256_dense_weight(
     params_dtype: torch.dtype = torch.float16,
     dummy_scale: torch.Tensor | None = None,
 ) -> PreparedTrellis256DenseWeight:
-    """Prepare one native EXL3 linear for the dense trellis256 entry point.
+    """Prepare one native trellis linear for the dense trellis256 entry point.
 
     The native payload is ``[K/16,N/16,16*bits]i16`` (or the byte-identical
     ``[...,8*bits]i32`` view), optionally with a leading singleton expert axis.

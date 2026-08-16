@@ -10271,14 +10271,14 @@ def _w4a16_fused_moe_launch_flat(
         packed_route_indices.data_ptr() if expert_map is None else expert_map.data_ptr()
     )
     route_num_experts = 0 if expert_map is None else int(expert_map.numel())
-    if weight_layout == "trellis3_t256":
+    if weight_layout == "trellis3_t256" and trellis_codebook != "mcg":
         trellis_rank_lut = _trellis256_execution_lut(
             a_input.device, trellis_codebook
         )
         fc1_trellis_lut_addr = trellis_rank_lut.data_ptr()
         fc2_trellis_lut_addr = trellis_rank_lut.data_ptr()
     else:
-        # Non-trellis kernels never dereference this ABI slot.
+        # Non-trellis and MCG kernels never dereference this ABI slot.
         fc1_trellis_lut_addr = w13_scale_i32.data_ptr()
         fc2_trellis_lut_addr = w13_scale_i32.data_ptr()
     fused.compiled(
@@ -11473,7 +11473,10 @@ def _run_trellis256_dense_current_device(
         prepared_dense.global_scale,
         launch.c_tmp,
         prepared_dense.workspace,
-        _trellis256_execution_lut(x.device, trellis_codebook),
+        # MCG kernels never dereference the LUT ABI slot.
+        dummy_i32
+        if trellis_codebook == "mcg"
+        else _trellis256_execution_lut(x.device, trellis_codebook),
         m,
         grid_x,
         stream,

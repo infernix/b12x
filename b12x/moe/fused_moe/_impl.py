@@ -2582,7 +2582,7 @@ def _plan_core_workspace(
         if full_rotation:
             if source_format not in _TRELLIS_SOURCE_FORMATS:
                 raise ValueError(
-                    "trellis3_t256 workspace requires an EXL3 trellis source format"
+                    "trellis3_t256 workspace requires a trellis source format"
                 )
             if int(k) % 128 != 0 or int(n) % 128 != 0:
                 raise ValueError(
@@ -5286,7 +5286,7 @@ def prepare_b12x_fp4_moe_weights(
             for value in (gate_suh, up_suh, intermediate_rotations, down_svh)
         ):
             raise ValueError(
-                "EXL3 Trellis preparation requires gate_suh, up_suh, "
+                "Trellis preparation requires gate_suh, up_suh, "
                 "intermediate_rotations, and down_svh"
             )
         assert gate_suh is not None and up_suh is not None

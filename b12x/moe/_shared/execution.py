@@ -765,7 +765,7 @@ def plan_moe_weight_preparation(
         and source_format not in _TRELLIS_SOURCE_FORMATS
     ):
         raise ValueError(
-            "trellis_native layout requires an EXL3 trellis source format"
+            "trellis_native layout requires a trellis source format"
         )
 
     transforms: set[WeightPreparationTransform] = set()
