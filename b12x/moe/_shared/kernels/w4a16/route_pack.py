@@ -77,6 +77,22 @@ def _next_power_of_2(x: int) -> int:
     return 1 << (int(x) - 1).bit_length()
 
 
+def _numel_capacity_for_route_workspace(
+    packed_routes: int,
+    route_blocks: int,
+    block_size: int,
+    num_experts: int,
+) -> int:
+    """Recover the largest live route count covered by a fixed workspace."""
+    block_size = int(block_size)
+    num_experts = int(num_experts)
+    padded_slots = min(int(packed_routes), int(route_blocks) * block_size)
+    fully_padded_experts = num_experts * block_size
+    if padded_slots <= fully_padded_experts:
+        return padded_slots // block_size
+    return padded_slots - num_experts * (block_size - 1)
+
+
 def _workspace_slice(
     tensor: torch.Tensor | None,
     *,
@@ -289,22 +305,54 @@ def pack_topk_routes_by_expert(
         int(num_experts),
         topk=topk,
     )
-    if packed_route_indices is not None and block_expert_ids is not None:
+    provided_routes = (
+        None if packed_route_indices is None else int(packed_route_indices.numel())
+    )
+    provided_blocks = (
+        None if block_expert_ids is None else int(block_expert_ids.numel())
+    )
+    if (
+        provided_routes is not None
+        and provided_blocks is not None
+        and (
+            provided_routes < capacity_packed_routes
+            or provided_blocks < capacity_route_blocks
+        )
+    ):
+        (
+            exact_numel_capacity,
+            exact_packed_routes,
+            exact_route_blocks,
+        ) = route_pack_capacity(
+            numel,
+            int(block_size),
+            int(num_experts),
+            topk=topk,
+            bucket_tokens=False,
+        )
         if (
-            int(packed_route_indices.numel()) < capacity_packed_routes
-            or int(block_expert_ids.numel()) < capacity_route_blocks
+            provided_routes >= exact_packed_routes
+            and provided_blocks >= exact_route_blocks
         ):
-            (
-                numel_capacity,
-                capacity_packed_routes,
-                capacity_route_blocks,
-            ) = route_pack_capacity(
-                numel,
+            # A serving caller can own one fixed arena sized for its configured
+            # maximum while a live prefill tail belongs to a larger power-of-two
+            # bucket. Reuse the full caller capacity instead of specializing each
+            # exact tail. The small-prefix and post-prefix kernels fill unused
+            # route slots with ``live_numel`` and unused blocks with ``-1``. The
+            # recovered live-route capacity also keeps the small-prefix loop bound
+            # stable without changing the caller's allocation or route semantics.
+            numel_capacity = _numel_capacity_for_route_workspace(
+                provided_routes,
+                provided_blocks,
                 int(block_size),
                 int(num_experts),
-                topk=topk,
-                bucket_tokens=False,
             )
+            capacity_packed_routes = provided_routes
+            capacity_route_blocks = provided_blocks
+        else:
+            numel_capacity = exact_numel_capacity
+            capacity_packed_routes = exact_packed_routes
+            capacity_route_blocks = exact_route_blocks
     max_packed_routes = capacity_packed_routes
     max_route_blocks = capacity_route_blocks
     max_packed_routes = max(max_packed_routes, 1)
