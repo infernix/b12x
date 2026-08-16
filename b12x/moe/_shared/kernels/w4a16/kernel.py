@@ -86,8 +86,16 @@ from b12x._lib.intrinsics import (
     warp_reduce,
 )
 from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_lut
+from b12x.moe._shared.kernels.trellis_ring import (
+    trellis256_lane_geom_bits as _trellis_ring_lane_geom_bits,
+)
+from b12x.moe._shared.trellis_codebooks import (
+    MCG,
+    SQG_E4M3,
+    SQG_FP16,
+    validate_codebook_bits,
+)
 from b12x._lib.quant.sqg_fp16_d3l import (
-    SQG_FP16_D3L,
     sqg_fp16_d3l_descriptors,
 )
 from b12x._lib.utils import current_cuda_stream, make_ptr
@@ -170,7 +178,7 @@ _TRELLIS256_W13_LAYOUTS = {"packed", "trellis3_t256_proj"}
 # Native QSRT t256 tiles contain 256 tail-biting codes at one compile-time
 # bitrate. Their exact storage is [16*bits] int16 == [8*bits] uint32 per tile.
 _TRELLIS256_BITS = (2, 3, 4, 5, 6)
-_TRELLIS256_CODEBOOKS = {"mcg", "sqg_xor_cheb_t12", SQG_FP16_D3L}
+_TRELLIS256_CODEBOOKS = {MCG, SQG_E4M3, SQG_FP16}
 _SQG_XOR_CHEB_T12_LUT_ENTRIES = 1 << 12
 _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES = _SQG_XOR_CHEB_T12_LUT_ENTRIES
 _SCALE_FORMATS = {
@@ -185,17 +193,10 @@ _W4A16_SMALL_M_DIRECT_MAX_M = 8
 _FC2_DIRECT_MIN_EXPERT_CAPACITY = 1024
 
 
-def _validate_trellis256_codebook_bits(codebook: str, bits: int) -> None:
-    if codebook == "sqg_xor_cheb_t12" and bits not in (2, 3, 4):
-        raise ValueError("sqg_xor_cheb_t12 is defined only for K2/K3/K4")
-    if codebook == SQG_FP16_D3L and bits not in (5, 6):
-        raise ValueError("sqg_fp16_d3l is defined only for uniform K5/K6")
-
-
 def _trellis256_execution_lut(
     device: torch.device | str, codebook: str
 ) -> torch.Tensor:
-    if codebook == SQG_FP16_D3L:
+    if codebook == SQG_FP16:
         return sqg_fp16_d3l_descriptors(device)
     return sqg_xor_cheb_t12_lut(device)
 
@@ -580,7 +581,7 @@ class W4A16GemmCompileResult:
     w13_layout: str = "w13"
     dense_route_fast_path: bool = False
     trellis_bits: int = 3
-    trellis_codebook: str = "sqg_xor_cheb_t12"
+    trellis_codebook: str = SQG_E4M3
     trellis_pair_kind: str | None = None
     trellis_rate_axis: str | None = None
 
@@ -644,7 +645,7 @@ class W4A16FusedMoeCompileResult:
     intermediate_rotation: bool = False
     dual_a: bool = False
     trellis_bits: int = 3
-    trellis_codebook: str = "sqg_xor_cheb_t12"
+    trellis_codebook: str = SQG_E4M3
     fc1_trellis_pair_kind: str | None = None
     fc2_trellis_pair_kind: str | None = None
     full_rotation: bool = False
@@ -793,7 +794,7 @@ class W4A16GemmKernel:
         scale_format: str = "e4m3_k16",
         w13_layout: str = "w13",
         trellis_bits: int = 3,
-        trellis_codebook: str = "sqg_xor_cheb_t12",
+        trellis_codebook: str = SQG_E4M3,
         trellis_pair_kind: str | None = None,
         trellis_rate_axis: str | None = None,
         source_n_rotation: int = 0,
@@ -835,7 +836,7 @@ class W4A16GemmKernel:
                     "trellis3_t256 bits must be one of "
                     f"{_TRELLIS256_BITS}, got {trellis_bits}"
                 )
-            _validate_trellis256_codebook_bits(trellis_codebook, trellis_bits)
+            validate_codebook_bits(trellis_codebook, trellis_bits)
             if scale_format != "e4m3_k32":
                 raise ValueError(
                     "trellis3_t256 W4A16 weights require scale_format='e4m3_k32'"
@@ -3470,18 +3471,9 @@ class W4A16GemmKernel:
         weight_count: cutlass.Constexpr[int],
         bits: cutlass.Constexpr[int],
     ):
-        bits_i32 = Int32(int(bits))
-        ring_u32 = Int32(8 * int(bits))
-        t_offset = Int32(8) * lane + Int32(weight_offset)
-        b1 = (t_offset + Int32(257)) * bits_i32
-        b0 = b1 - Int32(16)
-        b2 = b1 + Int32((int(weight_count) - 1) * int(bits))
-        i0 = b0 >> Int32(5)
-        i2 = (b2 - Int32(1)) >> Int32(5)
-        ia = i0 - ring_u32 * (i0 >= ring_u32).to(Int32)
-        ib = i2 - ring_u32 * (i2 >= ring_u32).to(Int32)
-        s2 = (i2 + Int32(1)) * Int32(32) - b2
-        return ia, ib, s2, i2 - i0
+        return _trellis_ring_lane_geom_bits(
+            lane, weight_offset, weight_count, bits
+        )
 
     @cute.jit
     def _trellis256_lane_geom(
@@ -3526,7 +3518,7 @@ class W4A16GemmKernel:
                 o0, o1, o2, o3 = packed_dequant_trellis_to_bfloat2x4(
                     win_a, win_b, int(bits)
                 )
-        elif cutlass.const_expr(self.trellis_codebook == SQG_FP16_D3L):
+        elif cutlass.const_expr(self.trellis_codebook == SQG_FP16):
             if cutlass.const_expr(self.is_fp16):
                 o0, o1, o2, o3 = packed_decode_sqg_fp16_d3l_to_half2x4(
                     win_a, win_b, trellis_lut_addr, int(bits)
@@ -5555,7 +5547,7 @@ class W4A16FusedMoeKernel:
         scale_format: str = "e4m3_k16",
         w13_layout: str = "w13",
         trellis_bits: int = 3,
-        trellis_codebook: str = "sqg_xor_cheb_t12",
+        trellis_codebook: str = SQG_E4M3,
         fc1_trellis_pair_kind: str | None = None,
         fc2_trellis_pair_kind: str | None = None,
         direct_topk_routes: bool = False,
@@ -5851,7 +5843,7 @@ class W4A16FusedMoeKernel:
         self.blocks_per_sm = min(self.fc1.blocks_per_sm, self.fc2.blocks_per_sm)
         self.shared_words = max(self.fc1.shared_words, self.fc2.shared_words)
         self.sqg_xor_cheb_t12_smem = (
-            self.trellis_codebook == "sqg_xor_cheb_t12"
+            self.trellis_codebook == SQG_E4M3
             and _sqg_xor_cheb_t12_smem_enabled()
         )
         self.sqg_xor_cheb_t12_smem_off = 0
@@ -8517,7 +8509,7 @@ def _compile_w4a16_small_m_direct(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_facts(
             "moe.w4a16.small_m_direct",
-            1,
+            2,
             ("device_index", None if device is None else int(device.index or 0)),
             ("m", int(m)),
             ("hidden_size", int(hidden_size)),
@@ -8654,7 +8646,7 @@ def _compile_w4a16_fc2_direct(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_facts(
             "moe.w4a16.fc2_direct",
-            3,
+            4,
             ("device_index", int(device.index or 0)),
             ("hidden_size", int(hidden_size)),
             ("intermediate_size", int(intermediate_size)),
@@ -8692,7 +8684,7 @@ def compile_w4a16_gemm(
     scale_format: str = "e4m3_k16",
     w13_layout: str = "packed",
     trellis_bits: int = 3,
-    trellis_codebook: str = "sqg_xor_cheb_t12",
+    trellis_codebook: str = SQG_E4M3,
     trellis_pair_kind: str | None = None,
     trellis_rate_axis: str | None = None,
     dense_route_fast_path: bool = False,
@@ -8835,7 +8827,7 @@ def compile_w4a16_gemm(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.gemm",
-            3,
+            4,
             cache_key,
         ),
     )
@@ -8882,7 +8874,7 @@ def compile_w4a16_fused_moe(
     scale_format: str = "e4m3_k16",
     w13_layout: str = "w13",
     trellis_bits: int = 3,
-    trellis_codebook: str = "sqg_xor_cheb_t12",
+    trellis_codebook: str = SQG_E4M3,
     fc1_trellis_pair_kind: str | None = None,
     fc2_trellis_pair_kind: str | None = None,
     direct_topk_routes: bool = False,
@@ -9494,7 +9486,7 @@ def compile_w4a16_fused_moe(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.fused_moe",
-            7,
+            8,
             cache_key,
         ),
         dsl_compile_options=OptLevel(2),
@@ -10156,7 +10148,7 @@ def _w4a16_fused_moe_launch_flat(
     intermediate_rotation: bool = False,
     a_input_up: torch.Tensor | None = None,
     trellis_bits: int = 3,
-    trellis_codebook: str = "sqg_xor_cheb_t12",
+    trellis_codebook: str = SQG_E4M3,
     fc1_trellis_pair_kind: str | None = None,
     fc2_trellis_pair_kind: str | None = None,
     full_rotation: bool = False,
@@ -11052,7 +11044,7 @@ def _compile_w4a16_gemm_launch(
     scale_format: str = "e4m3_k16",
     w13_layout: str = "packed",
     trellis_bits: int = 3,
-    trellis_codebook: str = "sqg_xor_cheb_t12",
+    trellis_codebook: str = SQG_E4M3,
     trellis_pair_kind: str | None = None,
     trellis_rate_axis: str | None = None,
     dense_route_fast_path: bool = False,
@@ -11675,7 +11667,7 @@ def run_w4a16_moe(
     trellis_bits = int(getattr(prepared, "trellis_bits", 3))
     coupled_hadamard = bool(getattr(prepared, "coupled_hadamard", False))
     trellis_codebook = str(
-        getattr(prepared, "trellis_codebook", "sqg_xor_cheb_t12")
+        getattr(prepared, "trellis_codebook", SQG_E4M3)
     ).lower()
     fc1_trellis_pair_kind = getattr(prepared, "fc1_trellis_pair_kind", None)
     fc2_trellis_pair_kind = getattr(prepared, "fc2_trellis_pair_kind", None)
@@ -12335,7 +12327,7 @@ def run_w4a16_moe(
                 getattr(
                     fused_launch,
                     "trellis_codebook",
-                    "sqg_xor_cheb_t12",
+                    SQG_E4M3,
                 )
             ).lower(),
             getattr(fused_launch, "fc1_trellis_pair_kind", None),

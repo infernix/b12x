@@ -90,7 +90,7 @@ def _make_expert_weights(
         w13_layout="trellis3_t256_proj",
         weight_layout="trellis3_t256",
         scale_format="e4m3_k32",
-        trellis_codebook="sqg_xor_cheb_t12",
+        trellis_codebook="sqg_e4m3",
         trellis_bits=_BITS,
         intermediate_rotations=rotations,
         coupled_hadamard=coupled,

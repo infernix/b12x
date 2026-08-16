@@ -80,6 +80,7 @@ from b12x.moe._shared.execution import (
     make_moe_spec,
     plan_moe_weight_preparation,
 )
+from b12x.moe._shared.trellis_codebooks import MCG, SQG_E4M3, SQG_FP16
 from b12x.moe._shared.tuning import lookup_max_active_clusters
 from b12x._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,
@@ -5129,7 +5130,7 @@ def prepare_b12x_fp4_moe_weights(
                 up_suh=up_suh,
                 down_svh=down_svh,
                 params_dtype=torch.float16,
-                codebook="sqg_xor_cheb_t12",
+                codebook=SQG_E4M3,
                 tile_config=plan.trellis_tile_config or (64, 256, 64, 256),
                 dummy_scale=dummy_scale,
             )
@@ -5231,7 +5232,7 @@ def prepare_b12x_fp4_moe_weights(
             up_suh=up_suh,
             down_svh=down_svh,
             params_dtype=torch.float16,
-            codebook="sqg_xor_cheb_t12",
+            codebook=SQG_E4M3,
             tile_config=tile_config,
             dummy_scale=dummy_scale,
             workspace=workspace_placeholder,
@@ -5339,7 +5340,7 @@ def prepare_b12x_fp4_moe_weights(
             w13_layout="trellis3_t256_proj",
             trellis_bits=plan.trellis_bits,
             dummy_scale=dummy_scale,
-            codebook="sqg_fp16_d3l" if is_d3l else "mcg",
+            codebook=SQG_FP16 if is_d3l else MCG,
             gate_suh=gate_suh,
             up_suh=up_suh,
             intermediate_rotations=intermediate_rotations,
@@ -9443,9 +9444,7 @@ def _launch_dynamic_flat(
             _trellis256_execution_lut,
         )
 
-        trellis_lut_tensor = _trellis256_execution_lut(
-            a.device, "sqg_xor_cheb_t12"
-        )
+        trellis_lut_tensor = _trellis256_execution_lut(a.device, SQG_E4M3)
         payload_u32 = w13_rp.numel() * w13_rp.element_size() // 4
         window_words = 2 * E * (k // 16) * (n // 16) * 8
         trellis_bits = payload_u32 // window_words
@@ -10113,7 +10112,7 @@ def _launch_compact_micro_flat(
             _trellis256_execution_lut,
         )
 
-        trellis_lut = _trellis256_execution_lut(a.device, "sqg_xor_cheb_t12")
+        trellis_lut = _trellis256_execution_lut(a.device, SQG_E4M3)
         trellis_rotations = w1_scale_storage
     use_native_nvfp4_split = (
         quant_mode == "w4a8_nvfp4"

@@ -142,7 +142,7 @@ def _decode_lane(
             values.append(_decode_mul1_e4m3_fp16(window))
         elif codebook == "sqg-cheb-normal-e4m3":
             values.append(_decode_sqg_cheb_normal_e4m3_fp16(window, bits))
-        elif codebook == "sqg_xor_cheb_t12":
+        elif codebook == "sqg_e4m3":
             values.append(_decode_sqg_xor_cheb_t12_fp16(window, bits))
         else:
             raise ValueError(f"unsupported test codebook {codebook!r}")
@@ -503,12 +503,12 @@ def test_dense_sqg_xor_cheb_t12_matches_reference(bits: int) -> None:
         trellis,
         scale,
         scale.clone(),
-        codebook="sqg_xor_cheb_t12",
+        codebook="sqg_e4m3",
         params_dtype=torch.float16,
     )
-    assert weight.trellis_codebook == "sqg_xor_cheb_t12"
+    assert weight.trellis_codebook == "sqg_e4m3"
     reference_weight = _reconstruct_native(
-        trellis, codebook="sqg_xor_cheb_t12"
+        trellis, codebook="sqg_e4m3"
     ).to(device)
     x = (torch.randn((m, features), device=device) * 1.0e-3).to(torch.float16)
 
@@ -553,7 +553,7 @@ def test_dense_sqg_xor_cheb_t12_matches_reference(bits: int) -> None:
     [16, 224],
     ids=["square-proof", "wide-axis"],
 )
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_xor_cheb_t12"])
+@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3"])
 def test_dense_pair_matches_independent_reference_and_captures(
     pair_kind: str,
     bits: tuple[int, int],

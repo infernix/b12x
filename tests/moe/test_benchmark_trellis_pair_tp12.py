@@ -19,7 +19,7 @@ from benchmarks.benchmark_trellis_pair_moe_tp12 import (
 
 
 def test_qsrt_benchmark_uses_sqg_xor_cheb_t12() -> None:
-    assert _CODEBOOK_SOURCE_FORMATS["sqg_xor_cheb_t12"] == "qsrt_sqg_e4m3"
+    assert _CODEBOOK_SOURCE_FORMATS["sqg_e4m3"] == "qsrt_sqg_e4m3"
 
 
 def _write_route_fixture(

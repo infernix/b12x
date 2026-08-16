@@ -541,7 +541,7 @@ def _decode_lane(
     *,
     codebook: str = "mcg",
 ) -> np.ndarray:
-    if codebook not in {"mcg", "sqg_xor_cheb_t12", "sqg_fp16_d3l"}:
+    if codebook not in {"mcg", "sqg_e4m3", "sqg_fp16"}:
         raise ValueError(f"unsupported test codebook {codebook!r}")
     width = 8 * bits
     values = []
@@ -557,7 +557,7 @@ def _decode_lane(
         window = ((merged >> np.uint64(shift)) & np.uint64(0xFFFF)).astype(np.uint32)
         if codebook == "mcg":
             values.append(_decode_mcg_fp16(window))
-        elif codebook == "sqg_xor_cheb_t12":
+        elif codebook == "sqg_e4m3":
             values.append(_sqg_xor_cheb_t12_table(bits)[window])
         else:
             values.append(_sqg_fp16_d3l_table(bits)[window])
@@ -654,7 +654,7 @@ def test_sqg_fp16_d3l_uniform_w4a16_matches_reference_and_captures(
         params_dtype=torch.float16,
         w13_layout="trellis3_t256_proj",
         trellis_bits=bits,
-        codebook="sqg_fp16_d3l",
+        codebook="sqg_fp16",
         gate_suh=gate_suh,
         up_suh=up_suh,
         intermediate_rotations=intermediate_rotations,
@@ -662,16 +662,16 @@ def test_sqg_fp16_d3l_uniform_w4a16_matches_reference_and_captures(
         tile_config=(64, 128, 64, 128),
     )
     assert prepared.source_format == "sqg_fp16_d3l"
-    assert prepared.trellis_codebook == "sqg_fp16_d3l"
+    assert prepared.trellis_codebook == "sqg_fp16"
 
     gate_weights = _reconstruct_native(
-        w13[0, 0], codebook="sqg_fp16_d3l"
+        w13[0, 0], codebook="sqg_fp16"
     ).unsqueeze(0).to(device)
     up_weights = _reconstruct_native(
-        w13[1, 0], codebook="sqg_fp16_d3l"
+        w13[1, 0], codebook="sqg_fp16"
     ).unsqueeze(0).to(device)
     down_weights = _reconstruct_native(
-        w2[0], codebook="sqg_fp16_d3l"
+        w2[0], codebook="sqg_fp16"
     ).unsqueeze(0).to(device)
     x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
     ids = torch.zeros((m, topk), dtype=torch.int32, device=device)
@@ -1315,7 +1315,7 @@ def test_coupled_k2_atom_extent_pads_short_tp_rank() -> None:
         up_suh=up_suh,
         down_svh=down_svh,
         params_dtype=torch.float16,
-        codebook="sqg_xor_cheb_t12",
+        codebook="sqg_e4m3",
         tile_config=(128, 128, 128, 128),
         dummy_scale=None,
         workspace=None,
@@ -1468,7 +1468,7 @@ def test_coupled_k2_fused_moe_matches_transform_reference_and_captures(
         up_suh=up_suh,
         down_svh=down_svh,
         params_dtype=torch.float16,
-        codebook="sqg_xor_cheb_t12",
+        codebook="sqg_e4m3",
         tile_config=tile_config,
         dummy_scale=None,
         workspace=None,
@@ -1496,19 +1496,19 @@ def test_coupled_k2_fused_moe_matches_transform_reference_and_captures(
 
     slot0_weights = torch.stack(
         [
-            _reconstruct_native(w13[0, expert], codebook="sqg_xor_cheb_t12")
+            _reconstruct_native(w13[0, expert], codebook="sqg_e4m3")
             for expert in range(experts)
         ]
     ).to(device)
     slot1_weights = torch.stack(
         [
-            _reconstruct_native(w13[1, expert], codebook="sqg_xor_cheb_t12")
+            _reconstruct_native(w13[1, expert], codebook="sqg_e4m3")
             for expert in range(experts)
         ]
     ).to(device)
     down_weights = torch.stack(
         [
-            _reconstruct_native(w2[expert], codebook="sqg_xor_cheb_t12")
+            _reconstruct_native(w2[expert], codebook="sqg_e4m3")
             for expert in range(experts)
         ]
     ).to(device)
@@ -1708,7 +1708,7 @@ def test_coupled_higher_rate_w4a16_matches_transform_reference(
         fc2_tile_n=128,
         w13_layout="trellis3_t256_proj",
         trellis_bits=bits,
-        codebook="sqg_xor_cheb_t12",
+        codebook="sqg_e4m3",
         gate_suh=source_suh,
         up_suh=source_suh,
         intermediate_rotations=ordinary_rotations,
@@ -1724,13 +1724,13 @@ def test_coupled_higher_rate_w4a16_matches_transform_reference(
     )
 
     slot0_weights = _reconstruct_native(
-        w13[0, 0], codebook="sqg_xor_cheb_t12"
+        w13[0, 0], codebook="sqg_e4m3"
     ).unsqueeze(0).to(device)
     slot1_weights = _reconstruct_native(
-        w13[1, 0], codebook="sqg_xor_cheb_t12"
+        w13[1, 0], codebook="sqg_e4m3"
     ).unsqueeze(0).to(device)
     down_weights = _reconstruct_native(
-        w2[0], codebook="sqg_xor_cheb_t12"
+        w2[0], codebook="sqg_e4m3"
     ).unsqueeze(0).to(device)
     x = torch.randn((m, hidden), dtype=torch.bfloat16, device=device)
     ids = torch.zeros((m, topk), dtype=torch.int32, device=device)
@@ -1920,9 +1920,9 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
             (
                 _reconstruct_native(
                     low,
-                    codebook="sqg_xor_cheb_t12",
+                    codebook="sqg_e4m3",
                 ),
-                _reconstruct_native(high, codebook="sqg_xor_cheb_t12"),
+                _reconstruct_native(high, codebook="sqg_e4m3"),
             ),
             dim=1 if shape == (hidden_tiles, 8) else 0,
         )
@@ -1982,7 +1982,7 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
         down_svh=down_svh,
         params_dtype=torch.float16,
         tile_config=(64, 256, 64, 256),
-        codebook="sqg_xor_cheb_t12",
+        codebook="sqg_e4m3",
     )
     pair_prepared = prepare_qsrt_pair_moe_weights(
         w13_payload,
@@ -1999,14 +1999,14 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
         down_svh=down_svh,
         params_dtype=torch.float16,
         tile_config=(64, 256, 64, 256),
-        codebook="sqg_xor_cheb_t12",
+        codebook="sqg_e4m3",
     )
     torch.testing.assert_close(prepared.w13, pair_prepared.w13, rtol=0, atol=0)
     torch.testing.assert_close(prepared.w2, pair_prepared.w2, rtol=0, atol=0)
     torch.testing.assert_close(
         prepared.intermediate_rotations, intermediate_rotations, rtol=0, atol=0
     )
-    assert prepared.trellis_codebook == "sqg_xor_cheb_t12"
+    assert prepared.trellis_codebook == "sqg_e4m3"
     assert prepared.fc1_trellis_pair_kind == "PDYNAMIC"
     assert prepared.fc2_trellis_pair_kind == "PDYNAMIC"
     assert torch.equal(prepared.fc1_trellis_pair_modes, fc1_pair_spec)
@@ -2224,7 +2224,7 @@ def test_coupled_h308_fused_moe_matches_transform_reference_and_captures(
         up_suh=up_suh,
         down_svh=down_svh,
         params_dtype=torch.float16,
-        codebook="sqg_xor_cheb_t12",
+        codebook="sqg_e4m3",
         tile_config=(64, 256, 64, 256),
         dummy_scale=None,
         workspace=None,
@@ -2254,10 +2254,10 @@ def test_coupled_h308_fused_moe_matches_transform_reference_and_captures(
     slot_weights: list[torch.Tensor] = []
     for projection in range(2):
         low = _reconstruct_native(
-            w13_low[projection, 0], codebook="sqg_xor_cheb_t12"
+            w13_low[projection, 0], codebook="sqg_e4m3"
         )
         high = _reconstruct_native(
-            w13_high[projection, 0], codebook="sqg_xor_cheb_t12"
+            w13_high[projection, 0], codebook="sqg_e4m3"
         )
         # The GEMM output follows the serialized record order.  For P43 that
         # is the funded K4 record followed by the K3 record; the coupled
@@ -2269,8 +2269,8 @@ def test_coupled_h308_fused_moe_matches_transform_reference_and_captures(
         )
     down_weights = torch.cat(
         (
-            _reconstruct_native(w2_low[0], codebook="sqg_xor_cheb_t12"),
-            _reconstruct_native(w2_high[0], codebook="sqg_xor_cheb_t12"),
+            _reconstruct_native(w2_low[0], codebook="sqg_e4m3"),
+            _reconstruct_native(w2_high[0], codebook="sqg_e4m3"),
         ),
         dim=0,
     ).unsqueeze(0).to(device)
@@ -2383,8 +2383,8 @@ def test_qsrt_atoms_v2_prepared_p33_p43_matches_full_rotation_reference(
         )
         decoded = torch.cat(
             (
-                _reconstruct_native(low, codebook="sqg_xor_cheb_t12"),
-                _reconstruct_native(high, codebook="sqg_xor_cheb_t12"),
+                _reconstruct_native(low, codebook="sqg_e4m3"),
+                _reconstruct_native(high, codebook="sqg_e4m3"),
             ),
             dim=1 if fc1 else 0,
         )
@@ -2589,7 +2589,7 @@ def test_qsrt_atom_prepare_rejects_malformed_payloads_and_metadata() -> None:
         up_suh=rotations,
         down_svh=rotations,
         params_dtype=torch.float16,
-        codebook="sqg_xor_cheb_t12",
+        codebook="sqg_e4m3",
         tile_config=(64, 256, 64, 256),
     )
 
@@ -3119,7 +3119,7 @@ def test_qsrt_pdynamic_cache_key_ignores_expert_count() -> None:
             scale_format="e4m3_k32",
             w13_layout="trellis3_t256_proj",
             trellis_bits=3,
-            trellis_codebook="sqg_xor_cheb_t12",
+            trellis_codebook="sqg_e4m3",
             fc1_trellis_pair_kind=pair_kind,
             fc2_trellis_pair_kind=(
                 pair_kind if fc2_pair_kind is None else fc2_pair_kind

@@ -7,7 +7,12 @@ from dataclasses import dataclass, replace
 
 import torch
 
-from b12x._lib.quant.sqg_fp16_d3l import SQG_FP16_D3L
+from b12x.moe._shared.trellis_codebooks import (
+    MCG,
+    SQG_E4M3,
+    normalize_codebook,
+    validate_codebook_bits,
+)
 
 from b12x.moe._shared.kernels.w4a16.host import (
     W4A16PackedBuffers,
@@ -161,7 +166,7 @@ class PreparedW4A16MoeWeights:
     w13_layout: str = "packed"
     weight_layout: str = "trellis3_t256"
     scale_format: str = "e4m3_k32"
-    # Native tiles use MCG, K2/K3/K4 SQG-XOR-Cheb-T12, or K5/K6 FP16-D3L.
+    # Native tiles use mcg, K2/K3/K4 sqg_e4m3, or K5/K6 sqg_fp16 codebooks.
     trellis_codebook: str | None = None
     trellis_bits: int = 3
     # Optional compact fixed-payload pair specialization.  FC1's pair lies on
@@ -1503,42 +1508,10 @@ def make_w4a16_packed_buffers(
 
 
 _TRELLIS256_W13_LAYOUTS = {"packed", "trellis3_t256_proj"}
-_TRELLIS256_CODEBOOKS = {
-    "mcg": "mcg",
-    "sqg_xor_cheb_t12": "sqg_xor_cheb_t12",
-    SQG_FP16_D3L: SQG_FP16_D3L,
-}
-_TRELLIS256_CODEBOOK_SENTINELS = {
-    0xCBAC1FED: "mcg",
-}
-
-
-def _normalize_trellis256_codebook(codebook: str | int) -> str:
-    if isinstance(codebook, int):
-        normalized = _TRELLIS256_CODEBOOK_SENTINELS.get(
-            int(codebook) & 0xFFFFFFFF
-        )
-        if normalized is None:
-            raise ValueError(
-                "unsupported trellis256 codebook sentinel "
-                f"{int(codebook) & 0xFFFFFFFF:#010x}; expected MCG "
-                "0xcbac1fed"
-            )
-        return normalized
-    normalized = _TRELLIS256_CODEBOOKS.get(str(codebook).strip().lower())
-    if normalized is None:
-        raise ValueError(
-            f"unsupported trellis256 codebook {codebook!r}; expected "
-            "'mcg', 'sqg_xor_cheb_t12', or 'sqg_fp16_d3l'"
-        )
-    return normalized
-
-
-def _validate_trellis256_codebook_bits(codebook: str, bits: int) -> None:
-    if codebook == "sqg_xor_cheb_t12" and bits not in (2, 3, 4):
-        raise ValueError("sqg_xor_cheb_t12 is defined only for K2/K3/K4")
-    if codebook == SQG_FP16_D3L and bits not in (5, 6):
-        raise ValueError("sqg_fp16_d3l is defined only for uniform K5/K6")
+def _normalize_trellis256_codebook(
+    codebook: str | int, *, accept_legacy_ids: bool = False
+) -> str:
+    return normalize_codebook(codebook, accept_legacy_ids=accept_legacy_ids)
 
 
 def _trellis256_random_native_tensor(
@@ -1973,9 +1946,7 @@ def prepare_trellis256_moe_weights(
                 "trellis3_t256 tile_config K dimensions must divide the model geometry"
             )
 
-    _validate_trellis256_codebook_bits(
-        normalized_codebook, resolved_trellis_bits
-    )
+    validate_codebook_bits(normalized_codebook, resolved_trellis_bits)
     if dummy_scale is None:
         dummy_scale = torch.zeros(4, dtype=torch.uint8, device=resolved_device)
     else:
@@ -2022,10 +1993,10 @@ def prepare_trellis256_moe_weights(
         fc2_tile_n=fc2_tile_n,
         source_format=(
             "exl3_trellis_mcg"
-            if normalized_codebook == "mcg"
+            if normalized_codebook == MCG
             else "qsrt_sqg_e4m3"
-            if normalized_codebook == "sqg_xor_cheb_t12"
-            else SQG_FP16_D3L
+            if normalized_codebook == SQG_E4M3
+            else "sqg_fp16_d3l"
         ),
         w13_layout=w13_layout,
         weight_layout="trellis3_t256",
@@ -2159,7 +2130,7 @@ def prepare_trellis256_dense_weight(
         mul1_e4m3=mul1_e4m3,
         codebook=codebook,
     )
-    _validate_trellis256_codebook_bits(normalized_codebook, trellis_bits)
+    validate_codebook_bits(normalized_codebook, trellis_bits)
     if dummy_scale is None:
         dummy_scale = torch.zeros(4, dtype=torch.uint8, device=device)
     else:
@@ -2204,7 +2175,7 @@ def prepare_trellis256_pair_dense_weight(
     rate_axis: str,
     mcg: torch.Tensor | int | None = None,
     mul1_e4m3: torch.Tensor | int | None = None,
-    codebook: str | None = "sqg_xor_cheb_t12",
+    codebook: str | None = SQG_E4M3,
     params_dtype: torch.dtype = torch.float16,
     dummy_scale: torch.Tensor | None = None,
 ) -> PreparedTrellis256DenseWeight:
@@ -2362,7 +2333,7 @@ def prepare_qsrt_pair_moe_weights(
     intermediate_rotations: torch.Tensor,
     down_svh: torch.Tensor,
     params_dtype: torch.dtype = torch.float16,
-    codebook: str = "sqg_xor_cheb_t12",
+    codebook: str = SQG_E4M3,
     tile_config: tuple[int, int, int, int] = (64, 256, 64, 256),
     dummy_scale: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
@@ -2388,8 +2359,8 @@ def prepare_qsrt_pair_moe_weights(
         raise ValueError("trellis pairs require gated experts")
     if params_dtype != torch.float16:
         raise ValueError("trellis pairs require fp16 operands")
-    if _normalize_trellis256_codebook(codebook) != "sqg_xor_cheb_t12":
-        raise ValueError("W4A8 trellis pairs support only sqg_xor_cheb_t12")
+    if _normalize_trellis256_codebook(codebook, accept_legacy_ids=True) != SQG_E4M3:
+        raise ValueError("W4A8 trellis pairs support only sqg_e4m3")
     if w13_payload.dtype != torch.int16 or w2_payload.dtype != torch.int16:
         raise TypeError("trellis-pair payloads must use torch.int16")
     if not w13_payload.is_cuda or not w2_payload.is_cuda:
@@ -2537,7 +2508,7 @@ def prepare_qsrt_pair_moe_weights(
         w13_layout="trellis3_t256_proj",
         weight_layout="trellis3_t256",
         scale_format="e4m3_k32",
-        trellis_codebook="sqg_xor_cheb_t12",
+        trellis_codebook=SQG_E4M3,
         trellis_bits=3,
         fc1_trellis_pair_kind="PDYNAMIC",
         fc2_trellis_pair_kind="PDYNAMIC",
@@ -2566,7 +2537,7 @@ def _prepare_qsrt_p33_p43_moe_weights(
     intermediate_rotations: torch.Tensor,
     down_svh: torch.Tensor,
     params_dtype: torch.dtype = torch.float16,
-    codebook: str = "sqg_xor_cheb_t12",
+    codebook: str = SQG_E4M3,
     tile_config: tuple[int, int, int, int] = (64, 256, 64, 256),
     dummy_scale: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
@@ -2598,8 +2569,8 @@ def _prepare_qsrt_p33_p43_moe_weights(
         raise ValueError("QSRT P33/P43 preparation requires gated experts")
     if params_dtype != torch.float16:
         raise ValueError("QSRT P33/P43 preparation requires fp16 operands")
-    if _normalize_trellis256_codebook(codebook) != "sqg_xor_cheb_t12":
-        raise ValueError("QSRT P33/P43 preparation supports only sqg_xor_cheb_t12")
+    if _normalize_trellis256_codebook(codebook, accept_legacy_ids=True) != SQG_E4M3:
+        raise ValueError("QSRT P33/P43 preparation supports only sqg_e4m3")
     if w13_payload.dtype != torch.int16 or w2_payload.dtype != torch.int16:
         raise TypeError("QSRT P33/P43 payloads must use torch.int16")
     if not w13_payload.is_cuda or not w2_payload.is_cuda:
@@ -2754,7 +2725,7 @@ def _prepare_qsrt_p33_p43_moe_weights(
         w13_layout="trellis3_t256_proj",
         weight_layout="trellis3_t256",
         scale_format="e4m3_k32",
-        trellis_codebook="sqg_xor_cheb_t12",
+        trellis_codebook=SQG_E4M3,
         trellis_bits=3,
         fc1_trellis_pair_kind="P33_P43",
         fc2_trellis_pair_kind="P33_P43",
@@ -3301,7 +3272,7 @@ def prepare_qsrt_atom_v2_moe_weights(
     up_suh: torch.Tensor,
     down_svh: torch.Tensor,
     params_dtype: torch.dtype = torch.float16,
-    codebook: str = "sqg_xor_cheb_t12",
+    codebook: str = SQG_E4M3,
     tile_config: tuple[int, int, int, int] = (64, 256, 64, 256),
     dummy_scale: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
@@ -3325,8 +3296,8 @@ def prepare_qsrt_atom_v2_moe_weights(
         raise ValueError(f"unsupported QSRT atoms-v2 profile {profile!r}")
     if not validate_activation(activation) or params_dtype != torch.float16:
         raise ValueError("QSRT atoms-v2 requires gated fp16 preparation")
-    if _normalize_trellis256_codebook(codebook) != "sqg_xor_cheb_t12":
-        raise ValueError("QSRT atoms-v2 supports only sqg_xor_cheb_t12")
+    if _normalize_trellis256_codebook(codebook, accept_legacy_ids=True) != SQG_E4M3:
+        raise ValueError("QSRT atoms-v2 supports only sqg_e4m3")
     if (
         atom_payload.dtype != torch.uint8
         or atom_payload.ndim != 2
@@ -3611,7 +3582,7 @@ def prepare_qsrt_atom_moe_weights(
     up_suh: torch.Tensor,
     down_svh: torch.Tensor,
     params_dtype: torch.dtype = torch.float16,
-    codebook: str | None = "sqg_xor_cheb_t12",
+    codebook: str | None = SQG_E4M3,
     tile_config: tuple[int, int, int, int] = (64, 256, 64, 256),
     dummy_scale: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,

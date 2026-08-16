@@ -121,7 +121,7 @@ class MixedTrellisTier(Protocol):
 class W4A16MixedTrellisKernel:
     """One cooperative grid over two native Trellis bitrates."""
 
-    ABI_VERSION = 7
+    ABI_VERSION = 8
 
     def __init__(
         self,

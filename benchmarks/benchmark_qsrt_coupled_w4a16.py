@@ -114,7 +114,7 @@ def main() -> None:
         fc2_tile_n=tile_config[3],
         w13_layout="trellis3_t256_proj",
         trellis_bits=bits,
-        codebook="sqg_xor_cheb_t12",
+        codebook="sqg_e4m3",
         gate_suh=h_scale,
         up_suh=h_scale,
         intermediate_rotations=ordinary_i,

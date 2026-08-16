@@ -306,7 +306,7 @@ def _serial_tier(
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("route_ids_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_xor_cheb_t12"])
+@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3"])
 def test_mixed_k3_k4_matches_serial_and_captures(
     route_ids_dtype: torch.dtype,
     codebook: str,

@@ -57,7 +57,7 @@ _FIXTURE_KIND = "kquant_qsrt_tp12_benchmark_fixture"
 _FIXTURE_SCHEMA_VERSION = 1
 _RESULT_KIND = "b12x_trellis_pair_moe_tp12_benchmark"
 _RESULT_SCHEMA_VERSION = 1
-_CODEBOOK_SOURCE_FORMATS = {"sqg_xor_cheb_t12": "qsrt_sqg_e4m3"}
+_CODEBOOK_SOURCE_FORMATS = {"sqg_e4m3": "qsrt_sqg_e4m3"}
 
 
 @dataclass(frozen=True)
@@ -792,7 +792,7 @@ def main() -> None:
     parser.add_argument(
         "--codebook",
         choices=tuple(_CODEBOOK_SOURCE_FORMATS),
-        default="sqg_xor_cheb_t12",
+        default="sqg_e4m3",
         help="SQG-XOR-Cheb-T12 reconstruction used by every trellis scenario",
     )
     parser.add_argument(
