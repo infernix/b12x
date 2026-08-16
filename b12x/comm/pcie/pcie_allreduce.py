@@ -70,6 +70,7 @@ class PCIeAllReduce:
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
         single_channel: bool = False,
+        max_concurrent_channels: int = 1,
     ) -> "PCIeAllReduce":
         world_size = dist.get_world_size(group=exchange_group)
         algorithm = _algorithm_for_world_size(world_size)
@@ -82,8 +83,13 @@ class PCIeAllReduce:
                 rank_data_bytes=rank_data_bytes,
                 ext_module=ext_module,
                 single_channel=single_channel,
+                max_concurrent_channels=max_concurrent_channels,
             )
         else:
+            if int(max_concurrent_channels) != 1:
+                raise ValueError(
+                    "hierarchical all-reduce supports exactly one concurrent channel"
+                )
             if max_size < torch.bfloat16.itemsize:
                 raise ValueError("max_size must hold at least one BF16 element")
             runtime = PCIeHierarchicalAllReduce(
@@ -106,6 +112,7 @@ class PCIeAllReduce:
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
         single_channel: bool = False,
+        max_concurrent_channels: int = 1,
     ) -> "PCIeAllReduce":
         return cls.from_exchange_group(
             exchange_group=process_group,
@@ -117,6 +124,7 @@ class PCIeAllReduce:
             rank_data_bytes=rank_data_bytes,
             ext_module=ext_module,
             single_channel=single_channel,
+            max_concurrent_channels=max_concurrent_channels,
         )
 
     @property
@@ -125,8 +133,17 @@ class PCIeAllReduce:
 
         return self.algorithm == "oneshot"
 
-    def for_stream(self, stream: object = None):
-        return self._runtime.for_stream(stream)
+    def prepare_channels(self, channel_ids: Sequence[str]) -> None:
+        """Prepare the runtime's semantic channel owners."""
+        self._runtime.prepare_channels(channel_ids)
+
+    def for_stream(
+        self,
+        stream: object = None,
+        *,
+        channel_id: Optional[str] = None,
+    ):
+        return self._runtime.for_stream(stream, channel_id=channel_id)
 
     def all_reduce(
         self,
@@ -136,6 +153,7 @@ class PCIeAllReduce:
         peer_input_ptrs: Optional[Sequence[int]] = None,
         blocks: Optional[int] = None,
         stream: object = None,
+        channel_id: Optional[str] = None,
     ) -> torch.Tensor:
         if self.algorithm == "hierarchical":
             if peer_input_ptrs is not None:
@@ -147,6 +165,7 @@ class PCIeAllReduce:
                 out=out,
                 blocks=blocks,
                 stream=stream,
+                channel_id=channel_id,
             )
         if blocks is not None:
             raise ValueError("blocks is only available for hierarchical all-reduce")
@@ -155,11 +174,20 @@ class PCIeAllReduce:
             out=out,
             peer_input_ptrs=peer_input_ptrs,
             stream=stream,
+            channel_id=channel_id,
         )
 
     @contextmanager
-    def capture(self, stream: object = None):
-        with self._runtime.capture(stream=stream) as runtime:
+    def capture(
+        self,
+        stream: object = None,
+        *,
+        channel_id: Optional[str] = None,
+    ):
+        with self._runtime.capture(
+            stream=stream,
+            channel_id=channel_id,
+        ) as runtime:
             yield runtime
 
     def close(self) -> None:
