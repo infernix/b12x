@@ -35,7 +35,7 @@ def _caps(*, block_size_m: int | None) -> fused_moe.Caps:
 def _trellis_caps() -> fused_moe.Caps:
     weight_plan = fused_moe.plan_weights(
         quant_modes="w4a16",
-        source_format="exl3_trellis_mcg",
+        source_format="btx",
         activation="silu",
         params_dtype=torch.bfloat16,
         num_experts=160,
@@ -43,6 +43,7 @@ def _trellis_caps() -> fused_moe.Caps:
         intermediate_size=512,
         w13_layout="w13",
         trellis_bits=3,
+        trellis_codebook="mcg",
         trellis_tile_config=(64, 256, 64, 256),
     )
     return fused_moe.Caps(
@@ -288,20 +289,15 @@ def test_btx_plan_fails_closed(overrides, match) -> None:
 
 
 def test_btx_declarations_require_btx_source() -> None:
-    with pytest.raises(ValueError, match="source_format='btx'"):
+    with pytest.raises(ValueError, match="trellis source format"):
         fused_moe.plan_weights(
             quant_modes="w4a16",
-            source_format="qsrt_sqg_e4m3",
-            activation="situ",
-            params_dtype=torch.float16,
+            source_format="modelopt_nvfp4",
+            activation="silu",
+            params_dtype=torch.bfloat16,
             num_experts=8,
             hidden_size=256,
             intermediate_size=256,
-            trellis_bits=2,
-            qsrt_storage_format="qsrt_atoms_v2",
-            qsrt_profile="k2_coupled_h512_h128",
-            coupled_hadamard=True,
-            trellis_tile_config=(128, 128, 128, 128),
             trellis_codebook="sqg_e4m3",
         )
 
@@ -310,15 +306,10 @@ def test_btx_pair_kind_derivation_from_plan() -> None:
     derive = fused_moe_impl._fc_trellis_pair_kind
 
     class _Stub:
-        def __init__(self, kinds, storage=None, bits=3):
+        def __init__(self, kinds):
             self.trellis_pair_kinds = kinds
-            self.qsrt_storage_format = storage
-            self.trellis_bits = bits
 
     assert derive(_Stub(frozenset({"P33", "P43"}))) == "P33_P43"
     assert derive(_Stub(frozenset({"P33", "P24"}))) == "PDYNAMIC"
     assert derive(_Stub(frozenset({"P33"}))) == "PDYNAMIC"
     assert derive(_Stub(None)) is None
-    assert derive(_Stub(None, storage="qsrt_atoms_v2")) == "P33_P43"
-    assert derive(_Stub(None, storage="qsrt_atoms_v2", bits=2)) is None
-    assert derive(_Stub(None, storage="qsrt_atoms_v1")) == "PDYNAMIC"

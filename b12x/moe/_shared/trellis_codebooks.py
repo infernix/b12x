@@ -12,10 +12,6 @@ setting; three are defined:
 
 This module is torch-free. Kernel modules embed the ids as compile-time
 constants, so the ids participate in kernel cache keys.
-
-Frozen checkpoint metadata written before these ids existed spells the SQG
-codebooks ``sqg_xor_cheb_t12`` and ``sqg_fp16_d3l``; only readers of those
-containers should accept the legacy spellings (``accept_legacy_ids=True``).
 """
 
 from __future__ import annotations
@@ -29,20 +25,11 @@ CODEBOOKS: tuple[str, ...] = (MCG, SQG_E4M3, SQG_FP16)
 MCG_MULTIPLIER = 0xCBAC1FED
 CODEBOOK_SENTINELS: dict[int, str] = {MCG_MULTIPLIER: MCG}
 
-LEGACY_CODEBOOK_IDS: dict[str, str] = {
-    "sqg_xor_cheb_t12": SQG_E4M3,
-    "sqg_fp16_d3l": SQG_FP16,
-}
-
-
-def normalize_codebook(
-    codebook: str | int, *, accept_legacy_ids: bool = False
-) -> str:
+def normalize_codebook(codebook: str | int) -> str:
     """Return the canonical codebook id for ``codebook``.
 
-    Integers are checkpoint sentinels (the MCG multiplier). Strings are
-    matched case-insensitively against the canonical ids and, when
-    ``accept_legacy_ids`` is set, the frozen legacy spellings.
+    Integers are checkpoint sentinels (the MCG multiplier); strings are
+    matched case-insensitively against the canonical ids.
     """
 
     if isinstance(codebook, int):
@@ -56,8 +43,6 @@ def normalize_codebook(
     text = str(codebook).strip().lower()
     if text in CODEBOOKS:
         return text
-    if accept_legacy_ids and text in LEGACY_CODEBOOK_IDS:
-        return LEGACY_CODEBOOK_IDS[text]
     raise ValueError(
         f"unsupported trellis codebook {codebook!r}; expected "
         "'mcg', 'sqg_e4m3', or 'sqg_fp16'"

@@ -121,12 +121,16 @@ def main() -> None:
         down_svh=h_scale,
         tile_config=tile_config,
     )
+    assert ordinary.trellis is not None
     coupled = replace(
         ordinary,
-        intermediate_rotations=torch.cat(
-            (ordinary_i, coupled_signs), dim=1
-        ).contiguous(),
-        coupled_hadamard=True,
+        trellis=replace(
+            ordinary.trellis,
+            intermediate_rotations=torch.cat(
+                (ordinary_i, coupled_signs), dim=1
+            ).contiguous(),
+            coupled_hadamard=True,
+        ),
     )
     source = (
         torch.randn((1, h), dtype=torch.float32, device=device) * 1.0e-3

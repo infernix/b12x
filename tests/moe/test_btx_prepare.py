@@ -1,10 +1,8 @@
 """BTX preparation equivalence and fail-closed reader tests.
 
-The equivalence bridges pack identical logical weights into the BTX
-container and into the frozen container each legacy reader consumes, then
-require byte-identical prepared tensors. Independent-assembly checks
-reconstruct the runtime word order with naive loops so the shared restore
-helper is never compared against itself.
+Independent-assembly checks reconstruct the runtime word order with
+naive loops so the shared restore helper is never compared against
+itself; frozen-container equivalence lives in test_btx_compat.
 """
 
 from __future__ import annotations
@@ -30,7 +28,6 @@ from b12x.moe._shared.kernels.w4a16.btx_synth import (
     write_btx_checkpoint,
 )
 from b12x.moe._shared.kernels.w4a16.prepare import (
-    _prepare_qsrt_p22_atom_v2_moe_weights,
     prepare_trellis256_moe_weights,
 )
 
@@ -66,100 +63,6 @@ def _naive_fc2_words(low_planes, high_planes) -> torch.Tensor:
     low = torch.cat([plane.reshape(-1) for plane in low_planes])
     high = torch.cat([plane.reshape(-1) for plane in high_planes])
     return torch.cat((low, high))
-
-
-@requires_cuda
-def test_btx_uniform_k2_coupled_matches_legacy_atoms_v2_reader(
-    tmp_path,
-) -> None:
-    """The production shape class: pure-K2 coupled, one balanced extent."""
-
-    hidden, global_i, experts, slots = 3584, 3072, 2, 8
-    config = BtxSynthConfig(
-        codebook="sqg_e4m3",
-        num_experts=experts,
-        hidden_size=hidden,
-        intermediate_size=global_i,
-        moe_layer_indices=(1,),
-        bits=2,
-        coupled=True,
-        pre_block=512,
-        post_block=128,
-        extent_alignment_slots=4,
-        extent_barriers=(48,),
-        seed=11,
-    )
-    manifest = write_btx_checkpoint(tmp_path, config)
-    layer = read_btx_layer(
-        tmp_path, manifest, 1, first_slot=0, slot_count=slots, verify_sha=True
-    )
-    device = _device()
-    btx_prepared = prepare_btx_moe_weights(
-        layer,
-        activation="situ",
-        device=device,
-        tile_config=(128, 128, 128, 128),
-    )
-
-    # Pack the identical payloads as a frozen atoms-v2 pure-K2 extent.
-    payloads = synth_layer_payloads(config, 1)
-    section = matrix_atom_bytes(hidden, 2, 2)
-    bundle = 3 * section + 3 * 64
-    atom_payload = torch.zeros((slots, experts * bundle), dtype=torch.uint8)
-    for slot in range(slots):
-        cursor = 0
-        for expert in range(experts):
-            for matrix in range(3):
-                low, high = _plane_pair(payloads, expert, slot, matrix)
-                for plane in (low, high):
-                    raw = plane.contiguous().view(torch.uint8).reshape(-1)
-                    atom_payload[slot, cursor : cursor + raw.numel()] = raw
-                    cursor += raw.numel()
-            for matrix in range(3):
-                raw = (
-                    payloads.rotations[slot, expert, matrix]
-                    .contiguous()
-                    .view(torch.uint8)
-                )
-                atom_payload[slot, cursor : cursor + 64] = raw
-                cursor += 64
-
-    def _side(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor.reshape(1, -1).to(device)
-
-    legacy_prepared = _prepare_qsrt_p22_atom_v2_moe_weights(
-        atom_payload,
-        first_atom_slot=0,
-        rotation_draws=payloads.rotation_draws,
-        hidden_size=hidden,
-        intermediate_size=slots * 32,
-        num_experts=experts,
-        activation="situ",
-        gate_suh=_side(payloads.gate_suh),
-        up_suh=_side(payloads.up_suh),
-        down_svh=_side(payloads.down_svh),
-        params_dtype=torch.float16,
-        codebook="sqg_e4m3",
-        tile_config=(128, 128, 128, 128),
-        dummy_scale=None,
-        workspace=None,
-    )
-
-    assert torch.equal(btx_prepared.w13, legacy_prepared.w13)
-    assert torch.equal(btx_prepared.w2, legacy_prepared.w2)
-    assert torch.equal(
-        btx_prepared.intermediate_rotations,
-        legacy_prepared.intermediate_rotations,
-    )
-    assert torch.equal(btx_prepared.gate_suh, legacy_prepared.gate_suh)
-    assert torch.equal(btx_prepared.up_suh, legacy_prepared.up_suh)
-    assert torch.equal(btx_prepared.down_svh, legacy_prepared.down_svh)
-    assert btx_prepared.trellis is not None
-    assert btx_prepared.trellis.bits == 2
-    assert btx_prepared.coupled_hadamard
-    assert btx_prepared.tile_config == legacy_prepared.tile_config
-    assert btx_prepared.source_format == "btx"
-    assert legacy_prepared.source_format == "qsrt_sqg_e4m3"
 
 
 @requires_cuda

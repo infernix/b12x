@@ -329,7 +329,6 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
         activation="silu",
         trellis_bits=3,
         trellis_tile_config=None,
-        qsrt_storage_format=None,
     )
     fused_calls: list[dict[str, object]] = []
     resolved_fused = object()

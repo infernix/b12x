@@ -33,7 +33,7 @@ from b12x.moe._shared.btx_schema import (
 from b12x.moe._shared.kernels.w4a16.prepare import (
     PreparedW4A16MoeWeights,
     _finalize_prepared_trellis_weights,
-    _qsrt_coupled_rotation_signs,
+    _coupled_rotation_signs,
     _restore_plane_words,
     prepare_trellis256_moe_weights,
 )
@@ -290,10 +290,10 @@ def _coupled_rotation_rows(
     draws = layer.rotation_draws
     for draw in sorted(set(int(value) for value in draws.tolist())):
         rows = torch.nonzero(draws == draw, as_tuple=False).flatten()
-        pre = _qsrt_coupled_rotation_signs(2 * global_i, draw=draw, axis=1)[
+        pre = _coupled_rotation_signs(2 * global_i, draw=draw, axis=1)[
             pre_begin : pre_begin + 2 * local
         ]
-        post = _qsrt_coupled_rotation_signs(global_i, draw=draw, axis=2)[
+        post = _coupled_rotation_signs(global_i, draw=draw, axis=2)[
             post_begin : post_begin + local
         ]
         signs.index_copy_(
@@ -426,11 +426,10 @@ def prepare_btx_moe_weights(
             workspace=workspace,
         )
         if not manifest.hadamard.coupled:
-            return replace(prepared, source_format="btx")
+            return prepared
         assert prepared.trellis is not None
         return replace(
             prepared,
-            source_format="btx",
             trellis=replace(
                 prepared.trellis,
                 coupled_hadamard=True,
@@ -438,20 +437,17 @@ def prepare_btx_moe_weights(
             ),
         )
 
-    return replace(
-        _prepare_btx_pair_extent(
-            layer,
-            device=device,
-            gate_suh=gate_suh,
-            up_suh=up_suh,
-            down_svh=down_svh,
-            rotations=rotations,
-            params_dtype=params_dtype,
-            tile_config=tile_config or (64, 256, 64, 256),
-            dummy_scale=dummy_scale,
-            workspace=workspace,
-        ),
-        source_format="btx",
+    return _prepare_btx_pair_extent(
+        layer,
+        device=device,
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        down_svh=down_svh,
+        rotations=rotations,
+        params_dtype=params_dtype,
+        tile_config=tile_config or (64, 256, 64, 256),
+        dummy_scale=dummy_scale,
+        workspace=workspace,
     )
 
 

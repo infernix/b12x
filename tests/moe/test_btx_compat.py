@@ -1,9 +1,10 @@
 """Equivalence of lifted frozen QSRT containers with the BTX load path.
 
 Each test packs one rank extent in a frozen container layout, lifts it to
-an in-memory BTX extent, and requires the BTX preparation to match either
-the frozen container's dedicated reader (byte-for-byte prepared tensors)
-or a synthetically written BTX checkpoint carrying the same plane words.
+an in-memory BTX extent, and requires byte-identical prepared tensors
+against a synthetically written BTX checkpoint carrying the same plane
+words. Byte equality against the frozen containers' dedicated readers was
+established when the lift landed beside them; those readers are removed.
 """
 
 from __future__ import annotations
@@ -47,76 +48,72 @@ def _span(generator):
 
 
 @requires_cuda
-def test_v1_lift_matches_legacy_reader() -> None:
-    from b12x.moe._shared.kernels.w4a16.prepare import (
-        prepare_qsrt_atom_moe_weights,
-    )
+def test_v1_lift_matches_synth_btx(tmp_path) -> None:
+    from b12x.moe._shared.kernels.w4a16.btx import read_btx_layer
+    from b12x.moe._shared.kernels.w4a16.btx_synth import write_btx_checkpoint
 
-    torch.manual_seed(0)
-    generator = torch.Generator().manual_seed(20260816)
-    hidden, experts = 3584, 2
-    hidden_tiles = hidden // 16
-    layer_index, first_atom_slot = 1, 8
-    expert_ids = torch.tensor([3, 17], dtype=torch.int32)
-    format_codes = torch.tensor([0x21, 0x02], dtype=torch.uint8)
-    matrix_bytes = matrix_atom_bytes(hidden, 3, 3)
-    bundle = 3 * matrix_bytes + 3 * 64
-
+    hidden, experts, layer_index, first_atom_slot = 256, 3, 1, 0
+    expert_ids = torch.tensor([3, 7, 11], dtype=torch.int32)
+    format_codes = torch.tensor([0x21, 0x02, 0x11], dtype=torch.uint8)
     physical_pair = first_atom_slot // 8
     rotation = (5 * expert_ids.to(torch.int64) + layer_index) % 12
     logical_pair = (physical_pair - rotation) % 12
-    fc1_p24 = logical_pair < (format_codes.to(torch.int64) >> 4)
-    fc2_p24 = logical_pair < (format_codes.to(torch.int64) & 0xF)
+    fc1_codes = torch.where(
+        logical_pair < (format_codes.to(torch.int64) >> 4),
+        rate_code(2, 4),
+        rate_code(3, 3),
+    ).to(torch.uint8)
+    fc2_codes = torch.where(
+        logical_pair < (format_codes.to(torch.int64) & 0xF),
+        rate_code(2, 4),
+        rate_code(3, 3),
+    ).to(torch.uint8)
 
+    config = BtxSynthConfig(
+        codebook="sqg_e4m3",
+        num_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=256,
+        moe_layer_indices=(layer_index,),
+        bits=None,
+        rate_tables={
+            layer_index: (
+                fc1_codes.reshape(1, -1).clone(),
+                fc2_codes.reshape(1, -1).clone(),
+            )
+        },
+        extent_alignment_slots=8,
+        seed=41,
+    )
+    manifest = write_btx_checkpoint(tmp_path, config)
+    btx_layer = read_btx_layer(
+        tmp_path, manifest, layer_index, first_slot=0, slot_count=8
+    )
+    device = _device()
+    from_synth = prepare_btx_moe_weights(
+        btx_layer, activation="situ", device=device
+    )
+
+    payloads = synth_layer_payloads(config, layer_index)
+    matrix_bytes = matrix_atom_bytes(hidden, 3, 3)
+    bundle = 3 * matrix_bytes + 3 * 64
     payload = torch.zeros((8, experts, bundle), dtype=torch.uint8)
-    spans = torch.zeros((8, experts, 3, 32), dtype=torch.float16)
     for slot in range(8):
         for expert in range(experts):
             cursor = 0
             for matrix in range(3):
-                p24 = bool((fc1_p24 if matrix < 2 else fc2_p24)[expert])
-                low_bits, high_bits = (2, 4) if p24 else (3, 3)
-                for bits in (low_bits, high_bits):
-                    raw = (
-                        _rand_plane(generator, hidden_tiles, bits)
-                        .view(torch.uint8)
-                        .reshape(-1)
-                    )
+                low, high = payloads.planes[(expert, slot, matrix)]
+                for plane in (low, high):
+                    raw = plane.contiguous().view(torch.uint8).reshape(-1)
                     payload[slot, expert, cursor : cursor + raw.numel()] = raw
                     cursor += raw.numel()
             for matrix in range(3):
-                values = _span(generator)
-                spans[slot, expert, matrix] = values
-                payload[
-                    slot, expert, cursor : cursor + 64
-                ] = values.view(torch.uint8)
+                payload[slot, expert, cursor : cursor + 64] = (
+                    payloads.rotations[slot, expert, matrix]
+                    .contiguous()
+                    .view(torch.uint8)
+                )
                 cursor += 64
-
-    device = _device()
-
-    def _side(seed: int) -> torch.Tensor:
-        gen = torch.Generator().manual_seed(seed)
-        raw = torch.rand((1, hidden), generator=gen, dtype=torch.float32)
-        return (0.5 + raw).to(torch.float16).to(device)
-
-    gate_suh, up_suh, down_svh = _side(1), _side(2), _side(3)
-    legacy = prepare_qsrt_atom_moe_weights(
-        payload.to(device),
-        first_atom_slot=first_atom_slot,
-        layer_index=layer_index,
-        expert_ids=expert_ids.to(device),
-        format_codes=format_codes.to(device),
-        hidden_size=hidden,
-        intermediate_size=256,
-        num_experts=experts,
-        activation="situ",
-        gate_suh=gate_suh,
-        up_suh=up_suh,
-        down_svh=down_svh,
-        params_dtype=torch.float16,
-        tile_config=(64, 256, 64, 256),
-        codebook="sqg_e4m3",
-    )
 
     lifted_layer = lift_qsrt_atoms_v1_extent(
         payload,
@@ -125,40 +122,35 @@ def test_v1_lift_matches_legacy_reader() -> None:
         expert_ids=expert_ids,
         format_codes=format_codes,
         hidden_size=hidden,
-        global_intermediate_size=3072,
-        gate_suh=gate_suh.cpu(),
-        up_suh=up_suh.cpu(),
-        down_svh=down_svh.cpu(),
+        global_intermediate_size=256,
+        gate_suh=payloads.gate_suh,
+        up_suh=payloads.up_suh,
+        down_svh=payloads.down_svh,
     )
     lifted = prepare_btx_moe_weights(
-        lifted_layer,
-        activation="situ",
-        device=device,
-        tile_config=(64, 256, 64, 256),
+        lifted_layer, activation="situ", device=device
     )
 
-    assert torch.equal(lifted.w13, legacy.w13)
-    assert torch.equal(lifted.w2, legacy.w2)
+    assert torch.equal(lifted.w13, from_synth.w13)
+    assert torch.equal(lifted.w2, from_synth.w2)
     assert torch.equal(
-        lifted.intermediate_rotations, legacy.intermediate_rotations
+        lifted.intermediate_rotations, from_synth.intermediate_rotations
     )
-    assert torch.equal(lifted.gate_suh, legacy.gate_suh)
-    assert lifted.fc1_trellis_pair_kind == legacy.fc1_trellis_pair_kind
+    assert lifted.fc1_trellis_pair_kind == from_synth.fc1_trellis_pair_kind
     assert torch.equal(
-        lifted.fc1_trellis_pair_modes, legacy.fc1_trellis_pair_modes
+        lifted.fc1_trellis_pair_modes, from_synth.fc1_trellis_pair_modes
     )
     assert torch.equal(
-        lifted.fc2_trellis_pair_modes, legacy.fc2_trellis_pair_modes
+        lifted.fc2_trellis_pair_modes, from_synth.fc2_trellis_pair_modes
     )
 
 
 @requires_cuda
-def test_v2_pure_k2_lift_matches_legacy_reader() -> None:
-    from b12x.moe._shared.kernels.w4a16.prepare import (
-        _prepare_qsrt_p22_atom_v2_moe_weights,
-    )
+def test_v2_pure_k2_lift_matches_synth_btx(tmp_path) -> None:
+    from b12x.moe._shared.kernels.w4a16.btx import read_btx_layer
+    from b12x.moe._shared.kernels.w4a16.btx_synth import write_btx_checkpoint
 
-    hidden, global_i, experts, slots = 3584, 3072, 2, 8
+    hidden, global_i, experts, slots = 512, 512, 2, 8
     config = BtxSynthConfig(
         codebook="sqg_e4m3",
         num_experts=experts,
@@ -170,9 +162,21 @@ def test_v2_pure_k2_lift_matches_legacy_reader() -> None:
         pre_block=512,
         post_block=128,
         extent_alignment_slots=4,
-        extent_barriers=(48,),
+        extent_barriers=(8,),
         seed=21,
     )
+    manifest = write_btx_checkpoint(tmp_path, config)
+    btx_layer = read_btx_layer(
+        tmp_path, manifest, 1, first_slot=0, slot_count=slots
+    )
+    device = _device()
+    from_synth = prepare_btx_moe_weights(
+        btx_layer,
+        activation="situ",
+        device=device,
+        tile_config=(128, 128, 128, 128),
+    )
+
     payloads = synth_layer_payloads(config, 1)
     section = matrix_atom_bytes(hidden, 2, 2)
     bundle = 3 * section + 3 * 64
@@ -187,36 +191,12 @@ def test_v2_pure_k2_lift_matches_legacy_reader() -> None:
                     payload[slot, cursor : cursor + raw.numel()] = raw
                     cursor += raw.numel()
             for matrix in range(3):
-                raw = (
+                payload[slot, cursor : cursor + 64] = (
                     payloads.rotations[slot, expert, matrix]
                     .contiguous()
                     .view(torch.uint8)
                 )
-                payload[slot, cursor : cursor + 64] = raw
                 cursor += 64
-
-    device = _device()
-
-    def _side(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor.reshape(1, -1).to(device)
-
-    legacy = _prepare_qsrt_p22_atom_v2_moe_weights(
-        payload,
-        first_atom_slot=0,
-        rotation_draws=payloads.rotation_draws,
-        hidden_size=hidden,
-        intermediate_size=slots * 32,
-        num_experts=experts,
-        activation="situ",
-        gate_suh=_side(payloads.gate_suh),
-        up_suh=_side(payloads.up_suh),
-        down_svh=_side(payloads.down_svh),
-        params_dtype=torch.float16,
-        codebook="sqg_e4m3",
-        tile_config=(128, 128, 128, 128),
-        dummy_scale=None,
-        workspace=None,
-    )
 
     lifted_layer = lift_qsrt_atoms_v2_extent(
         payload,
@@ -238,13 +218,13 @@ def test_v2_pure_k2_lift_matches_legacy_reader() -> None:
         tile_config=(128, 128, 128, 128),
     )
 
-    assert torch.equal(lifted.w13, legacy.w13)
-    assert torch.equal(lifted.w2, legacy.w2)
+    assert torch.equal(lifted.w13, from_synth.w13)
+    assert torch.equal(lifted.w2, from_synth.w2)
     assert torch.equal(
-        lifted.intermediate_rotations, legacy.intermediate_rotations
+        lifted.intermediate_rotations, from_synth.intermediate_rotations
     )
-    assert torch.equal(lifted.gate_suh, legacy.gate_suh)
-    assert lifted.coupled_hadamard and legacy.coupled_hadamard
+    assert torch.equal(lifted.gate_suh, from_synth.gate_suh)
+    assert lifted.coupled_hadamard and from_synth.coupled_hadamard
 
 
 @requires_cuda

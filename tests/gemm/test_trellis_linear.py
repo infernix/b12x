@@ -20,11 +20,6 @@ from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_LINEAR_BETA,
 )
 from b12x.moe._shared.kernels.w4a16.kernel import _trellis256_dense_launch_geometry
-from b12x.moe._shared.kernels.w4a16.prepare import (
-    prepare_qsrt_pair_moe_weights,
-)
-
-
 _MCG = np.uint64(0xCBAC1FED)
 _MUL1 = np.uint64(0x83DCD12D)
 _MASK = np.uint32(0x8FFF8FFF)

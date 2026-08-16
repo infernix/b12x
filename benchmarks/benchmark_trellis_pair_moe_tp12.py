@@ -43,6 +43,9 @@ try:
 except ModuleNotFoundError:  # Direct ``python benchmarks/...py`` execution.
     from common import make_l2_flush_fn, nvidia_smi_gpu_mode_snapshot
 from b12x.moe import fused_moe
+from b12x.moe._shared.kernels.w4a16.btx_compat import (
+    lift_qsrt_atoms_v1_extent,
+)
 
 
 _HIDDEN = 3584
@@ -57,7 +60,6 @@ _FIXTURE_KIND = "kquant_qsrt_tp12_benchmark_fixture"
 _FIXTURE_SCHEMA_VERSION = 1
 _RESULT_KIND = "b12x_trellis_pair_moe_tp12_benchmark"
 _RESULT_SCHEMA_VERSION = 1
-_CODEBOOK_SOURCE_FORMATS = {"sqg_e4m3": "qsrt_sqg_e4m3"}
 
 
 @dataclass(frozen=True)
@@ -463,19 +465,6 @@ def _prepare_weights(
     sparse_p24_experts: int,
     route_fixture: _RouteFixture | None = None,
 ) -> fused_moe.ExpertWeights:
-    weight_plan = fused_moe.plan_weights(
-        quant_modes="w4a16",
-        source_format=_CODEBOOK_SOURCE_FORMATS[codebook],
-        activation="situ",
-        params_dtype=torch.bfloat16,
-        num_experts=experts,
-        hidden_size=_HIDDEN,
-        intermediate_size=_LOCAL_INTERMEDIATE,
-        w13_layout="w13",
-        trellis_bits=3,
-        trellis_tile_config=_TILES,
-        qsrt_storage_format="qsrt_atoms_v1",
-    )
     w13 = _random_i16(
         (2, experts, _PAIR_WORDS),
         device=device,
@@ -518,17 +507,41 @@ def _prepare_weights(
     format_codes = (
         (fc1_modes.to(torch.uint8) << 4) | fc2_modes.to(torch.uint8)
     ).contiguous()
-    return fused_moe.prepare_weights(
-        plan=weight_plan,
+    pair_kinds = {"P33"}
+    if bool(fc1_modes.any()) or bool(fc2_modes.any()):
+        pair_kinds.add("P24")
+    weight_plan = fused_moe.plan_weights(
+        quant_modes="w4a16",
+        source_format="btx",
+        activation="situ",
         params_dtype=torch.bfloat16,
-        qsrt_atom_payload=atom_payload,
-        qsrt_first_atom_slot=0,
-        qsrt_layer_index=12,
-        qsrt_expert_ids=expert_ids,
-        qsrt_format_codes=format_codes,
+        num_experts=experts,
+        hidden_size=_HIDDEN,
+        intermediate_size=_LOCAL_INTERMEDIATE,
+        w13_layout="w13",
+        trellis_bits=3,
+        trellis_codebook=codebook,
+        trellis_rate_structure="per_expert_pair",
+        trellis_pair_kinds=sorted(pair_kinds),
+        trellis_tile_config=_TILES,
+    )
+    btx_layer = lift_qsrt_atoms_v1_extent(
+        atom_payload,
+        first_atom_slot=0,
+        layer_index=12,
+        expert_ids=expert_ids,
+        format_codes=format_codes,
+        hidden_size=_HIDDEN,
+        global_intermediate_size=_LOCAL_INTERMEDIATE,
         gate_suh=hidden_rotation,
         up_suh=hidden_rotation,
         down_svh=hidden_rotation,
+    )
+    return fused_moe.prepare_weights(
+        plan=weight_plan,
+        params_dtype=torch.bfloat16,
+        btx_layer=btx_layer,
+        btx_device=device,
     )
 
 
