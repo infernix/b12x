@@ -306,6 +306,20 @@ def test_btx_per_expert_pair_matches_naive_assembly(
     assert torch.equal(prepared.w13.view(torch.int16), expected_w13)
     assert torch.equal(prepared.w2.view(torch.int16), expected_w2)
 
+    # Rotation rows follow the pair runtime's record-major channel order:
+    # each atom's first 16 channels belong to the low record, its last 16
+    # to the high record.
+    expected_rotations = []
+    for matrix in range(3):
+        planes = payloads.rotations[:, :, matrix, :].reshape(8, experts, 2, 16)
+        low = planes[:, :, 0, :].permute(1, 0, 2).reshape(experts, -1)
+        high = planes[:, :, 1, :].permute(1, 0, 2).reshape(experts, -1)
+        expected_rotations.append(torch.cat((low, high), dim=1))
+    assert torch.equal(
+        prepared.intermediate_rotations,
+        torch.cat(expected_rotations, dim=1).to(device),
+    )
+
     modes = prepared.fc1_trellis_pair_modes
     assert modes is not None
     if expected_kind == "PDYNAMIC":

@@ -58,6 +58,8 @@ class BtxSynthConfig:
     pre_block: int | None = None
     post_block: int | None = None
     per_expert_input_rotations: bool = False
+    # Unit hidden-axis tables for routes that fold no input-side rotation.
+    unit_hidden_rotations: bool = False
     atom_row_alignment: int = 4096
     extent_alignment_slots: int = 4
     extent_barriers: tuple[int, ...] = ()
@@ -157,6 +159,11 @@ def synth_layer_payloads(
         if config.per_expert_input_rotations
         else (config.hidden_size,)
     )
+
+    def _h_values() -> torch.Tensor:
+        if config.unit_hidden_rotations:
+            return torch.ones(h_shape, dtype=torch.float16)
+        return _values(h_shape)
     draws = None
     if config.coupled:
         draws = torch.randint(
@@ -166,9 +173,9 @@ def synth_layer_payloads(
     return BtxLayerPayloads(
         planes=planes,
         rotations=rotations,
-        gate_suh=_values(h_shape),
-        up_suh=_values(h_shape),
-        down_svh=_values(h_shape),
+        gate_suh=_h_values(),
+        up_suh=_h_values(),
+        down_svh=_h_values(),
         rotation_draws=draws,
         rates_fc1=None if uniform else rates_fc1,
         rates_fc2=None if uniform else rates_fc2,

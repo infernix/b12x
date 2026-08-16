@@ -260,10 +260,19 @@ def test_btx_plan_supports_w4a8_mx_uniform() -> None:
         (
             {
                 "trellis_bits": 2,
+                "coupled_hadamard": False,
                 "trellis_rate_structure": "per_expert_pair",
                 "trellis_pair_kinds": ("P33", "P43"),
             },
             "trellis_bits=3",
+        ),
+        (
+            {
+                "trellis_bits": 3,
+                "trellis_rate_structure": "per_expert_pair",
+                "trellis_pair_kinds": ("P33", "P43"),
+            },
+            "only for uniform rate structures",
         ),
         (
             {"trellis_pair_kinds": ("P33", "P43")},

@@ -464,6 +464,11 @@ class MoEWeightPreparationPlan:
                             "uniform btx rates declare no trellis_pair_kinds"
                         )
                 elif structure == "per_expert_pair":
+                    if self.coupled_hadamard:
+                        raise ValueError(
+                            "coupled-Hadamard btx execution is qualified "
+                            "only for uniform rate structures"
+                        )
                     if bits != 3:
                         raise ValueError(
                             "per-expert-pair btx rates require the "

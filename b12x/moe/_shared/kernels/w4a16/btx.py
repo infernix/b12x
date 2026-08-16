@@ -483,6 +483,25 @@ def _prepare_btx_pair_extent(
             f"256-channel pair ({ATOMS_PER_PAIR} atom slots); got "
             f"{layer.slot_count}"
         )
+    if manifest.hadamard.coupled:
+        raise ValueError(
+            "coupled-Hadamard execution of per-expert-pair BTX extents has "
+            "no qualified kernel path"
+        )
+    # The pair runtime orders each 256-channel pair record-major: every
+    # atom contributes its first 16 channels to the low record and its
+    # last 16 to the high record. Rotation rows must match that order.
+    experts_count = geometry.num_experts
+    per_matrix = []
+    values = layer.rotations.to(rotations.device)
+    for matrix in range(3):
+        planes = values[:, :, matrix, :].reshape(
+            ATOMS_PER_PAIR, experts_count, 2, 16
+        )
+        low = planes[:, :, 0, :].permute(1, 0, 2).reshape(experts_count, -1)
+        high = planes[:, :, 1, :].permute(1, 0, 2).reshape(experts_count, -1)
+        per_matrix.append(torch.cat((low, high), dim=1))
+    rotations = torch.cat(per_matrix, dim=1).contiguous()
     assert layer.rates_fc1 is not None and layer.rates_fc2 is not None
     fc1_codes = layer.rates_fc1[0].to(torch.int64)
     fc2_codes = layer.rates_fc2[0].to(torch.int64)

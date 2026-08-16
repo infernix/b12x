@@ -43,7 +43,7 @@ def _uniform_manifest_dict(
         "codebook": codebook,
         "geometry": {
             "num_experts": 8,
-            "hidden_size": 256,
+            "hidden_size": 512,
             "intermediate_size": 512,
             "atom_channels": 32,
             "atom_slots": 16,
@@ -278,7 +278,7 @@ def test_write_btx_checkpoint_coupled_and_per_expert(tmp_path) -> None:
     assert manifest.rates.pair_kinds == frozenset({"P33", "P43"})
 
     coupled = _small_config(
-        coupled=True, pre_block=512, post_block=128, seed=9
+        coupled=True, pre_block=512, post_block=128, seed=9, hidden_size=512
     )
     manifest = write_btx_checkpoint(tmp_path / "coupled", coupled)
     assert manifest.hadamard.coupled

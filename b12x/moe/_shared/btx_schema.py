@@ -413,6 +413,10 @@ def _parse_hadamard(data: dict, *, geometry: BtxGeometry) -> BtxHadamard:
         geometry.intermediate_size % post_block == 0,
         "BTX intermediate_size must be a multiple of post_block",
     )
+    _require(
+        geometry.hidden_size % pre_block == 0,
+        "BTX hidden_size must be a multiple of pre_block",
+    )
     return BtxHadamard(
         coupled=True,
         pre_block=pre_block,

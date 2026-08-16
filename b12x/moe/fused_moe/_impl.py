@@ -272,6 +272,7 @@ class TPW4A16Workspace:
     trellis_tile_config: tuple[int, int, int, int] | None = None
     qsrt_storage_format: str | None = None
     trellis_pair_kinds: frozenset[str] | None = None
+    trellis_codebook: str | None = None
     coupled_hadamard: bool = False
     route_block_size_m: int | None = None
     planned_token_counts: frozenset[int] = field(default_factory=frozenset)
@@ -694,6 +695,7 @@ class _TPCoreWorkspacePlan:
     trellis_tile_config: tuple[int, int, int, int] | None = None
     qsrt_storage_format: str | None = None
     trellis_pair_kinds: frozenset[str] | None = None
+    trellis_codebook: str | None = None
     coupled_hadamard: bool = False
     route_block_size_m: int | None = None
     tensor_specs: Tuple[_TensorAllocSpec, ...] = ()
@@ -1413,6 +1415,20 @@ def _normalize_swiglu_params(
         normalize_swiglu_alpha_for_activation(activation, swiglu_alpha),
         normalize_swiglu_beta_for_activation(activation, swiglu_beta),
     )
+
+
+def _derive_trellis_codebook(
+    source_format: str, trellis_codebook: str | None
+) -> str | None:
+    """Kernel decode codebook: declared by btx plans, implied by legacy ids."""
+
+    if trellis_codebook is not None:
+        return trellis_codebook
+    return {
+        "exl3_trellis_mcg": MCG,
+        "qsrt_sqg_e4m3": SQG_E4M3,
+        "sqg_fp16_d3l": SQG_FP16,
+    }.get(source_format)
 
 
 def _fc_trellis_pair_kind(workspace) -> str | None:
@@ -2547,6 +2563,7 @@ def _plan_core_workspace(
     trellis_tile_config: tuple[int, int, int, int] | None = None,
     qsrt_storage_format: str | None = None,
     trellis_pair_kinds: frozenset[str] | None = None,
+    trellis_codebook: str | None = None,
     coupled_hadamard: bool = False,
     apply_router_weight_on_input: bool = False,
     deterministic_output: bool = False,
@@ -2845,6 +2862,7 @@ def _plan_core_workspace(
             trellis_tile_config=trellis_tile_config,
             qsrt_storage_format=qsrt_storage_format,
             trellis_pair_kinds=trellis_pair_kinds,
+            trellis_codebook=trellis_codebook,
             coupled_hadamard=bool(coupled_hadamard),
             route_block_size_m=w4a16_block_size_m,
             tensor_specs=tuple(tensor_specs),
@@ -3284,6 +3302,7 @@ def _materialize_workspace_from_core_arena(
             trellis_tile_config=plan.trellis_tile_config,
             qsrt_storage_format=plan.qsrt_storage_format,
             trellis_pair_kinds=plan.trellis_pair_kinds,
+            trellis_codebook=plan.trellis_codebook,
             coupled_hadamard=plan.coupled_hadamard,
             route_block_size_m=plan.route_block_size_m,
             volatile_launch_state=bool(volatile_launch_state),
@@ -6813,6 +6832,9 @@ def plan_tp_moe_arena_layout(
             trellis_tile_config=weight_plan.trellis_tile_config,
             qsrt_storage_format=weight_plan.qsrt_storage_format,
             trellis_pair_kinds=weight_plan.trellis_pair_kinds,
+            trellis_codebook=_derive_trellis_codebook(
+                weight_plan.source_format, weight_plan.trellis_codebook
+            ),
             coupled_hadamard=weight_plan.coupled_hadamard,
             apply_router_weight_on_input=apply_router_weight_on_input,
             deterministic_output=plan.deterministic_output,
@@ -6947,6 +6969,7 @@ def _plan_full_rotation_w4a16_launches(
                 scale_format=scale_format,
                 w13_layout=w13_layout,
                 trellis_bits=core_plan.trellis_bits,
+                trellis_codebook=core_plan.trellis_codebook or SQG_E4M3,
                 force_tile_config=core_plan.trellis_tile_config,
                 intermediate_rotation=True,
                 full_rotation=True,
@@ -7148,6 +7171,9 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         trellis_tile_config=caps.weight_plan.trellis_tile_config,
         qsrt_storage_format=caps.weight_plan.qsrt_storage_format,
         trellis_pair_kinds=caps.weight_plan.trellis_pair_kinds,
+        trellis_codebook=_derive_trellis_codebook(
+            caps.weight_plan.source_format, caps.weight_plan.trellis_codebook
+        ),
         coupled_hadamard=caps.weight_plan.coupled_hadamard,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         deterministic_output=launch_plan.deterministic_output,
@@ -7311,6 +7337,7 @@ def _prewarm_w4a16_planned_launches(
                     w13_layout=w13_layout,
                     collect_activation_amax=collect_activation_amax,
                     trellis_bits=workspace.trellis_bits,
+                    trellis_codebook=workspace.trellis_codebook or SQG_E4M3,
                     fc1_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
                     fc2_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
                     force_tile_config=workspace.trellis_tile_config,
@@ -7646,6 +7673,9 @@ def materialize_tp_moe_arena_workspaces(
             trellis_tile_config=weight_plan.trellis_tile_config,
             qsrt_storage_format=weight_plan.qsrt_storage_format,
             trellis_pair_kinds=weight_plan.trellis_pair_kinds,
+            trellis_codebook=_derive_trellis_codebook(
+                weight_plan.source_format, weight_plan.trellis_codebook
+            ),
             coupled_hadamard=weight_plan.coupled_hadamard,
             apply_router_weight_on_input=apply_router_weight_on_input,
             deterministic_output=plan.deterministic_output,
