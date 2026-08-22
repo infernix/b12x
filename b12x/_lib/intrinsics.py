@@ -1094,6 +1094,27 @@ def ldmatrix_m8n8x4_trans_right_half_b16(
 
 
 @dsl_user_op
+def ldmatrix_m16n16x1_trans_b8(
+    smem_addr: Int32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """Load one transposed 16x16 byte matrix as two registers per lane."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ldmatrix.sync.aligned.m16n16.x1.trans.shared.b8 {$0, $1}, [$2];",
+        "=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(r0), Uint32(r1)
+
+
+@dsl_user_op
 def ld_shared_v4_u32(
     smem_addr: Int32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32, Uint32, Uint32]:

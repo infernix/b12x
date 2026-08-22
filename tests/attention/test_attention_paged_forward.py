@@ -327,6 +327,48 @@ def test_paged_forward_matches_reference_decode_short_context() -> None:
 
 
 @torch.inference_mode()
+def test_qwen38_gqa6_head_dim256_decode_matches_reference() -> None:
+    """Qwen3.8 full-attention geometry must avoid the H128 GQA6 row fast path."""
+    require_b12x()
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[1],
+        cache_seqlens=[128],
+        q_heads=24,
+        kv_heads=4,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+    )
+    workspace = _make_workspace(q, k_cache, v_cache, mode="decode")
+    workspace.prepare(
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        disable_split_kv=True,
+    )
+    output, _lse = workspace.run(
+        q,
+        k_cache,
+        v_cache,
+        output=torch.empty_like(q),
+    )
+    torch.cuda.synchronize()
+
+    ref_out, _ref_lse = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+    )
+    assert (output - ref_out).abs().max().item() <= 0.03
+    assert _cosine_similarity(output, ref_out) >= 0.99999
+
+
+@torch.inference_mode()
 def test_paged_forward_matches_reference_decode_dense_page128() -> None:
     require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
@@ -1365,3 +1407,62 @@ def test_paged_forward_matches_reference_with_bf16_kv_extend() -> None:
     assert (output - ref_out).abs().max().item() <= 0.03
     assert (lse_natural - ref_lse).abs().max().item() <= 0.05
     assert _cosine_similarity(output, ref_out) >= 0.99999
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize(
+    "kv_dtype",
+    [torch.bfloat16, torch.float8_e4m3fn],
+)
+def test_qwen38_full_prefill_terminal_v_copy_matches_reference(
+    kv_dtype: torch.dtype,
+) -> None:
+    """Full prefill must drain a terminal partial V tile before its PV MMA."""
+    require_b12x()
+    q_len = 256
+    batch = 8
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[q_len] * batch,
+        cache_seqlens=[q_len] * batch,
+        q_heads=24,
+        kv_heads=4,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        dtype=torch.bfloat16,
+        kv_dtype=kv_dtype,
+    )
+    workspace = _make_workspace(q, k_cache, v_cache, mode="extend")
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+    assert workspace.plan.split_kv is False
+    descale = (
+        torch.ones(batch, dtype=torch.float32, device=q.device)
+        if kv_dtype == torch.float8_e4m3fn
+        else None
+    )
+
+    ref_out, _ref_lse = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale=descale,
+        v_descale=descale,
+        causal=True,
+    )
+    output = torch.empty_like(q)
+    for _ in range(3):
+        output.fill_(float("nan"))
+        workspace.run(
+            q,
+            k_cache,
+            v_cache,
+            output=output,
+            k_descale=descale,
+            v_descale=descale,
+        )
+        torch.cuda.synchronize()
+        assert torch.isfinite(output).all()
+        assert (output - ref_out).abs().max().item() <= 0.05
+        assert _cosine_similarity(output, ref_out) >= 0.999
