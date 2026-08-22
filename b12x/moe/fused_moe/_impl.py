@@ -6133,6 +6133,7 @@ def _w4a16_preplanned_launches(
     # partials into the output), so it only applies when m matches exactly.
     from b12x.moe._shared.kernels.w4a16.kernel import (
         _TC_DECODE_MAX_M,
+        _w4a16_tc_decode_preferred,
     )
 
     sum_uses_expert_map = bool(use_output_expert_map or use_route_expert_map)
@@ -6153,6 +6154,12 @@ def _w4a16_preplanned_launches(
         not collect_activation_amax
         and weight_layout == "packed"
         and token_count <= _TC_DECODE_MAX_M
+        and _w4a16_tc_decode_preferred(
+            m=token_count,
+            topk=workspace.num_topk,
+            num_experts=workspace.weight_E,
+            sms=get_num_sm(workspace.device),
+        )
     ):
         tc_decode = workspace.planned_tc_decode_launches.get(token_count)
         if tc_decode is not None:

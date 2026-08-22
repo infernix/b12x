@@ -190,6 +190,9 @@ _E8M0_K32_BF16_GLOBAL_COMPENSATION = float(2.0**119)
 _MAX_DIRECT_TOPK_ROUTE_M = 6
 _W4A16_SMALL_M_DIRECT_MAX_M = 8
 _FC2_DIRECT_MIN_EXPERT_CAPACITY = 1024
+_TC_DECODE_PACK_COLLIDING_PAIRS = 3
+_TC_DECODE_PACK_SM_COVERAGE_NUMERATOR = 7
+_TC_DECODE_PACK_SM_COVERAGE_DENOMINATOR = 8
 
 
 def _trellis256_execution_lut(
@@ -210,6 +213,38 @@ def _trellis256_execution_lut(
 # _TC_DECODE_M is retained for callers/tests that enumerate the supported sizes.
 _TC_DECODE_MAX_M = _W4A16_SMALL_M_DIRECT_MAX_M
 _TC_DECODE_M = tuple(range(1, _TC_DECODE_MAX_M + 1))
+
+
+def _w4a16_tc_decode_preferred(
+    *,
+    m: int,
+    topk: int,
+    num_experts: int,
+    sms: int,
+) -> bool:
+    """Choose direct TC-decode until expert packing has useful reuse.
+
+    With ``r`` uniformly distributed routes over ``E`` experts, the birthday
+    approximation predicts ``r * (r - 1) / (2 * E)`` colliding route pairs.
+    Route packing starts to amortize its histogram/sort and separate top-k sum
+    once it can cover most of the machine and predicts several reusable expert
+    rows.
+    """
+
+    m = int(m)
+    topk = int(topk)
+    num_experts = max(int(num_experts), 1)
+    sms = max(int(sms), 1)
+    if m < 1 or m > _TC_DECODE_MAX_M:
+        return False
+    routed_rows = m * topk
+    pack_has_reuse = (
+        routed_rows * _TC_DECODE_PACK_SM_COVERAGE_DENOMINATOR
+        >= sms * _TC_DECODE_PACK_SM_COVERAGE_NUMERATOR
+        and routed_rows * (routed_rows - 1)
+        >= 2 * _TC_DECODE_PACK_COLLIDING_PAIRS * num_experts
+    )
+    return not pack_has_reuse
 
 
 @dsl_user_op
@@ -9102,8 +9137,9 @@ def compile_w4a16_fused_moe(
             fc1_tile_n = 256
             fc1_tile_k = wide_fc1_tile_k
             fc1_cta_threads = 256
-    # TC-decode FC2 wide-N override: in the m8 fused path the host right-sizes
-    # grid_x to the FC1 mn-tile count (one persistent wave, no split-K). FC2
+    # Packed decode FC2 wide-N override: the direct path right-sizes grid_x to
+    # the FC1 mn-tile count, while the expert-packed path uses the same
+    # persistent cap with a device-known live block count. FC2
     # (N=hidden_size, K=intermediate_size) with the default tile_n=128 produces
     # route_blocks*(hidden_size/128) mn-tiles -- roughly double FC1's count --
     # so FC2 would need ~2 persistent waves while FC1 fits in 1; that second
@@ -9113,7 +9149,9 @@ def compile_w4a16_fused_moe(
     # hidden_size%256==0, and matching cta_threads so the fused single
     # thread-geometry contract is preserved.
     if (
-        bool(tc_decode_fused_sum)
+        weight_layout == "packed"
+        and int(moe_block_size) == 8
+        and int(size_m) <= _TC_DECODE_MAX_M
         and int(hidden_size) % 256 == 0
         and fc2_tile_n == 128
         and fc1_cta_threads == 256
@@ -11880,6 +11918,8 @@ def run_w4a16_moe(
     if block_size_m not in _ALLOWED_ROUTED_SIZES:
         raise ValueError(f"unsupported W4A16 moe_block_size={block_size_m}")
 
+    props = torch.cuda.get_device_properties(a_input.device)
+    sms = int(props.multi_processor_count)
     current_stream = current_cuda_stream()
     stream = current_stream if stream is None else stream
     if (not collect_activation_amax) and _small_m_direct_supported(
@@ -11987,7 +12027,12 @@ def run_w4a16_moe(
         and element_dtype == "bf16"
         and topk_ids.dtype in (torch.int32, torch.int64)
         and topk_ids.is_cuda
-        and int(m) <= _TC_DECODE_MAX_M
+        and _w4a16_tc_decode_preferred(
+            m=m,
+            topk=topk,
+            num_experts=int(prepared.num_experts),
+            sms=sms,
+        )
     )
     if use_tc_decode and topk_ids.dtype != torch.int32:
         # The inline direct-topk route path needs int32 route indices.
@@ -12114,8 +12159,6 @@ def run_w4a16_moe(
             stream=stream,
         )
 
-    props = torch.cuda.get_device_properties(a_input.device)
-    sms = int(props.multi_processor_count)
     max_shared_mem = int(
         getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
     )

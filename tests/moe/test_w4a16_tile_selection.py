@@ -1,4 +1,7 @@
-from b12x.moe._shared.kernels.w4a16.kernel import _candidate_tile_fits
+from b12x.moe._shared.kernels.w4a16.kernel import (
+    _candidate_tile_fits,
+    _w4a16_tc_decode_preferred,
+)
 
 
 def _fits(
@@ -39,3 +42,20 @@ def test_wave_balanced_fc2_tile_is_rejected_for_fc1() -> None:
 def test_other_sub64_k_tiles_remain_unsupported() -> None:
     assert not _fits(tile_k=32, tile_n=256, cta_threads=128)
     assert not _fits(tile_k=16, tile_n=512, cta_threads=128)
+
+
+def test_tc_decode_planner_keeps_underfilled_direct_route() -> None:
+    assert _w4a16_tc_decode_preferred(m=8, topk=6, num_experts=256, sms=188)
+
+
+def test_tc_decode_planner_packs_near_full_machine_with_expected_reuse() -> None:
+    assert not _w4a16_tc_decode_preferred(m=7, topk=6, num_experts=256, sms=48)
+    assert not _w4a16_tc_decode_preferred(m=8, topk=6, num_experts=256, sms=48)
+
+
+def test_tc_decode_planner_keeps_lower_coverage_direct_route() -> None:
+    assert _w4a16_tc_decode_preferred(m=6, topk=6, num_experts=256, sms=48)
+
+
+def test_tc_decode_planner_keeps_low_collision_direct_route() -> None:
+    assert _w4a16_tc_decode_preferred(m=8, topk=6, num_experts=512, sms=48)

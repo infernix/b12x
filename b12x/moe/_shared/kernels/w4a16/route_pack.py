@@ -189,6 +189,7 @@ def _pack_topk_routes_small_prefix_kernel(
     BLOCK_ROUTE_INIT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
+    COUNTS_ALIAS_PACKED: tl.constexpr,
 ):
     """Single-launch route packing whose cost scales with routed rows.
 
@@ -227,6 +228,11 @@ def _pack_topk_routes_small_prefix_kernel(
     tl.store(expert_offsets + experts, prefix, mask=expert_mask)
     tl.store(expert_offsets + NUM_EXPERTS, total)
     tl.store(packed_route_count, total)
+
+    if COUNTS_ALIAS_PACKED:
+        # The prefix has consumed the histogram. Make that read complete before
+        # reusing the same storage for packed-route sentinels.
+        tl.debug_barrier()
 
     route_init_offsets = tl.arange(0, BLOCK_ROUTE_INIT)
     tl.store(
@@ -427,13 +433,20 @@ def pack_topk_routes_by_expert(
         # Decode-sized W4A16 MoE calls are launch-overhead sensitive. Keep the
         # large-shape split kernel below, but fold prefix/post-prefix work into
         # one launch when the vector sizes are safely bounded.
-        expert_counts = _workspace_slice(
-            expert_counts,
-            name="expert_counts",
-            elements=int(num_experts),
-            dtype=torch.int32,
-            device=topk_ids.device,
+        counts_alias_packed = (
+            expert_counts is None
+            and int(packed_route_indices.numel()) >= int(num_experts)
         )
+        if counts_alias_packed:
+            expert_counts = packed_route_indices[: int(num_experts)]
+        else:
+            expert_counts = _workspace_slice(
+                expert_counts,
+                name="expert_counts",
+                elements=int(num_experts),
+                dtype=torch.int32,
+                device=topk_ids.device,
+            )
         _pack_topk_routes_small_prefix_kernel[(1,)](
             topk_ids,
             expert_map_tensor,
@@ -454,6 +467,7 @@ def pack_topk_routes_by_expert(
             BLOCK_ROUTE_INIT=block_route_init,
             BLOCK_M=block_m,
             SEARCH_STEPS=block_e.bit_length(),
+            COUNTS_ALIAS_PACKED=counts_alias_packed,
             num_warps=8,
         )
     else:
