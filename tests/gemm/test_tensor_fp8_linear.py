@@ -8,6 +8,7 @@ import torch
 
 from b12x.gemm import tensor_fp8_linear
 from b12x.gemm.tensor_fp8_linear import api as tensor_fp8_api
+from b12x.gemm.tensor_fp8_linear import _kernel as tensor_fp8_kernel
 
 from ..conftest import require_b12x
 
@@ -137,6 +138,60 @@ def test_mm_uses_plain_fp8_mma_not_scale_storage() -> None:
         rtol=1e-2,
         atol=2e-3,
     )
+
+
+def test_aligned_decode_uses_native_block_fp8_recipe() -> None:
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260823)
+
+    source, weight, output_scale, packed = _make_inputs(8, 128, 128)
+    actual = tensor_fp8_linear.mm(source, packed, expected_m=8)
+    expected = (source.float() @ weight.float().T) * output_scale
+
+    tensor_fp8_linear.prewarm(packed, [8])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = tensor_fp8_linear.mm(source, packed, expected_m=8)
+    output_ptr = graph_output.data_ptr()
+    for _ in range(3):
+        graph.replay()
+
+    zero_scale_weight = replace(
+        packed,
+        block_scale=torch.zeros_like(packed.block_scale),
+    )
+    zero = tensor_fp8_linear.mm(source, zero_scale_weight, expected_m=8)
+    torch.cuda.synchronize()
+
+    assert packed.block_scale.shape == (1, 1)
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(actual.dtype).float(),
+        rtol=1e-2,
+        atol=2e-3,
+    )
+    assert graph_output.data_ptr() == output_ptr
+    torch.testing.assert_close(graph_output, actual, rtol=0, atol=0)
+    assert torch.count_nonzero(zero) == 0
+
+
+def test_block_fp8_recipe_is_bounded_by_regime_alignment_and_sm_count() -> None:
+    common = {
+        "live_m": 8,
+        "expected_m": 8,
+        "out_features": 5120,
+        "padded_in_features": 6144,
+    }
+
+    assert tensor_fp8_kernel._use_block_fp8_recipe(**common, sm_count=48)
+    assert not tensor_fp8_kernel._use_block_fp8_recipe(
+        **(common | {"expected_m": 16}), sm_count=48
+    )
+    assert not tensor_fp8_kernel._use_block_fp8_recipe(
+        **(common | {"out_features": 5119}), sm_count=48
+    )
+    assert not tensor_fp8_kernel._use_block_fp8_recipe(**common, sm_count=188)
 
 
 def test_is_supported_honors_kernel_probe(monkeypatch) -> None:

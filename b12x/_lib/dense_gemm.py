@@ -980,6 +980,12 @@ class DenseGemmKernel:
                 self.acc_dtype,
                 self.sf_dtype,
             )
+        elif cutlass.const_expr(self.sf_vec_size == 32):
+            mma_op = cute.nvgpu.warp.MmaMXF4Op(
+                self.a_dtype,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
         else:
             mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
                 self.a_dtype,
