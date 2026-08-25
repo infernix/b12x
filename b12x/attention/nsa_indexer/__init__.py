@@ -1,7 +1,7 @@
 """NSA indexer for SM12x: the index stage of Native Sparse Attention.
 
 A three-stage pipeline whose outputs feed ``attention.sparse_mla`` /
-``attention.compressed_mla``:
+``attention.compressed_sparse_mla``:
 
 1. quantize — ``quantize_q_fp8`` (index-Q to FP8 e4m3, MXFP8 tiling;
    INDEX_HEAD_DIM 128).

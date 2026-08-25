@@ -37,7 +37,7 @@ projection (`gemm.mla_query_projection`) and grouped WO projection
 
 **`attention`** — `attention.paged` (paged-KV decode/extend, FP8 KV, MSA block
 sparse, CUDA-graph-replayable), `attention.sparse_mla` and
-`attention.compressed_mla` (top-k / compressed-page MLA — distinct contracts,
+`attention.compressed_sparse_mla` (top-k / compressed-page MLA — distinct contracts,
 kept separate on purpose), `attention.nsa_indexer` (the NSA/MSA quantize →
 score → select pipeline), and `attention.varlen` (contiguous batched/varlen).
 
@@ -86,15 +86,15 @@ out     = fused_moe.run(binding=binding)
 ```
 
 ```python
-# attention — MLA decode from compressed KV pages (DeepSeek-V3.2)
-from b12x.attention import compressed_mla
+# attention — sparse MLA from compressed KV pages (DeepSeek V4)
+from b12x.attention import compressed_sparse_mla
 
-plan    = compressed_mla.plan(compressed_mla.Caps(...))
+plan    = compressed_sparse_mla.plan(compressed_sparse_mla.Caps(...))
 spec    = plan.scratch_specs()[0]
 scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-binding = compressed_mla.bind(plan, scratch=scratch, q=q,
+binding = compressed_sparse_mla.bind(plan, scratch=scratch, q=q,
                               swa_indices=idx, swa_lengths=lens, ...)
-out = compressed_mla.run(swa_k_cache=swa, binding=binding, sm_scale=scale, ...)
+out = compressed_sparse_mla.run(swa_k_cache=swa, binding=binding, sm_scale=scale, ...)
 ```
 
 `plan` is host-side and may allocate; `bind` only narrows/views (never

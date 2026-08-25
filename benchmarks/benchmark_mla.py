@@ -2651,7 +2651,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.preset == TARGET_DSV4_TRACE_PRESET:
-        from benchmarks.benchmark_compressed_mla import main as compressed_mla_main
+        from benchmarks.benchmark_compressed_sparse_mla import main as compressed_sparse_mla_main
 
         forwarded = [
             "--preset",
@@ -2671,7 +2671,7 @@ def main(argv: list[str] | None = None) -> int:
             forwarded.append("--print-raw-samples")
         if args.model_config is not None:
             forwarded.extend(("--model-config", str(args.model_config)))
-        return compressed_mla_main(forwarded)
+        return compressed_sparse_mla_main(forwarded)
 
     device = require_sm120()
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)

@@ -27,15 +27,15 @@ from b12x.attention._shared.mla.api import (
     sparse_mla_extend_forward as _sparse_mla_extend_forward,
 )
 from b12x.attention._shared.mla.compressed_api import (
-    compressed_mla_decode_forward as _compressed_mla_decode_forward,
+    compressed_sparse_mla_decode_forward as _compressed_sparse_mla_decode_forward,
 )
 from b12x.attention._shared.mla.compressed_reference import (
-    compressed_mla_page_nbytes,
+    compressed_sparse_mla_page_nbytes,
     compressed_sparse_mla_reference,
-    pack_compressed_mla_kv_cache_reference,
+    pack_compressed_sparse_mla_kv_cache_reference,
 )
 from b12x._lib.intrinsics import get_sm_version
-from b12x.attention.compressed_mla._scratch import B12XCompressedMLAScratchCaps, _compressed_mla_scratch_layout, _materialize_compressed_mla_scratch
+from b12x.attention.compressed_sparse_mla._scratch import B12XCompressedSparseMLAScratchCaps, _compressed_sparse_mla_scratch_layout, _materialize_compressed_sparse_mla_scratch
 
 from tests._reference.helpers import require_b12x as _require_b12x
 
@@ -140,7 +140,7 @@ def sparse_mla_extend_forward(*, workspace=None, q_all=None, selected_token_offs
     )
 
 
-def compressed_mla_decode_forward(
+def compressed_sparse_mla_decode_forward(
     *,
     workspace=None,
     q_all=None,
@@ -160,8 +160,8 @@ def compressed_mla_decode_forward(
             indexed_lengths=indexed_topk_lengths,
             indexed_page_table=indexed_page_table,
         )
-        return _compressed_mla_decode_forward(binding=binding, **kwargs)
-    return _compressed_mla_decode_forward(
+        return _compressed_sparse_mla_decode_forward(binding=binding, **kwargs)
+    return _compressed_sparse_mla_decode_forward(
         q_all=q_all,
         swa_indices=swa_indices,
         swa_topk_lengths=swa_topk_lengths,
@@ -478,7 +478,7 @@ def _make_dsv4_compressed_case(device, *, topk, seed=0):
     n_tokens = num_blocks * _DSV4_PAGE
     k_nope = (torch.randn((n_tokens, 448), generator=gen, dtype=torch.float32, device=device) / 10).clamp(-1, 1)
     k_rope = (torch.randn((n_tokens, 64), generator=gen, dtype=torch.float32, device=device) / 10).clamp(-1, 1)
-    cache = pack_compressed_mla_kv_cache_reference(
+    cache = pack_compressed_sparse_mla_kv_cache_reference(
         k_nope, k_rope.to(torch.bfloat16), page_size=_DSV4_PAGE, num_pages=num_blocks
     )
     q = (torch.randn((1, _DSV4_HEADS, _DSV4_HEAD_DIM), generator=gen, dtype=torch.float32, device=device) / 10).clamp(-1, 1).to(torch.bfloat16)
@@ -489,20 +489,20 @@ def _make_dsv4_compressed_case(device, *, topk, seed=0):
 
 
 def _make_dsv4_scratch(device, *, topk, max_chunks):
-    caps = B12XCompressedMLAScratchCaps(
+    caps = B12XCompressedSparseMLAScratchCaps(
         device=device, num_q_heads=_DSV4_HEADS, max_q_rows=1, max_width=topk,
         head_dim=_DSV4_HEAD_DIM, v_head_dim=_DSV4_HEAD_DIM,
         max_chunks_per_row=max_chunks, page_size=_DSV4_PAGE,
     )
-    layout = _compressed_mla_scratch_layout(caps)
+    layout = _compressed_sparse_mla_scratch_layout(caps)
     storage = torch.zeros(int(layout.nbytes), dtype=torch.uint8, device=device)
-    return _materialize_compressed_mla_scratch(caps, storage, layout)
+    return _materialize_compressed_sparse_mla_scratch(caps, storage, layout)
 
 
 @torch.inference_mode()
 @pytest.mark.parametrize("topk", [64, 128, 512])
 def test_dsv4_compressed_decode_routes_to_sm120_and_matches_reference(monkeypatch, topk) -> None:
-    """DSV4 main-cache contract: compressed_mla_decode_forward routes to
+    """DSV4 main-cache contract: compressed_sparse_mla_decode_forward routes to
     SM120 sparse MLA.run_unified_decode (kernel split-K partials + reused base-2 merge)
     and matches compressed_sparse_mla_reference."""
     device = require_b12x_sparse_mla()
@@ -511,7 +511,7 @@ def test_dsv4_compressed_decode_routes_to_sm120_and_matches_reference(monkeypatc
     q, cache, idx, lengths = _make_dsv4_compressed_case(device, topk=topk, seed=topk)
     scratch = _make_dsv4_scratch(device, topk=topk, max_chunks=8)
 
-    out = compressed_mla_decode_forward(
+    out = compressed_sparse_mla_decode_forward(
         q_all=q,
         swa_k_cache=cache,
         swa_indices=idx,
@@ -549,7 +549,7 @@ def test_dsv4_compressed_decode_routes_to_sm120_and_matches_reference(monkeypatc
 @pytest.mark.parametrize("mode", ["extend", "verify", "draft_extend"])
 def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(monkeypatch, mode) -> None:
     """DSV4 compressed contract in a prefill-like mode routes
-    compressed_mla_decode_forward to SM120 sparse MLA.run_unified_prefill (single-pass
+    compressed_sparse_mla_decode_forward to SM120 sparse MLA.run_unified_prefill (single-pass
     DSV4 prefill), NOT run_unified_decode."""
     device = require_b12x_sparse_mla()
     routed = {"prefill": 0, "decode": 0}
@@ -581,7 +581,7 @@ def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(monkeypatch, mod
     # the materialized scratch mode is mutable).
     scratch.mode = mode
 
-    out = compressed_mla_decode_forward(
+    out = compressed_sparse_mla_decode_forward(
         q_all=q,
         swa_k_cache=cache,
         swa_indices=idx,
@@ -626,7 +626,7 @@ def test_dsv4_compressed_decode_extra_cache_routes_to_unified(monkeypatch) -> No
     n_chunks = (topk + 64 - 1) // 64 + (extra_topk + 64 - 1) // 64
     scratch = _make_dsv4_scratch(device, topk=topk + extra_topk, max_chunks=max(8, n_chunks))
 
-    out = compressed_mla_decode_forward(
+    out = compressed_sparse_mla_decode_forward(
         q_all=q,
         swa_k_cache=swa_cache,
         swa_indices=main_idx,
@@ -663,7 +663,7 @@ def test_dsv4_compressed_decode_mapped_extra_page_table_raises() -> None:
     page_table = torch.zeros((1, topk), dtype=torch.int32, device=device)
 
     with pytest.raises(ValueError, match="mapped"):
-        compressed_mla_decode_forward(
+        compressed_sparse_mla_decode_forward(
             q_all=q,
             swa_k_cache=cache,
             swa_indices=idx,
@@ -690,7 +690,7 @@ def test_dsv4_compressed_decode_partial_extra_trio_raises() -> None:
     scratch.fixed_capacity = False
 
     with pytest.raises(ValueError, match="(?i)dual-cache|together|trio"):
-        compressed_mla_decode_forward(
+        compressed_sparse_mla_decode_forward(
             q_all=q,
             swa_k_cache=cache,
             swa_indices=idx,
@@ -765,7 +765,7 @@ def _cosine(got: torch.Tensor, exp: torch.Tensor) -> float:
 def _repack_dsv4_to_compressed(packed_dsv4: torch.Tensor, page_size: int, num_blocks: int) -> torch.Tensor:
     """Re-lay the dsv4_ref (nb,bs,1,584) cache into the compressed flat
     [pages, page_nbytes] layout the launcher reads (swa_k_cache.reshape(-1) with
-    per-page stride = compressed_mla_page_nbytes(page_size)).
+    per-page stride = compressed_sparse_mla_page_nbytes(page_size)).
 
     The data (pbs*576) + footer (pbs*8) = pbs*584 bytes are byte-identical
     between the two packings (the verified P7 layout finding); only the per-page
@@ -774,7 +774,7 @@ def _repack_dsv4_to_compressed(packed_dsv4: torch.Tensor, page_size: int, num_bl
     """
     bs = page_size
     bpt = dsv4_ref.DSV4_KV_GMEM_STRIDE  # 584
-    page_nbytes = compressed_mla_page_nbytes(page_size)
+    page_nbytes = compressed_sparse_mla_page_nbytes(page_size)
     flat = packed_dsv4.reshape(num_blocks, bs * bpt)
     out = torch.zeros(num_blocks, page_nbytes, dtype=torch.uint8, device=packed_dsv4.device)
     out[:, : bs * bpt] = flat
@@ -791,14 +791,14 @@ def _merge_base2_lse(mid_lse: torch.Tensor) -> torch.Tensor:
 
 
 def _make_dsv4_scratch_heads(device, *, topk, max_chunks, num_heads):
-    caps = B12XCompressedMLAScratchCaps(
+    caps = B12XCompressedSparseMLAScratchCaps(
         device=device, num_q_heads=num_heads, max_q_rows=1, max_width=topk,
         head_dim=_DSV4_HEAD_DIM, v_head_dim=_DSV4_HEAD_DIM,
         max_chunks_per_row=max_chunks, page_size=_DSV4_PAGE,
     )
-    layout = _compressed_mla_scratch_layout(caps)
+    layout = _compressed_sparse_mla_scratch_layout(caps)
     storage = torch.zeros(int(layout.nbytes), dtype=torch.uint8, device=device)
-    return _materialize_compressed_mla_scratch(caps, storage, layout)
+    return _materialize_compressed_sparse_mla_scratch(caps, storage, layout)
 
 
 def _run_unified_dsv4(device, *, topk, forced_num_splits, seed):
@@ -1714,14 +1714,14 @@ def _run_unified_dsv4_multitoken(
     )
 
     n_chunks = (topk + 64 - 1) // 64
-    caps = B12XCompressedMLAScratchCaps(
+    caps = B12XCompressedSparseMLAScratchCaps(
         device=device, num_q_heads=_MT_HEADS, max_q_rows=num_tokens, max_width=topk,
         head_dim=_DSV4_HEAD_DIM, v_head_dim=_DSV4_HEAD_DIM,
         max_chunks_per_row=max(8, forced_num_splits, n_chunks), page_size=_DSV4_PAGE,
     )
-    layout = _compressed_mla_scratch_layout(caps)
+    layout = _compressed_sparse_mla_scratch_layout(caps)
     storage = torch.zeros(int(layout.nbytes), dtype=torch.uint8, device=device)
-    scratch = _materialize_compressed_mla_scratch(caps, storage, layout)
+    scratch = _materialize_compressed_sparse_mla_scratch(caps, storage, layout)
 
     out = run_unified_decode(
         q_all=q, swa_k_cache=swa_cache, swa_indices=idx, swa_topk_lengths=lengths,
@@ -1864,14 +1864,14 @@ def test_unified_decode_dual_cache_multitoken_per_token_length(num_tokens) -> No
     exp_O = exp_O.float()
 
     n_chunks = (topk + 64 - 1) // 64 + (extra_topk + 64 - 1) // 64
-    caps = B12XCompressedMLAScratchCaps(
+    caps = B12XCompressedSparseMLAScratchCaps(
         device=device, num_q_heads=_MT_HEADS, max_q_rows=num_tokens,
         max_width=topk + extra_topk, head_dim=_DSV4_HEAD_DIM, v_head_dim=_DSV4_HEAD_DIM,
         max_chunks_per_row=max(8, n_chunks), page_size=_DSV4_PAGE,
     )
-    layout = _compressed_mla_scratch_layout(caps)
+    layout = _compressed_sparse_mla_scratch_layout(caps)
     storage = torch.zeros(int(layout.nbytes), dtype=torch.uint8, device=device)
-    scratch = _materialize_compressed_mla_scratch(caps, storage, layout)
+    scratch = _materialize_compressed_sparse_mla_scratch(caps, storage, layout)
 
     out = run_unified_decode(
         q_all=q, swa_k_cache=swa_cache, swa_indices=main_idx, swa_topk_lengths=main_len,

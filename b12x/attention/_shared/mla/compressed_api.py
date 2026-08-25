@@ -13,13 +13,13 @@ from .api import (
     _validate_tensor_storage_bounds,
 )
 from .compressed_config import (
-    compressed_mla_split_chunks_for_contract,
+    compressed_sparse_mla_split_chunks_for_contract,
 )
 from .compressed_reference import (
-    COMPRESSED_MLA_BYTES_PER_TOKEN,
-    COMPRESSED_MLA_DSV4_PAGE_SIZE,
-    COMPRESSED_MLA_HEAD_DIM,
-    compressed_mla_page_nbytes,
+    COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
+    COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
+    COMPRESSED_SPARSE_MLA_HEAD_DIM,
+    compressed_sparse_mla_page_nbytes,
 )
 
 
@@ -52,7 +52,7 @@ def _should_use_sm121_single_pass_decode(
     return chunks <= 10
 
 
-def compressed_mla_decode_forward(
+def compressed_sparse_mla_decode_forward(
     *,
     q_all: torch.Tensor | None = None,
     swa_k_cache: torch.Tensor,
@@ -60,7 +60,7 @@ def compressed_mla_decode_forward(
     swa_topk_lengths: torch.Tensor | None = None,
     binding=None,
     sm_scale: float,
-    swa_page_size: int = COMPRESSED_MLA_DSV4_PAGE_SIZE,
+    swa_page_size: int = COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
     indexed_k_cache: torch.Tensor | None = None,
     indexed_indices: torch.Tensor | None = None,
     indexed_topk_lengths: torch.Tensor | None = None,
@@ -84,7 +84,7 @@ def compressed_mla_decode_forward(
         raise ValueError(f"lse_scale must be 'base2' or 'natural', got {lse_scale!r}")
 
     if binding is None:
-        raise TypeError("compressed_mla_decode_forward requires binding")
+        raise TypeError("compressed_sparse_mla_decode_forward requires binding")
     extras = [
         name
         for name, value in (
@@ -118,10 +118,10 @@ def compressed_mla_decode_forward(
         raise ValueError(
             f"q_all local heads must match expected_num_q_heads={int(expected_num_q_heads)}, got {heads}"
         )
-    if int(q3.shape[-1]) != COMPRESSED_MLA_HEAD_DIM:
+    if int(q3.shape[-1]) != COMPRESSED_SPARSE_MLA_HEAD_DIM:
         raise ValueError(
-            f"compressed_mla_decode_forward is DSV4 (q_head_dim="
-            f"{COMPRESSED_MLA_HEAD_DIM}) by construction; got q_head_dim="
+            f"compressed_sparse_mla_decode_forward is DSV4 (q_head_dim="
+            f"{COMPRESSED_SPARSE_MLA_HEAD_DIM}) by construction; got q_head_dim="
             f"{int(q3.shape[-1])}"
         )
     if not _use_sm120_sparse_mla(backend=backend, device=q3.device):
@@ -129,7 +129,9 @@ def compressed_mla_decode_forward(
             "compressed sparse MLA requires the active SM120 sparse MLA kernel path; "
             "legacy compressed sparse MLA kernels have been retired"
         )
-    swa_k_cache = _compressed_mla_cache_byte_view(swa_k_cache, name="swa_k_cache")
+    swa_k_cache = _compressed_sparse_mla_cache_byte_view(
+        swa_k_cache, name="swa_k_cache"
+    )
     _validate_compressed_cache_layout(
         swa_k_cache,
         page_size=swa_page_size,
@@ -172,7 +174,7 @@ def compressed_mla_decode_forward(
                 "SM120 sparse-MLA decode does not support a mapped indexed_page_table; "
                 "the extra cache is addressed by raw slot id"
             )
-        indexed_k_cache = _compressed_mla_cache_byte_view(
+        indexed_k_cache = _compressed_sparse_mla_cache_byte_view(
             indexed_k_cache, name="indexed_k_cache"
         )
         _validate_compressed_cache_layout(
@@ -218,7 +220,7 @@ def compressed_mla_decode_forward(
         if not attn_sink.is_contiguous():
             raise ValueError("attn_sink must be contiguous")
 
-    _validate_compressed_mla_scratch(
+    _validate_compressed_sparse_mla_scratch(
         scratch=scratch,
         rows=rows,
         heads=heads,
@@ -227,7 +229,7 @@ def compressed_mla_decode_forward(
     )
 
     if out is not None:
-        _validate_compressed_mla_out(out, q3=q3)
+        _validate_compressed_sparse_mla_out(out, q3=q3)
 
     if scratch.mode in ("extend", "verify", "draft_extend"):
         return _run_sm120_compressed_prefill(
@@ -295,9 +297,9 @@ def compressed_mla_decode_forward(
     )
 
 
-def _validate_compressed_mla_out(out: torch.Tensor, *, q3: torch.Tensor) -> None:
+def _validate_compressed_sparse_mla_out(out: torch.Tensor, *, q3: torch.Tensor) -> None:
     rows, heads, _ = q3.shape
-    expected = (int(rows), int(heads), COMPRESSED_MLA_HEAD_DIM)
+    expected = (int(rows), int(heads), COMPRESSED_SPARSE_MLA_HEAD_DIM)
     if tuple(out.shape) != expected:
         raise ValueError(
             f"compressed MLA out must have shape {expected}, got {tuple(out.shape)}"
@@ -349,7 +351,7 @@ def _run_sm120_compressed_prefill(
         output = _get_mla_output_view(
             workspace=workspace,
             q_all=q3,
-            v_head_dim=COMPRESSED_MLA_HEAD_DIM,
+            v_head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM,
         )
 
     extra_kwargs: dict = {}
@@ -380,7 +382,7 @@ def _run_sm120_compressed_prefill(
     return output, lse
 
 
-def _stage_fixed_compressed_mla_inputs(
+def _stage_fixed_compressed_sparse_mla_inputs(
     *,
     workspace: object,
     q_all: torch.Tensor,
@@ -392,12 +394,12 @@ def _stage_fixed_compressed_mla_inputs(
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    q_stage = workspace.compressed_mla_q_stage
-    swa_indices_stage = workspace.compressed_mla_swa_indices_stage
-    swa_lengths_stage = workspace.compressed_mla_swa_lengths_stage
-    indexed_indices_stage = workspace.compressed_mla_indexed_indices_stage
-    indexed_lengths_stage = workspace.compressed_mla_indexed_lengths_stage
-    indexed_page_table_stage = workspace.compressed_mla_indexed_page_table_stage
+    q_stage = workspace.compressed_sparse_mla_q_stage
+    swa_indices_stage = workspace.compressed_sparse_mla_swa_indices_stage
+    swa_lengths_stage = workspace.compressed_sparse_mla_swa_lengths_stage
+    indexed_indices_stage = workspace.compressed_sparse_mla_indexed_indices_stage
+    indexed_lengths_stage = workspace.compressed_sparse_mla_indexed_lengths_stage
+    indexed_page_table_stage = workspace.compressed_sparse_mla_indexed_page_table_stage
     if (
         q_stage is None
         or swa_indices_stage is None
@@ -408,7 +410,7 @@ def _stage_fixed_compressed_mla_inputs(
     ):
         raise RuntimeError(
             "fixed compressed MLA scratch is missing capacity staging buffers; "
-            "set reserve_compressed_mla_staging=True when planning scratch"
+            "set reserve_compressed_sparse_mla_staging=True when planning scratch"
         )
 
     rows = int(q_all.shape[0])
@@ -417,11 +419,15 @@ def _stage_fixed_compressed_mla_inputs(
         raise ValueError(
             f"q rows {rows} exceed fixed compressed MLA staging capacity {cap_rows}"
         )
-    if q_stage.shape != (cap_rows, int(workspace.num_q_heads), COMPRESSED_MLA_HEAD_DIM):
+    if q_stage.shape != (
+        cap_rows,
+        int(workspace.num_q_heads),
+        COMPRESSED_SPARSE_MLA_HEAD_DIM,
+    ):
         raise ValueError(
             "compressed MLA q staging buffer shape mismatch: "
             f"got {tuple(q_stage.shape)}, expected "
-            f"({cap_rows}, {int(workspace.num_q_heads)}, {COMPRESSED_MLA_HEAD_DIM})"
+            f"({cap_rows}, {int(workspace.num_q_heads)}, {COMPRESSED_SPARSE_MLA_HEAD_DIM})"
         )
     for name, stage in (
         ("swa_lengths", swa_lengths_stage),
@@ -504,9 +510,9 @@ def _stage_fixed_int_matrix(
 def _normalize_compressed_q(q: torch.Tensor) -> torch.Tensor:
     if q.ndim == 4 and q.shape[1] == 1:
         q = q[:, 0]
-    if q.ndim != 3 or q.shape[-1] != COMPRESSED_MLA_HEAD_DIM:
+    if q.ndim != 3 or q.shape[-1] != COMPRESSED_SPARSE_MLA_HEAD_DIM:
         raise ValueError(
-            f"q_all must have shape [rows, heads, {COMPRESSED_MLA_HEAD_DIM}], got {tuple(q.shape)}"
+            f"q_all must have shape [rows, heads, {COMPRESSED_SPARSE_MLA_HEAD_DIM}], got {tuple(q.shape)}"
         )
     if q.dtype != torch.bfloat16:
         raise TypeError(f"q_all must have dtype torch.bfloat16, got {q.dtype}")
@@ -524,8 +530,8 @@ def _validate_compressed_cache_layout(
     page_size = int(page_size)
     if page_size <= 0:
         raise ValueError(f"{name} page_size must be positive, got {page_size}")
-    payload_nbytes = page_size * COMPRESSED_MLA_BYTES_PER_TOKEN
-    padded_page_nbytes = compressed_mla_page_nbytes(page_size)
+    payload_nbytes = page_size * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
+    padded_page_nbytes = compressed_sparse_mla_page_nbytes(page_size)
     page_nbytes = int(cache.shape[1])
     if page_nbytes not in (payload_nbytes, padded_page_nbytes):
         raise ValueError(
@@ -535,7 +541,9 @@ def _validate_compressed_cache_layout(
         )
 
 
-def _compressed_mla_cache_byte_view(cache: torch.Tensor, *, name: str) -> torch.Tensor:
+def _compressed_sparse_mla_cache_byte_view(
+    cache: torch.Tensor, *, name: str
+) -> torch.Tensor:
     if cache.dtype == torch.uint8:
         byte_cache = cache
     elif cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
@@ -587,11 +595,11 @@ def _validate_compressed_launch_views(
             raise ValueError(
                 f"compressed MLA direct output must be rank-3, got {tuple(tmp_output.shape)}"
             )
-        required = (q_rows, heads, COMPRESSED_MLA_HEAD_DIM)
+        required = (q_rows, heads, COMPRESSED_SPARSE_MLA_HEAD_DIM)
         if (
             int(tmp_output.shape[0]) < q_rows
             or int(tmp_output.shape[1]) < heads
-            or int(tmp_output.shape[2]) < COMPRESSED_MLA_HEAD_DIM
+            or int(tmp_output.shape[2]) < COMPRESSED_SPARSE_MLA_HEAD_DIM
         ):
             raise ValueError(
                 "compressed MLA direct output is too small: "
@@ -602,12 +610,12 @@ def _validate_compressed_launch_views(
             raise ValueError(
                 f"compressed MLA split output must be rank-4, got {tuple(tmp_output.shape)}"
             )
-        required = (q_rows, heads, launch_num_chunks, COMPRESSED_MLA_HEAD_DIM)
+        required = (q_rows, heads, launch_num_chunks, COMPRESSED_SPARSE_MLA_HEAD_DIM)
         if (
             int(tmp_output.shape[0]) < q_rows
             or int(tmp_output.shape[1]) < heads
             or int(tmp_output.shape[2]) < launch_num_chunks
-            or int(tmp_output.shape[3]) < COMPRESSED_MLA_HEAD_DIM
+            or int(tmp_output.shape[3]) < COMPRESSED_SPARSE_MLA_HEAD_DIM
         ):
             raise ValueError(
                 "compressed MLA split output is too small: "
@@ -672,7 +680,7 @@ def _validate_lengths(
         raise ValueError(f"{name} must be contiguous for compressed MLA")
 
 
-def _validate_compressed_mla_scratch(
+def _validate_compressed_sparse_mla_scratch(
     scratch: object,
     *,
     rows: int,
@@ -691,13 +699,13 @@ def _validate_compressed_mla_scratch(
         raise ValueError(
             f"q_all num_heads {heads} does not match compressed MLA scratch num_q_heads {scratch.num_q_heads}"
         )
-    if scratch.head_dim != COMPRESSED_MLA_HEAD_DIM:
+    if scratch.head_dim != COMPRESSED_SPARSE_MLA_HEAD_DIM:
         raise ValueError(
-            f"compressed MLA scratch head_dim must be {COMPRESSED_MLA_HEAD_DIM}, got {scratch.head_dim}"
+            f"compressed MLA scratch head_dim must be {COMPRESSED_SPARSE_MLA_HEAD_DIM}, got {scratch.head_dim}"
         )
-    if scratch.v_head_dim != COMPRESSED_MLA_HEAD_DIM:
+    if scratch.v_head_dim != COMPRESSED_SPARSE_MLA_HEAD_DIM:
         raise ValueError(
-            f"compressed MLA scratch v_head_dim must be {COMPRESSED_MLA_HEAD_DIM}, got {scratch.v_head_dim}"
+            f"compressed MLA scratch v_head_dim must be {COMPRESSED_SPARSE_MLA_HEAD_DIM}, got {scratch.v_head_dim}"
         )
     if width > scratch.topk:
         raise ValueError(

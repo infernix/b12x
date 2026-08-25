@@ -7,12 +7,12 @@ import torch
 
 import b12x.attention.nsa_indexer._impl as indexer_impl
 import b12x.attention._shared.mla.api as sparse_mla_impl
-import b12x.attention._shared.mla.compressed_api as compressed_mla_impl
-import b12x.attention._shared.mla.kernel as compressed_mla_kernel
+import b12x.attention._shared.mla.compressed_api as compressed_sparse_mla_impl
+import b12x.attention._shared.mla.kernel as compressed_sparse_mla_kernel
 import b12x.attention.nsa_indexer.paged as paged_indexer_impl
 from b12x.attention._shared.mla.compressed_reference import (
-    COMPRESSED_MLA_DSV4_PAGE_SIZE,
-    compressed_mla_page_nbytes,
+    COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
+    compressed_sparse_mla_page_nbytes,
 )
 from b12x.attention._shared.workspace import B12XAttentionArena, B12XAttentionWorkspace
 from b12x.attention.nsa_indexer.scratch import INDEXER_SOURCE_LAYOUT_CONTIGUOUS, INDEXER_SOURCE_LAYOUT_PAGED, B12XIndexerContiguousBinding, B12XIndexerPagedBinding, B12XIndexerPagedScratch, B12XIndexerScratchCaps, plan_indexer_scratch
@@ -22,7 +22,7 @@ from b12x.attention.nsa_indexer.scratch import (
     plan_indexer_contiguous_scratch,
     plan_indexer_paged_scratch,
 )
-from b12x.attention.compressed_mla._scratch import B12XCompressedMLABinding, B12XCompressedMLAScratch, B12XCompressedMLAScratchCaps, plan_compressed_mla_scratch
+from b12x.attention.compressed_sparse_mla._scratch import B12XCompressedSparseMLABinding, B12XCompressedSparseMLAScratch, B12XCompressedSparseMLAScratchCaps, plan_compressed_sparse_mla_scratch
 from b12x.attention.sparse_mla._scratch import B12XSparseMLABinding, B12XSparseMLAScratchCaps, plan_sparse_mla_scratch
 
 
@@ -61,9 +61,9 @@ def _one_scratch(plan):
     return torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
 
 
-def test_compressed_mla_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
-    plan = plan_compressed_mla_scratch(
-        B12XCompressedMLAScratchCaps(
+def test_compressed_sparse_mla_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
+    plan = plan_compressed_sparse_mla_scratch(
+        B12XCompressedSparseMLAScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -74,16 +74,16 @@ def test_compressed_mla_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
 
     specs = plan.scratch_specs()
     assert len(specs) == 1
-    assert specs[0].name == "compressed_mla.scratch"
+    assert specs[0].name == "compressed_sparse_mla.scratch"
     assert specs[0].dtype == torch.uint8
     assert specs[0].shape == plan.shapes_and_dtypes()[0][0]
     assert specs[0].nbytes == specs[0].shape[0]
     assert plan.layout.nbytes == specs[0].nbytes
 
 
-def test_compressed_mla_scratch_binding_uses_component_scratch() -> None:
-    plan = plan_compressed_mla_scratch(
-        B12XCompressedMLAScratchCaps(
+def test_compressed_sparse_mla_scratch_binding_uses_component_scratch() -> None:
+    plan = plan_compressed_sparse_mla_scratch(
+        B12XCompressedSparseMLAScratchCaps(
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -104,7 +104,7 @@ def test_compressed_mla_scratch_binding_uses_component_scratch() -> None:
         swa_lengths=swa_lengths,
     )
 
-    assert isinstance(binding.scratch, B12XCompressedMLAScratch)
+    assert isinstance(binding.scratch, B12XCompressedSparseMLAScratch)
     assert binding.scratch.shared_scratch.data_ptr() == scratch.data_ptr()
     assert binding.scratch.tmp_output is not None
     assert binding.scratch.tmp_lse is not None
@@ -611,7 +611,7 @@ def test_sparse_mla_scratch_bind_does_not_call_workspace_factory(
     assert binding.selected_indices is selected_indices
 
 
-def test_workspace_bind_compressed_mla_returns_common_binding_type() -> None:
+def test_workspace_bind_compressed_sparse_mla_returns_common_binding_type() -> None:
     workspace = _workspace(topk=6, max_page_table_width=5)
     q = torch.empty((4, 2, 512), dtype=torch.bfloat16)
     swa_indices = torch.empty((4, 2), dtype=torch.int32)
@@ -620,7 +620,7 @@ def test_workspace_bind_compressed_mla_returns_common_binding_type() -> None:
     indexed_lengths = torch.empty((4,), dtype=torch.int32)
     indexed_page_table = torch.empty((4, 5), dtype=torch.int32)
 
-    binding = workspace.bind_compressed_mla(
+    binding = workspace.bind_compressed_sparse_mla(
         q=q,
         swa_indices=swa_indices,
         swa_lengths=swa_lengths,
@@ -629,13 +629,13 @@ def test_workspace_bind_compressed_mla_returns_common_binding_type() -> None:
         indexed_page_table=indexed_page_table,
     )
 
-    assert isinstance(binding, B12XCompressedMLABinding)
+    assert isinstance(binding, B12XCompressedSparseMLABinding)
     assert binding.scratch is workspace
     assert binding.q.data_ptr() == q.data_ptr()
     assert binding.indexed_page_table is indexed_page_table
 
 
-def test_compressed_mla_bind_accepts_row_shared_page_table() -> None:
+def test_compressed_sparse_mla_bind_accepts_row_shared_page_table() -> None:
     workspace = _workspace(topk=6, max_page_table_width=5)
     q = torch.empty((4, 2, 512), dtype=torch.bfloat16)
     swa_indices = torch.empty((4, 2), dtype=torch.int32)
@@ -644,7 +644,7 @@ def test_compressed_mla_bind_accepts_row_shared_page_table() -> None:
     indexed_lengths = torch.empty((4,), dtype=torch.int32)
     indexed_page_table = torch.empty((1, 5), dtype=torch.int32).expand(4, -1)
 
-    binding = workspace.bind_compressed_mla(
+    binding = workspace.bind_compressed_sparse_mla(
         q=q,
         swa_indices=swa_indices,
         swa_lengths=swa_lengths,
@@ -781,7 +781,7 @@ def test_indexer_contiguous_plan_bind_returns_common_binding_type() -> None:
     assert binding.lengths.shape == (3,)
 
 
-def test_compressed_mla_decode_binding_supplies_runtime_tensors(monkeypatch) -> None:
+def test_compressed_sparse_mla_decode_binding_supplies_runtime_tensors(monkeypatch) -> None:
     workspace = _workspace(max_total_q=1, topk=2, max_page_table_width=2)
     workspace.fixed_capacity = False
     workspace.use_cuda_graph = True
@@ -795,19 +795,19 @@ def test_compressed_mla_decode_binding_supplies_runtime_tensors(monkeypatch) -> 
     q = torch.zeros((1, 2, 512), dtype=torch.bfloat16)
     swa_indices = torch.zeros((1, 2), dtype=torch.int32)
     swa_lengths = torch.zeros((1,), dtype=torch.int32)
-    binding = workspace.bind_compressed_mla(
+    binding = workspace.bind_compressed_sparse_mla(
         q=q,
         swa_indices=swa_indices,
         swa_lengths=swa_lengths,
     )
     swa_cache = torch.empty(
-        (1, compressed_mla_page_nbytes(COMPRESSED_MLA_DSV4_PAGE_SIZE)),
+        (1, compressed_sparse_mla_page_nbytes(COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE)),
         dtype=torch.uint8,
     )
     calls = {}
 
     def fail_stage(**kwargs):
-        raise AssertionError("binding path should not stage compressed MLA inputs")
+        raise AssertionError("binding path should not stage compressed sparse MLA inputs")
 
     def fake_forward(**kwargs):
         calls["q_all"] = kwargs["q_all"]
@@ -815,11 +815,11 @@ def test_compressed_mla_decode_binding_supplies_runtime_tensors(monkeypatch) -> 
         calls["swa_lengths"] = kwargs["swa_topk_lengths"]
         return kwargs["workspace"].output_buffer
 
-    monkeypatch.setattr(compressed_mla_impl, "_stage_fixed_compressed_mla_inputs", fail_stage)
-    monkeypatch.setattr(compressed_mla_impl, "_use_sm120_sparse_mla", lambda **_: True)
-    monkeypatch.setattr(compressed_mla_kernel, "run_unified_decode", fake_forward)
+    monkeypatch.setattr(compressed_sparse_mla_impl, "_stage_fixed_compressed_sparse_mla_inputs", fail_stage)
+    monkeypatch.setattr(compressed_sparse_mla_impl, "_use_sm120_sparse_mla", lambda **_: True)
+    monkeypatch.setattr(compressed_sparse_mla_kernel, "run_unified_decode", fake_forward)
 
-    out = compressed_mla_impl.compressed_mla_decode_forward(
+    out = compressed_sparse_mla_impl.compressed_sparse_mla_decode_forward(
         binding=binding,
         swa_k_cache=swa_cache,
         sm_scale=1.0,
