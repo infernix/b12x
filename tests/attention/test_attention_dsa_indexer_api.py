@@ -34,6 +34,7 @@ from b12x.attention.dsa_indexer._impl import (
 from b12x.attention.dsa_indexer.contiguous_kernel import (
     resolve_contiguous_prefill_block_k,
 )
+from b12x.attention.dsa_indexer import resolve_paged_prefill_k_rows
 from b12x.attention.dsa_indexer.scratch import (
     B12XIndexerContiguousScratchCaps,
     B12XIndexerPagedScratchCaps,
@@ -301,6 +302,14 @@ def test_contiguous_prefill512_policy_allows_padded_k_rows() -> None:
         )
         == 512
     )
+
+
+def test_paged_prefill_k_rows_match_plan_capacity_and_override(monkeypatch) -> None:
+    assert resolve_paged_prefill_k_rows(max_page_table_width=128) == 8192
+    assert resolve_paged_prefill_k_rows(max_page_table_width=1024) == 32768
+
+    monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "16384")
+    assert resolve_paged_prefill_k_rows(max_page_table_width=128) == 16384
 
 
 def test_paged_dsa_glm_front_door_does_not_expose_paged_window_contract() -> None:

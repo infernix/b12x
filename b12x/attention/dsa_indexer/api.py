@@ -145,6 +145,7 @@ from .scratch import (
 from .scratch import (
     plan_indexer_scratch as plan,
 )
+from .scratch import resolve_paged_prefill_k_rows
 from . import META
 
 

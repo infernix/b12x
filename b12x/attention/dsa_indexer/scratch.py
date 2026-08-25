@@ -774,6 +774,26 @@ def _resolve_indexer_paged_supertile_tokens(
     return tokens
 
 
+def resolve_paged_prefill_k_rows(
+    *,
+    max_page_table_width: int,
+    page_size: int = 64,
+    supertile_k: int = 0,
+) -> int:
+    """Resolve the K-row window streamed by paged prefill."""
+    page_size = max(int(page_size), 1)
+    tokens = _resolve_indexer_paged_supertile_tokens(
+        int(supertile_k),
+        capacity_tokens=max(int(max_page_table_width), 1) * page_size,
+    )
+    if tokens % page_size != 0:
+        raise ValueError(
+            "paged indexer prefill K rows must be divisible by page_size, "
+            f"got k_rows={tokens}, page_size={page_size}"
+        )
+    return tokens
+
+
 def _resolve_indexer_paged_route(
     caps: B12XIndexerPagedScratchCaps,
     *,
@@ -2380,4 +2400,5 @@ __all__ = [
     "plan_indexer_scratch",
     "plan_indexer_paged_scratch",
     "plan_indexer_contiguous_scratch",
+    "resolve_paged_prefill_k_rows",
 ]

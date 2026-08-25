@@ -75,6 +75,7 @@ META = OpMeta(
         "index_topk_fp8",
         "resolve_local_num_q_heads",
         "resolve_replicated_num_q_heads",
+        "resolve_paged_prefill_k_rows",
         "INDEX_HEAD_DIM",
         "PAGED_INDEX_PAGE_SIZE",
         "SOURCE_LAYOUT_PAGED",
