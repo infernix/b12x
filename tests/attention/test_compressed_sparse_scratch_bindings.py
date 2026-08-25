@@ -5,25 +5,42 @@ from dataclasses import replace
 import pytest
 import torch
 
-import b12x.attention.nsa_indexer._impl as indexer_impl
+import b12x.attention.dsa_indexer._impl as indexer_impl
 import b12x.attention._shared.mla.api as sparse_mla_impl
 import b12x.attention._shared.mla.compressed_api as compressed_sparse_mla_impl
 import b12x.attention._shared.mla.kernel as compressed_sparse_mla_kernel
-import b12x.attention.nsa_indexer.paged as paged_indexer_impl
+import b12x.attention.dsa_indexer.paged as paged_indexer_impl
 from b12x.attention._shared.mla.compressed_reference import (
     COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
     compressed_sparse_mla_page_nbytes,
 )
 from b12x.attention._shared.workspace import B12XAttentionArena, B12XAttentionWorkspace
-from b12x.attention.nsa_indexer.scratch import INDEXER_SOURCE_LAYOUT_CONTIGUOUS, INDEXER_SOURCE_LAYOUT_PAGED, B12XIndexerContiguousBinding, B12XIndexerPagedBinding, B12XIndexerPagedScratch, B12XIndexerScratchCaps, plan_indexer_scratch
-from b12x.attention.nsa_indexer.scratch import (
+from b12x.attention.dsa_indexer.scratch import (
+    INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
+    INDEXER_SOURCE_LAYOUT_PAGED,
+    B12XIndexerContiguousBinding,
+    B12XIndexerPagedBinding,
+    B12XIndexerPagedScratch,
+    B12XIndexerScratchCaps,
+    plan_indexer_scratch,
+)
+from b12x.attention.dsa_indexer.scratch import (
     B12XIndexerContiguousScratchCaps,
     B12XIndexerPagedScratchCaps,
     plan_indexer_contiguous_scratch,
     plan_indexer_paged_scratch,
 )
-from b12x.attention.compressed_sparse_mla._scratch import B12XCompressedSparseMLABinding, B12XCompressedSparseMLAScratch, B12XCompressedSparseMLAScratchCaps, plan_compressed_sparse_mla_scratch
-from b12x.attention.sparse_mla._scratch import B12XSparseMLABinding, B12XSparseMLAScratchCaps, plan_sparse_mla_scratch
+from b12x.attention.compressed_sparse_mla._scratch import (
+    B12XCompressedSparseMLABinding,
+    B12XCompressedSparseMLAScratch,
+    B12XCompressedSparseMLAScratchCaps,
+    plan_compressed_sparse_mla_scratch,
+)
+from b12x.attention.sparse_mla._scratch import (
+    B12XSparseMLABinding,
+    B12XSparseMLAScratchCaps,
+    plan_sparse_mla_scratch,
+)
 
 
 def _workspace(
@@ -335,9 +352,7 @@ def test_indexer_paged_default_supertile_is_capped_by_fixed_capacity(
         shared_page_table=True,
     )
     automatic = plan_indexer_scratch(B12XIndexerScratchCaps(**common))
-    explicit = plan_indexer_scratch(
-        B12XIndexerScratchCaps(**common, supertile_k=32768)
-    )
+    explicit = plan_indexer_scratch(B12XIndexerScratchCaps(**common, supertile_k=32768))
 
     assert automatic.layout.supertile_tokens == 16384
     assert automatic.layout.gather_k_rows == 16384
@@ -781,7 +796,9 @@ def test_indexer_contiguous_plan_bind_returns_common_binding_type() -> None:
     assert binding.lengths.shape == (3,)
 
 
-def test_compressed_sparse_mla_decode_binding_supplies_runtime_tensors(monkeypatch) -> None:
+def test_compressed_sparse_mla_decode_binding_supplies_runtime_tensors(
+    monkeypatch,
+) -> None:
     workspace = _workspace(max_total_q=1, topk=2, max_page_table_width=2)
     workspace.fixed_capacity = False
     workspace.use_cuda_graph = True
@@ -807,7 +824,7 @@ def test_compressed_sparse_mla_decode_binding_supplies_runtime_tensors(monkeypat
     calls = {}
 
     def fail_stage(**kwargs):
-        raise AssertionError("binding path should not stage compressed sparse MLA inputs")
+        raise AssertionError("binding path should not stage compressed MLA inputs")
 
     def fake_forward(**kwargs):
         calls["q_all"] = kwargs["q_all"]
@@ -815,9 +832,17 @@ def test_compressed_sparse_mla_decode_binding_supplies_runtime_tensors(monkeypat
         calls["swa_lengths"] = kwargs["swa_topk_lengths"]
         return kwargs["workspace"].output_buffer
 
-    monkeypatch.setattr(compressed_sparse_mla_impl, "_stage_fixed_compressed_sparse_mla_inputs", fail_stage)
-    monkeypatch.setattr(compressed_sparse_mla_impl, "_use_sm120_sparse_mla", lambda **_: True)
-    monkeypatch.setattr(compressed_sparse_mla_kernel, "run_unified_decode", fake_forward)
+    monkeypatch.setattr(
+        compressed_sparse_mla_impl,
+        "_stage_fixed_compressed_sparse_mla_inputs",
+        fail_stage,
+    )
+    monkeypatch.setattr(
+        compressed_sparse_mla_impl, "_use_sm120_sparse_mla", lambda **_: True
+    )
+    monkeypatch.setattr(
+        compressed_sparse_mla_kernel, "run_unified_decode", fake_forward
+    )
 
     out = compressed_sparse_mla_impl.compressed_sparse_mla_decode_forward(
         binding=binding,
@@ -949,7 +974,9 @@ def test_indexer_contiguous_logits_binding_supplies_metadata(monkeypatch) -> Non
         calls.update(kwargs)
         return torch.empty((3, 64), dtype=torch.float32)
 
-    monkeypatch.setattr(indexer_impl, "supports_contiguous_logits_kernel", fake_supports)
+    monkeypatch.setattr(
+        indexer_impl, "supports_contiguous_logits_kernel", fake_supports
+    )
     monkeypatch.setattr(indexer_impl, "run_contiguous_logits_kernel", fake_run_kernel)
 
     logits = indexer_impl.contiguous_logits(
@@ -966,7 +993,9 @@ def test_indexer_contiguous_logits_binding_supplies_metadata(monkeypatch) -> Non
     assert logits.shape == (3, 64)
 
 
-def test_indexer_contiguous_tiled_topk_binding_supplies_topk_and_metadata(monkeypatch) -> None:
+def test_indexer_contiguous_tiled_topk_binding_supplies_topk_and_metadata(
+    monkeypatch,
+) -> None:
     plan = plan_indexer_contiguous_scratch(
         B12XIndexerContiguousScratchCaps(
             device="cpu",
@@ -1004,7 +1033,9 @@ def test_indexer_contiguous_tiled_topk_binding_supplies_topk_and_metadata(monkey
         calls.update(kwargs)
         return logits
 
-    monkeypatch.setattr(indexer_impl, "supports_contiguous_logits_kernel", fake_supports)
+    monkeypatch.setattr(
+        indexer_impl, "supports_contiguous_logits_kernel", fake_supports
+    )
     monkeypatch.setattr(indexer_impl, "contiguous_logits_reference", fake_reference)
 
     indices = indexer_impl.contiguous_tiled_topk(

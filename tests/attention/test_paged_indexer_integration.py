@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.attention.nsa_indexer._impl import clear_indexer_caches
-from b12x.attention.nsa_indexer.paged import (
+from b12x.attention.dsa_indexer._impl import clear_indexer_caches
+from b12x.attention.dsa_indexer.paged import (
     _paged_indexer_chunk_geometry,
     _plan_two_level_fold,
     index_topk_fp8,
@@ -13,11 +13,11 @@ from b12x.attention.nsa_indexer.paged import (
     prepare_paged_indexer_metadata,
     resolve_replicated_num_q_heads,
 )
-from b12x.attention.nsa_indexer.scratch import (
+from b12x.attention.dsa_indexer.scratch import (
     B12XIndexerPagedScratchCaps,
     plan_indexer_paged_scratch,
 )
-from b12x.attention.nsa_indexer.tiled_topk import run_tiled_topk
+from b12x.attention.dsa_indexer.tiled_topk import run_tiled_topk
 
 
 def _make_real_page_table(
@@ -33,7 +33,9 @@ def _make_real_page_table(
         dtype=torch.int32,
         device=device,
     )
-    for row_idx, (page_start, seq_len) in enumerate(zip(page_starts, seqlens, strict=True)):
+    for row_idx, (page_start, seq_len) in enumerate(
+        zip(page_starts, seqlens, strict=True)
+    ):
         block_count = (int(seq_len) + 63) // 64
         if block_count:
             real_page_table[row_idx, :block_count] = torch.arange(
@@ -166,8 +168,14 @@ def _bind_paged_indexer(
 
 
 def test_resolve_replicated_num_q_heads_for_tensor_parallel() -> None:
-    assert resolve_replicated_num_q_heads(global_num_q_heads=64, tensor_parallel_size=2) == 64
-    assert resolve_replicated_num_q_heads(global_num_q_heads=64, tensor_parallel_size=1) == 64
+    assert (
+        resolve_replicated_num_q_heads(global_num_q_heads=64, tensor_parallel_size=2)
+        == 64
+    )
+    assert (
+        resolve_replicated_num_q_heads(global_num_q_heads=64, tensor_parallel_size=1)
+        == 64
+    )
     with pytest.raises(ValueError, match="must be positive"):
         resolve_replicated_num_q_heads(global_num_q_heads=0, tensor_parallel_size=2)
     with pytest.raises(ValueError, match="tensor_parallel_size must be positive"):
@@ -226,10 +234,14 @@ def test_paged_index_plan_binding_keeps_metadata_aliases() -> None:
     rows = 1
     num_heads = 64
     width_blocks = 16
-    q_fp8 = torch.empty((rows, num_heads, 128), dtype=torch.float8_e4m3fn, device=device)
+    q_fp8 = torch.empty(
+        (rows, num_heads, 128), dtype=torch.float8_e4m3fn, device=device
+    )
     weights = torch.empty((rows, num_heads), dtype=torch.float32, device=device)
     del q_fp8, weights
-    real_page_table = torch.empty((rows, width_blocks), dtype=torch.int32, device=device)
+    real_page_table = torch.empty(
+        (rows, width_blocks), dtype=torch.int32, device=device
+    )
     seqlens = torch.empty((rows,), dtype=torch.int32, device=device)
     active_width = torch.empty((1,), dtype=torch.int32, device=device)
     schedule = torch.empty((4, 2), dtype=torch.int32, device=device)
@@ -252,7 +264,9 @@ def test_paged_index_plan_binding_keeps_metadata_aliases() -> None:
     assert binding.schedule_metadata.data_ptr() == schedule.data_ptr()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for graph capture"
+)
 def test_index_topk_fp8_graph_matches_reference(
     monkeypatch,
 ) -> None:
@@ -279,7 +293,9 @@ def test_index_topk_fp8_graph_matches_reference(
     )
     api_weights = weights.unsqueeze(-1)
     index_k_cache = pack_paged_index_k_cache_reference(
-        torch.randn((80 * 64, 128), generator=gen, dtype=torch.float32).to(device=device)
+        torch.randn((80 * 64, 128), generator=gen, dtype=torch.float32).to(
+            device=device
+        )
         / 3
     )
     actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
@@ -293,7 +309,9 @@ def test_index_topk_fp8_graph_matches_reference(
             device=device,
         )
         graph_real_page_table.copy_(live_table)
-        graph_seqlens.copy_(torch.tensor(seqlens_list, dtype=torch.int32, device=device))
+        graph_seqlens.copy_(
+            torch.tensor(seqlens_list, dtype=torch.int32, device=device)
+        )
         return prepare_paged_indexer_metadata(
             real_page_table=graph_real_page_table,
             cache_seqlens_int32=graph_seqlens,
@@ -399,7 +417,9 @@ def test_index_topk_fp8_graph_matches_reference(
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for graph capture"
+)
 def test_paged_tiled_indexer_emits_physical_slots_in_final_fold(
     monkeypatch,
 ) -> None:
@@ -408,25 +428,20 @@ def test_paged_tiled_indexer_emits_physical_slots_in_final_fold(
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu").manual_seed(91_009)
     rows, num_heads, width_blocks, topk = 4, 32, 32, 512
-    seqlens = torch.tensor(
-        [0, 1472, 1536, 1600], dtype=torch.int32, device=device
+    seqlens = torch.tensor([0, 1472, 1536, 1600], dtype=torch.int32, device=device)
+    shared_storage = torch.full((1, width_blocks), -1, dtype=torch.int32, device=device)
+    shared_storage[0, :25] = torch.arange(5, 30, dtype=torch.int32, device=device).flip(
+        0
     )
-    shared_storage = torch.full(
-        (1, width_blocks), -1, dtype=torch.int32, device=device
-    )
-    shared_storage[0, :25] = torch.arange(
-        5, 30, dtype=torch.int32, device=device
-    ).flip(0)
     page_table = shared_storage.expand(rows, width_blocks)
     assert page_table.stride(0) == 0
 
     q_fp8 = _rand_fp8_q((rows, num_heads, 128), gen=gen, device=device)
-    weights = torch.randn(
-        (rows, num_heads), generator=gen, dtype=torch.float32
-    ).to(device)
+    weights = torch.randn((rows, num_heads), generator=gen, dtype=torch.float32).to(
+        device
+    )
     index_k_cache = pack_paged_index_k_cache_reference(
-        torch.randn((64 * 64, 128), generator=gen, dtype=torch.float32).to(device)
-        / 3
+        torch.randn((64 * 64, 128), generator=gen, dtype=torch.float32).to(device) / 3
     )
     actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
     binding = _bind_paged_indexer(
@@ -507,19 +522,17 @@ def test_tiled_topk_physical_slots_use_runtime_page_table_row_stride(
         device=device,
     )
 
-    def select(width: int, *, shared: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    def select(
+        width: int, *, shared: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         selected_page_ids = page_ids
         if shared:
             selected_page_ids = torch.full_like(page_ids, 2000)
-            page_table = torch.full(
-                (1, width), -1, dtype=torch.int32, device=device
-            )
+            page_table = torch.full((1, width), -1, dtype=torch.int32, device=device)
             page_table[:, 0] = selected_page_ids[0]
             page_table = page_table.expand(rows, -1)
         else:
-            page_table = torch.full(
-                (rows, width), -1, dtype=torch.int32, device=device
-            )
+            page_table = torch.full((rows, width), -1, dtype=torch.int32, device=device)
             page_table[:, 0] = selected_page_ids
         _, indices = run_tiled_topk(
             tile_logits=tile_logits,
@@ -544,9 +557,10 @@ def test_tiled_topk_physical_slots_use_runtime_page_table_row_stride(
 
     def expected(selected_page_ids: torch.Tensor) -> torch.Tensor:
         result = torch.full((rows, topk), -1, dtype=torch.int32, device=device)
-        result[:, :32] = selected_page_ids[:, None] * 64 + torch.arange(
-            32, dtype=torch.int32, device=device
-        )[None, :]
+        result[:, :32] = (
+            selected_page_ids[:, None] * 64
+            + torch.arange(32, dtype=torch.int32, device=device)[None, :]
+        )
         return torch.sort(result, dim=1).values
 
     assert torch.equal(torch.sort(narrow, dim=1).values, expected(narrow_page_ids))
@@ -555,7 +569,9 @@ def test_tiled_topk_physical_slots_use_runtime_page_table_row_stride(
     assert misses_after_reuse == misses_after_narrow
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for graph capture"
+)
 def test_paged_index_shared_supertile_prefill_graph_matches_reference(
     monkeypatch,
 ) -> None:
@@ -589,7 +605,9 @@ def test_paged_index_shared_supertile_prefill_graph_matches_reference(
     )
     api_weights = weights.unsqueeze(-1)
     index_k_cache = pack_paged_index_k_cache_reference(
-        torch.randn((128 * 64, 128), generator=gen, dtype=torch.float32).to(device=device)
+        torch.randn((128 * 64, 128), generator=gen, dtype=torch.float32).to(
+            device=device
+        )
         / 3
     )
     padded_index_k_cache = torch.empty(
@@ -656,7 +674,10 @@ def test_paged_index_shared_supertile_prefill_graph_matches_reference(
     metadata = prepare(3, 4096, shared_page_table=True)
     reference_metadata = prepare(3, 4096, shared_page_table=False)
     assert metadata.real_page_table.data_ptr() == binding.real_page_table.data_ptr()
-    assert reference_metadata.real_page_table.data_ptr() == reference_binding.real_page_table.data_ptr()
+    assert (
+        reference_metadata.real_page_table.data_ptr()
+        == reference_binding.real_page_table.data_ptr()
+    )
     index_topk_fp8(
         q_fp8=q_fp8,
         weights=api_weights,
@@ -746,7 +767,9 @@ def test_paged_index_supertile_scratch_sizes_candidate_carry_buffer() -> None:
         torch.empty(shape, dtype=dtype, device=device)
         for shape, dtype in plan.shapes_and_dtypes()
     ]
-    real_page_table = torch.empty((16, page_table_width), dtype=torch.int32, device=device)
+    real_page_table = torch.empty(
+        (16, page_table_width), dtype=torch.int32, device=device
+    )
     seqlens = torch.empty((16,), dtype=torch.int32, device=device)
     binding = plan.bind(
         scratch=scratch,
@@ -928,9 +951,9 @@ def test_paged_index_two_level_fold_clips_rounded_final_slice() -> None:
     width_tokens = width_blocks * 64
 
     seqlens = torch.full((rows,), width_tokens, dtype=torch.int32, device=device)
-    page_table = torch.arange(
-        width_blocks, dtype=torch.int32, device=device
-    ).unsqueeze(0)
+    page_table = torch.arange(width_blocks, dtype=torch.int32, device=device).unsqueeze(
+        0
+    )
     q_fp8 = torch.zeros(
         (rows, num_heads, 128), dtype=torch.float8_e4m3fn, device=device
     )
@@ -978,7 +1001,9 @@ def test_paged_index_two_level_fold_clips_rounded_final_slice() -> None:
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for graph capture"
+)
 def test_index_topk_fp8_graph_unaligned_single_chunk(
     monkeypatch,
 ) -> None:
@@ -1006,7 +1031,9 @@ def test_index_topk_fp8_graph_unaligned_single_chunk(
     )
     api_weights = weights.unsqueeze(-1)
     index_k_cache = pack_paged_index_k_cache_reference(
-        torch.randn((96 * 64, 128), generator=gen, dtype=torch.float32).to(device=device)
+        torch.randn((96 * 64, 128), generator=gen, dtype=torch.float32).to(
+            device=device
+        )
         / 3
     )
     actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
@@ -1019,7 +1046,9 @@ def test_index_topk_fp8_graph_unaligned_single_chunk(
             device=device,
         )
         graph_real_page_table.copy_(live_table)
-        graph_seqlens.copy_(torch.tensor(seqlens_list, dtype=torch.int32, device=device))
+        graph_seqlens.copy_(
+            torch.tensor(seqlens_list, dtype=torch.int32, device=device)
+        )
         return prepare_paged_indexer_metadata(
             real_page_table=graph_real_page_table,
             cache_seqlens_int32=graph_seqlens,

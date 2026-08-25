@@ -5,8 +5,9 @@
 - ``dense_mla``: dense compressed-cache MLA with strided physical records and
   optional causal sliding-window masking.
 - ``sparse_mla``: top-k-selected MLA, including strided physical records.
-- ``compressed_sparse_mla``: MLA decode directly from compressed KV pages (DSV4).
-- ``nsa_indexer``: the NSA index stage — quantize -> score -> select.
+- ``compressed_sparse_mla``: sparse MLA directly from compressed KV pages
+  (DSV4).
+- ``dsa_indexer``: the DSA index stage — quantize -> score -> select.
 - ``varlen``: contiguous batched/varlen attention (reduced-assurance tier).
 """
 
@@ -20,7 +21,7 @@ _OP_MODULES = (
     "dense_mla",
     "sparse_mla",
     "compressed_sparse_mla",
-    "nsa_indexer",
+    "dsa_indexer",
     "varlen",
 )
 

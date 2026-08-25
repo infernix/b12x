@@ -1,4 +1,4 @@
-"""Public surface for attention.nsa_indexer (docs in the op ``__init__``).
+"""Public surface for attention.dsa_indexer (docs in the op ``__init__``).
 
 Naming: uniform ``_paged`` / ``_contiguous`` suffixes replace the upstream
 ``msa_`` / ``paged_`` / ``contiguous_`` prefix mix; the pipeline stage is the

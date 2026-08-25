@@ -1984,7 +1984,7 @@ class B12XAttentionWorkspace:
         topk = int(self.indexer_topk)
         if topk <= 0:
             return
-        from b12x.attention.nsa_indexer.fused_indexer import (
+        from b12x.attention.dsa_indexer.fused_indexer import (
             fused_indexer_scratch_max_rows,
             fused_indexer_scratch_capacity,
         )
@@ -2018,7 +2018,7 @@ class B12XAttentionWorkspace:
             raise RuntimeError(
                 "fused indexer scratch unavailable (non-CUDA workspace or topk<=0)"
             )
-        from b12x.attention.nsa_indexer.fused_indexer import (
+        from b12x.attention.dsa_indexer.fused_indexer import (
             fused_indexer_scratch_max_rows,
             fused_indexer_scratch_capacity,
         )
@@ -2214,23 +2214,29 @@ class B12XAttentionWorkspace:
                 shape=(max_total_q,),
                 dtype=torch.int32,
             )
-            self.compressed_sparse_mla_indexed_indices_stage, _ = _materialize_arena_view(
-                self.shared_arena,
-                offset_bytes=self.arena.compressed_indexed_indices_stage_offset_bytes,
-                shape=(max_total_q, int(self.topk)),
-                dtype=torch.int32,
+            self.compressed_sparse_mla_indexed_indices_stage, _ = (
+                _materialize_arena_view(
+                    self.shared_arena,
+                    offset_bytes=self.arena.compressed_indexed_indices_stage_offset_bytes,
+                    shape=(max_total_q, int(self.topk)),
+                    dtype=torch.int32,
+                )
             )
-            self.compressed_sparse_mla_indexed_lengths_stage, _ = _materialize_arena_view(
-                self.shared_arena,
-                offset_bytes=self.arena.compressed_indexed_lengths_stage_offset_bytes,
-                shape=(max_total_q,),
-                dtype=torch.int32,
+            self.compressed_sparse_mla_indexed_lengths_stage, _ = (
+                _materialize_arena_view(
+                    self.shared_arena,
+                    offset_bytes=self.arena.compressed_indexed_lengths_stage_offset_bytes,
+                    shape=(max_total_q,),
+                    dtype=torch.int32,
+                )
             )
-            self.compressed_sparse_mla_indexed_page_table_stage, _ = _materialize_arena_view(
-                self.shared_arena,
-                offset_bytes=self.arena.compressed_indexed_page_table_stage_offset_bytes,
-                shape=(max_total_q, int(self.max_page_table_width)),
-                dtype=torch.int32,
+            self.compressed_sparse_mla_indexed_page_table_stage, _ = (
+                _materialize_arena_view(
+                    self.shared_arena,
+                    offset_bytes=self.arena.compressed_indexed_page_table_stage_offset_bytes,
+                    shape=(max_total_q, int(self.max_page_table_width)),
+                    dtype=torch.int32,
+                )
             )
 
         if indexer_k_rows > 0:

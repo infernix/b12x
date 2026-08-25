@@ -37,8 +37,8 @@ projection (`gemm.mla_query_projection`) and grouped WO projection
 
 **`attention`** — `attention.paged` (paged-KV decode/extend, FP8 KV, MSA block
 sparse, CUDA-graph-replayable), `attention.sparse_mla` and
-`attention.compressed_sparse_mla` (top-k / compressed-page MLA — distinct contracts,
-kept separate on purpose), `attention.nsa_indexer` (the NSA/MSA quantize →
+`attention.compressed_sparse_mla` (top-k / compressed-page MLA — distinct
+contracts, kept separate on purpose), `attention.dsa_indexer` (the DSA/MSA quantize →
 score → select pipeline), and `attention.varlen` (contiguous batched/varlen).
 
 **`moe`** — `moe.fused_moe`, fused FP4 TP MoE across a micro-kernel decode
