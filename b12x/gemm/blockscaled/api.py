@@ -27,6 +27,54 @@ def _output_dtype_name(dtype: torch.dtype) -> str:
     raise ValueError(f"block-scaled output must be bf16/fp16, got {dtype}")
 
 
+def mm_mxfp4(
+    lhs_values: torch.Tensor,
+    lhs_scale_storage: torch.Tensor,
+    rhs_values: torch.Tensor,
+    rhs_scale_storage: torch.Tensor,
+    *,
+    out_dtype: torch.dtype = torch.bfloat16,
+    expected_m: int | None = None,
+    stream: object = None,
+) -> torch.Tensor:
+    """Run serialized MXFP4 operands through ``blockscaled.mm``."""
+    return mm(
+        (lhs_values, lhs_scale_storage),
+        (rhs_values, rhs_scale_storage),
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e8m0fnu",
+        c_dtype=_output_dtype_name(out_dtype),
+        sf_vec_size=32,
+        expected_m=expected_m,
+        stream=stream,
+    )
+
+
+def mm_nvfp4(
+    lhs_values: torch.Tensor,
+    lhs_scale_storage: torch.Tensor,
+    rhs_values: torch.Tensor,
+    rhs_scale_storage: torch.Tensor,
+    alpha: torch.Tensor,
+    *,
+    out_dtype: torch.dtype = torch.bfloat16,
+    expected_m: int | None = None,
+    stream: object = None,
+) -> torch.Tensor:
+    """Run serialized NVFP4 operands through ``blockscaled.mm``."""
+    return mm(
+        (lhs_values, lhs_scale_storage),
+        (rhs_values, rhs_scale_storage),
+        alpha=alpha.reshape(1),
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        c_dtype=_output_dtype_name(out_dtype),
+        sf_vec_size=16,
+        expected_m=expected_m,
+        stream=stream,
+    )
+
+
 def mm_block_fp8(
     lhs_values: torch.Tensor,
     lhs_scale: torch.Tensor,
@@ -56,6 +104,8 @@ __all__ = [
     "is_supported",
     "mm",
     "mm_block_fp8",
+    "mm_mxfp4",
+    "mm_nvfp4",
     "pack_weight",
     "prewarm",
 ]
