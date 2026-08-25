@@ -1844,8 +1844,8 @@ def test_w4a16_tc_decode_fused_sum_matches_oracle(
 ) -> None:
     """TC-decode folds the top-k sum into the FC2 store via atomic accumulate.
     Validate the epilogue across the whole small-M range, not just powers of
-    two, since 3/5/6/7 were never exercised through it before. TC-decode is
-    unconditional for packed small-M, so no toggle is needed."""
+    two, since 3/5/6/7 were never exercised through it before. This tiny-expert
+    geometry remains below the planner's route-packing crossover."""
     import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
 
     # Spy on the fused compile so we can assert the fused-sum path actually engaged
