@@ -434,6 +434,18 @@ def test_mm_serialized_nvfp4_and_block_fp8_match_native_views() -> None:
     )
     torch.testing.assert_close(serialized_block_fp8, native_block_fp8, rtol=0, atol=0)
 
+    compatibility_block_fp8 = blockscaled.mm_block_fp8(
+        lhs_fp8,
+        lhs_scale,
+        rhs_fp8,
+        rhs_scale,
+        out_dtype=torch.bfloat16,
+        expected_m=m,
+    )
+    torch.testing.assert_close(
+        compatibility_block_fp8, native_block_fp8, rtol=0, atol=0
+    )
+
 
 def test_blockscaled_public_surface_and_compatibility_aliases() -> None:
     from b12x.gemm import mxfp8_linear, tensor_fp8_linear
@@ -441,6 +453,7 @@ def test_blockscaled_public_surface_and_compatibility_aliases() -> None:
     assert blockscaled.META.entry_points == (
         "Weight",
         "mm",
+        "mm_block_fp8",
         "pack_weight",
         "prewarm",
         "is_supported",

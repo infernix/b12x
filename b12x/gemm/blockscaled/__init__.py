@@ -33,6 +33,7 @@ META = OpMeta(
     entry_points=(
         "Weight",
         "mm",
+        "mm_block_fp8",
         "pack_weight",
         "prewarm",
         "is_supported",
@@ -54,6 +55,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         Weight,
         is_supported,
         mm,
+        mm_block_fp8,
         pack_weight,
         prewarm,
     )
