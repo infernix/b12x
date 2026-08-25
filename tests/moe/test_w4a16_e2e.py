@@ -2208,17 +2208,22 @@ def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
     )
     w1_global = torch.ones(local_experts, dtype=torch.float32, device=device)
     w2_global = torch.ones(local_experts, dtype=torch.float32, device=device)
-    config = fused_moe.PackedConfig(
-        source_format="fp4_e8m0_k32",
-        w13_layout="w13",
+    source = fused_moe.PackedSource(
+        format=fused_moe.PackedSourceFormat.MXFP4_E8M0_K32,
+        w13_layout=fused_moe.W13Layout.W13,
     )
     weight_plan = fused_moe.plan_weights(
-        config=config,
-        activation=activation,
-        dtype=torch.bfloat16,
-        num_experts=local_experts,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
+        source=source,
+        activation=fused_moe.ActivationSpec(
+            mode=fused_moe.ActivationMode.A16,
+            nonlinearity=activation,
+            io_dtype=torch.bfloat16,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        ),
     )
     prepared = fused_moe.prepare_weights(
         plan=weight_plan,
@@ -2229,22 +2234,18 @@ def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
             w2_block_scales=w2_scale,
             w13_global_scales=w1_global,
             w2_global_scales=w2_global,
-            input_scale=torch.ones_like(w1_global),
-            intermediate_scale=torch.ones_like(w2_global),
         ),
     )
-    plan = fused_moe.plan(
-        fused_moe.Caps(
+    plan = fused_moe.plan_execution(
+        experts=prepared,
+        capacity=fused_moe.ExecutionCapacity(
             max_tokens=8,
-            num_topk=topk,
+            top_k=topk,
+            warmup_token_counts=(1, 8),
             route_num_experts=global_experts,
-            device=device,
-            config=config,
-            weight_plan=prepared.plan,
-            core_token_counts=(1, 8),
-            frozen=True,
-        )
+        ),
     )
+    fused_moe.prewarm(plan)
     scratch_spec = plan.scratch_specs()[0]
     scratch = torch.empty(
         scratch_spec.shape,
@@ -2257,7 +2258,8 @@ def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
     expert_map = torch.full((global_experts,), -1, dtype=torch.int32, device=device)
     expert_map[::2] = torch.arange(local_experts - 2, dtype=torch.int32, device=device)
     output = torch.empty_like(x)
-    binding = plan.bind(
+    binding = fused_moe.bind(
+        plan,
         scratch=scratch,
         a=x,
         experts=prepared,
@@ -2267,11 +2269,13 @@ def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
         input_scales_static=True,
         route_expert_map=expert_map,
     )
+    assert binding.unit_scale_contract
     legacy_ids = torch.zeros_like(topk_ids)
     legacy_weights = torch.zeros_like(topk_weights)
     legacy_weights[0, 0] = topk_weights[0, 0]
     legacy_output = torch.empty_like(x)
-    legacy_binding = plan.bind(
+    legacy_binding = fused_moe.bind(
+        plan,
         scratch=scratch,
         a=x,
         experts=prepared,
