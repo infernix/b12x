@@ -1,0 +1,42 @@
+"""Public surface for ``norm.hyperconnection``."""
+
+from __future__ import annotations
+
+from ..._lib.gating import default_is_supported
+from . import META
+from . import reference
+from ._impl import HyperConnectionBinding as Binding
+from ._impl import HyperConnectionCaps as Caps
+from ._impl import HyperConnectionPlan as Plan
+from ._impl import plan_hyperconnection as plan
+from ._impl import run_combine_impl as run_combine
+from ._impl import run_combine_norm_impl as run_combine_norm
+from ._impl import run_gate_mean_impl as run_gate_mean
+from ._impl import run_grouped_rmsnorm_impl as run_grouped_rmsnorm
+from ._impl import run_scaled_silu_impl as run_scaled_silu
+
+
+def bind(plan: Plan, **kwargs) -> Binding:
+    """Bind caller-owned output storage; creates views and never allocates."""
+    return plan.bind(**kwargs)
+
+
+def is_supported(device=None) -> bool:
+    """True when Triton-backed b12x kernels can run on the selected device."""
+    return default_is_supported(device, requires=META.requires)
+
+
+__all__ = [
+    "Caps",
+    "Plan",
+    "Binding",
+    "plan",
+    "bind",
+    "run_grouped_rmsnorm",
+    "run_scaled_silu",
+    "run_gate_mean",
+    "run_combine",
+    "run_combine_norm",
+    "reference",
+    "is_supported",
+]
