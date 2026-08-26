@@ -1622,9 +1622,10 @@ def _select_dynamic_tile_mn(
         if routed_rows > 16 * num_experts:
             return (32, _LEVEL_TILE_N)
         return (16, _LEVEL_TILE_N)
-    activation = _get_activation_kernel_spec(
+    activation_spec = _get_activation_kernel_spec(
         activation, quant_mode=quant_mode
-    ).activation
+    )
+    activation = activation_spec.activation
     if activation == "relu2":
         return (_LEVEL_TILE_M, _LEVEL_TILE_N)
     # Gated NVFP4 supports the full M16/M32/M64/M128 ladder.  DSV4 TP2/TP4
@@ -1639,6 +1640,17 @@ def _select_dynamic_tile_mn(
         tile_m = 64
     else:
         tile_m = _LEVEL_TILE_M
+    if (
+        quant_mode == "nvfp4"
+        and tile_m == 64
+        and activation_spec.is_gated
+        and int(n) % 128 != 0
+        and int(n) % 32 == 0
+    ):
+        # The swapped FC1 specialization uses a fixed M32 tile. The M64
+        # tactic selects an M64 MMA atom, leaving zero FC1 M tiles and invalid
+        # CuTe IR. M32 preserves the exact mid-atom gate-half addressing.
+        tile_m = 32
     return (tile_m, _LEVEL_TILE_N)
 
 

@@ -482,6 +482,41 @@ def test_w4a8_mx_tp6_prefill_scratch_uses_repacked_n128_extent(
     )
 
 
+def test_nvfp4_mid_atom_gate_boundary_caps_dynamic_tile_m(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+
+    assert tp_moe_impl._select_dynamic_tile_mn(
+        80 * 512,
+        192,
+        "nvfp4",
+        num_experts=512,
+        activation="silu",
+    ) == (32, 128)
+    assert tp_moe_impl._select_dynamic_tile_mn(
+        80 * 512,
+        256,
+        "nvfp4",
+        num_experts=512,
+        activation="silu",
+    ) == (64, 128)
+    assert tp_moe_impl._select_dynamic_tile_mn(
+        80 * 512,
+        192,
+        "nvfp4",
+        num_experts=512,
+        activation="relu2",
+    ) == (128, 128)
+    assert tp_moe_impl._select_dynamic_tile_mn(
+        96 * 512,
+        192,
+        "nvfp4",
+        num_experts=512,
+        activation="silu",
+    ) == (128, 128)
+
+
 def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
