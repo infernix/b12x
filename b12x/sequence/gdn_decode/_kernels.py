@@ -1,0 +1,650 @@
+"""Opaque Triton launches for packed sequential GDN decode and output gating."""
+
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+
+_VALIDATION_BLOCK = 256
+
+
+@triton.jit
+def _reset_validation_kernel(
+    duplicate_slots,
+    error_code,
+    TABLE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+    tl.store(duplicate_slots + offsets, -1, mask=offsets < TABLE_SIZE)
+    if tl.program_id(0) == 0:
+        tl.store(error_code, 0)
+
+
+@triton.jit
+def _validate_packed_metadata_kernel(
+    query_start_loc,
+    num_accepted_tokens,
+    num_seqs,
+    num_tokens,
+    error_code,
+    MAX_SEQS: tl.constexpr,
+    MAX_TOKENS: tl.constexpr,
+    STATE_INDEX_COLUMNS: tl.constexpr,
+):
+    request = tl.program_id(0)
+    live_seqs = tl.load(num_seqs).to(tl.int32)
+    live_tokens = tl.load(num_tokens).to(tl.int32)
+
+    if request == 0:
+        counts_invalid = (
+            (live_seqs < 0)
+            | (live_seqs > MAX_SEQS)
+            | (live_tokens < 0)
+            | (live_tokens > MAX_TOKENS)
+        )
+        first = tl.load(query_start_loc).to(tl.int32)
+        safe_last = tl.maximum(0, tl.minimum(live_seqs, MAX_SEQS))
+        last = tl.load(query_start_loc + safe_last).to(tl.int32)
+        if counts_invalid | (first != 0) | (last != live_tokens):
+            tl.atomic_or(error_code, 2)
+
+    if request < tl.maximum(0, tl.minimum(live_seqs, MAX_SEQS)):
+        start = tl.load(query_start_loc + request).to(tl.int32)
+        end = tl.load(query_start_loc + request + 1).to(tl.int32)
+        accepted = tl.load(num_accepted_tokens + request).to(tl.int32)
+        length = end - start
+        invalid = (
+            (start < 0)
+            | (end < start)
+            | (end > live_tokens)
+            | (length > STATE_INDEX_COLUMNS)
+            | (accepted < 1)
+            | (accepted > STATE_INDEX_COLUMNS)
+        )
+        if invalid:
+            tl.atomic_or(error_code, 2)
+
+
+@triton.jit
+def _validate_active_state_slots_kernel(
+    query_start_loc,
+    num_accepted_tokens,
+    state_indices,
+    num_seqs,
+    duplicate_slots,
+    error_code,
+    stride_indices_request: tl.constexpr,
+    stride_indices_column: tl.constexpr,
+    MAX_SEQS: tl.constexpr,
+    MAX_STATE_SLOTS: tl.constexpr,
+    STATE_INDEX_COLUMNS: tl.constexpr,
+    TABLE_SIZE: tl.constexpr,
+):
+    cell = tl.program_id(0)
+    request = cell // STATE_INDEX_COLUMNS
+    column = cell % STATE_INDEX_COLUMNS
+    live_seqs = tl.load(num_seqs).to(tl.int32)
+    if request >= tl.maximum(0, tl.minimum(live_seqs, MAX_SEQS)):
+        return
+
+    start = tl.load(query_start_loc + request).to(tl.int32)
+    end = tl.load(query_start_loc + request + 1).to(tl.int32)
+    accepted_column = tl.load(num_accepted_tokens + request).to(tl.int32) - 1
+    active = (end > start) & ((column < (end - start)) | (column == accepted_column))
+    if not active:
+        return
+
+    state_idx = tl.load(
+        state_indices
+        + request.to(tl.int64) * stride_indices_request
+        + column.to(tl.int64) * stride_indices_column
+    ).to(tl.int64)
+    if (state_idx < 0) | (state_idx >= MAX_STATE_SLOTS):
+        tl.atomic_or(error_code, 4)
+        return
+
+    empty_slot = tl.full((), -1, tl.int64)
+    slot = state_idx % TABLE_SIZE
+    probes = tl.full((), 0, tl.int32)
+    done = tl.full((), False, tl.int1)
+    duplicate = tl.full((), False, tl.int1)
+    while (probes < TABLE_SIZE) & ~done:
+        previous = tl.atomic_cas(duplicate_slots + slot, empty_slot, state_idx)
+        inserted = previous == empty_slot
+        duplicate = previous == state_idx
+        done = inserted | duplicate
+        slot = (slot + 1) % TABLE_SIZE
+        probes += 1
+
+    if duplicate | ~done:
+        tl.atomic_or(error_code, 1)
+
+
+@triton.jit
+def _packed_sequential_recurrent_decode_kernel(
+    mixed_qkv,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    recurrent_state,
+    query_start_loc,
+    num_accepted_tokens,
+    state_indices,
+    num_seqs,
+    output,
+    error_code,
+    scale,
+    stride_mixed_token: tl.constexpr,
+    stride_a_token: tl.constexpr,
+    stride_b_token: tl.constexpr,
+    stride_state_slot: tl.constexpr,
+    stride_state_head: tl.constexpr,
+    stride_state_v: tl.constexpr,
+    stride_indices_request: tl.constexpr,
+    stride_indices_column: tl.constexpr,
+    stride_output_token: tl.constexpr,
+    stride_output_head: tl.constexpr,
+    MAX_SEQS: tl.constexpr,
+    KEY_HEADS: tl.constexpr,
+    VALUE_HEADS: tl.constexpr,
+    KEY_HEAD_DIM: tl.constexpr,
+    VALUE_HEAD_DIM: tl.constexpr,
+    HEAD_RATIO: tl.constexpr,
+    STATE_INDEX_COLUMNS: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    QK_L2NORM: tl.constexpr,
+):
+    value_tile = tl.program_id(0)
+    request_value_head = tl.program_id(1)
+    request = request_value_head // VALUE_HEADS
+    value_head = request_value_head % VALUE_HEADS
+    key_head = value_head // HEAD_RATIO
+
+    live_seqs = tl.load(num_seqs).to(tl.int32)
+    if (request >= tl.maximum(0, tl.minimum(live_seqs, MAX_SEQS))) | (
+        tl.load(error_code).to(tl.int32) != 0
+    ):
+        return
+
+    start = tl.load(query_start_loc + request).to(tl.int32)
+    end = tl.load(query_start_loc + request + 1).to(tl.int32)
+    if end <= start:
+        return
+    accepted_column = tl.load(num_accepted_tokens + request).to(tl.int32) - 1
+    source_idx = tl.load(
+        state_indices
+        + request.to(tl.int64) * stride_indices_request
+        + accepted_column.to(tl.int64) * stride_indices_column
+    ).to(tl.int64)
+
+    key_cols = tl.arange(0, KEY_HEAD_DIM)
+    value_rows = value_tile * BLOCK_V + tl.arange(0, BLOCK_V)
+    key_mask = key_cols < KEY_HEAD_DIM
+    value_mask = value_rows < VALUE_HEAD_DIM
+    state_mask = value_mask[:, None] & key_mask[None, :]
+
+    # Pool-scaled arithmetic is explicitly Int64. Valid serving pools can place
+    # recycled state slots beyond the signed-32-bit element-offset boundary.
+    source_offsets = (
+        source_idx * stride_state_slot
+        + value_head.to(tl.int64) * stride_state_head
+        + value_rows[:, None].to(tl.int64) * stride_state_v
+        + key_cols[None, :].to(tl.int64)
+    )
+    state = tl.load(recurrent_state + source_offsets, mask=state_mask, other=0.0).to(
+        tl.float32
+    )
+
+    for relative_token in range(STATE_INDEX_COLUMNS):
+        if relative_token < (end - start):
+            token = start + relative_token
+            token_i64 = token.to(tl.int64)
+            mixed_base = token_i64 * stride_mixed_token
+            q_offsets = key_head * KEY_HEAD_DIM + key_cols
+            k_offsets = KEY_HEADS * KEY_HEAD_DIM + q_offsets
+            v_offsets = (
+                2 * KEY_HEADS * KEY_HEAD_DIM + value_head * VALUE_HEAD_DIM + value_rows
+            )
+            q = tl.load(
+                mixed_qkv + mixed_base + q_offsets, mask=key_mask, other=0.0
+            ).to(tl.float32)
+            k = tl.load(
+                mixed_qkv + mixed_base + k_offsets, mask=key_mask, other=0.0
+            ).to(tl.float32)
+            value = tl.load(
+                mixed_qkv + mixed_base + v_offsets, mask=value_mask, other=0.0
+            ).to(tl.float32)
+            if QK_L2NORM:
+                q = q * tl.rsqrt(tl.sum(q * q, axis=0) + 1.0e-6)
+                k = k * tl.rsqrt(tl.sum(k * k, axis=0) + 1.0e-6)
+            q *= scale
+
+            a_value = tl.load(a + token_i64 * stride_a_token + value_head).to(
+                tl.float32
+            )
+            b_value = tl.load(b + token_i64 * stride_b_token + value_head).to(
+                tl.float32
+            )
+            A_log_value = tl.load(A_log + value_head).to(tl.float32)
+            dt_bias_value = tl.load(dt_bias + value_head).to(tl.float32)
+            softplus_input = a_value + dt_bias_value
+            softplus = tl.where(
+                softplus_input <= 20.0,
+                tl.log(1.0 + tl.exp(softplus_input)),
+                softplus_input,
+            )
+            decay = tl.exp(-tl.exp(A_log_value) * softplus)
+            beta = tl.sigmoid(b_value).to(tl.bfloat16).to(tl.float32)
+
+            state *= decay
+            value -= tl.sum(state * k[None, :], axis=1)
+            value *= beta
+            state += value[:, None] * k[None, :]
+            decoded = tl.sum(state * q[None, :], axis=1)
+            output_offsets = (
+                token_i64 * stride_output_token
+                + value_head.to(tl.int64) * stride_output_head
+                + value_rows.to(tl.int64)
+            )
+            tl.store(output + output_offsets, decoded, mask=value_mask)
+
+            destination_idx = tl.load(
+                state_indices
+                + request.to(tl.int64) * stride_indices_request
+                + relative_token * stride_indices_column
+            ).to(tl.int64)
+            destination_offsets = (
+                destination_idx * stride_state_slot
+                + value_head.to(tl.int64) * stride_state_head
+                + value_rows[:, None].to(tl.int64) * stride_state_v
+                + key_cols[None, :].to(tl.int64)
+            )
+            tl.store(recurrent_state + destination_offsets, state, mask=state_mask)
+
+
+@triton.jit
+def _gated_rmsnorm_kernel(
+    output,
+    z,
+    norm_weight,
+    num_tokens,
+    error_code,
+    eps,
+    stride_output_token: tl.constexpr,
+    stride_output_head: tl.constexpr,
+    stride_z_token: tl.constexpr,
+    stride_z_head: tl.constexpr,
+    MAX_TOKENS: tl.constexpr,
+    VALUE_HEADS: tl.constexpr,
+    VALUE_HEAD_DIM: tl.constexpr,
+    SIGMOID_GATE: tl.constexpr,
+    NORM_WEIGHT_FP32: tl.constexpr,
+):
+    token_value_head = tl.program_id(0)
+    token = token_value_head // VALUE_HEADS
+    value_head = token_value_head % VALUE_HEADS
+    cols = tl.arange(0, VALUE_HEAD_DIM)
+    mask = cols < VALUE_HEAD_DIM
+    token_i64 = token.to(tl.int64)
+    output_offsets = (
+        token_i64 * stride_output_token
+        + value_head.to(tl.int64) * stride_output_head
+        + cols.to(tl.int64)
+    )
+    error = tl.load(error_code).to(tl.int32)
+    if error != 0:
+        tl.store(output + output_offsets, float("nan"), mask=mask)
+        return
+    live_tokens = tl.load(num_tokens).to(tl.int32)
+    if token >= tl.maximum(0, tl.minimum(live_tokens, MAX_TOKENS)):
+        tl.store(output + output_offsets, 0.0, mask=mask)
+        return
+
+    z_offsets = (
+        token_i64 * stride_z_token
+        + value_head.to(tl.int64) * stride_z_head
+        + cols.to(tl.int64)
+    )
+    values = tl.load(output + output_offsets, mask=mask, other=0.0).to(tl.float32)
+    variance = tl.sum(values * values, axis=0) / VALUE_HEAD_DIM
+    normalized = (values * tl.rsqrt(variance + eps)).to(tl.bfloat16)
+    if NORM_WEIGHT_FP32:
+        weight = tl.load(norm_weight + cols, mask=mask, other=0.0).to(tl.float32)
+        weighted = normalized.to(tl.float32) * weight
+    else:
+        weight = tl.load(norm_weight + cols, mask=mask, other=0.0).to(tl.bfloat16)
+        weighted = (normalized * weight).to(tl.bfloat16).to(tl.float32)
+    gate_input = tl.load(z + z_offsets, mask=mask, other=0.0).to(tl.float32)
+    gate = tl.sigmoid(gate_input)
+    if not SIGMOID_GATE:
+        gate *= gate_input
+    tl.store(output + output_offsets, weighted * gate, mask=mask)
+
+
+def _launch_gdn_decode(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    z: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    output: torch.Tensor,
+    duplicate_slots: torch.Tensor,
+    error_code: torch.Tensor,
+    eps: float,
+    scale: float,
+    max_tokens: int,
+    max_seqs: int,
+    max_state_slots: int,
+    state_index_columns: int,
+    key_heads: int,
+    value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    sigmoid_gate: bool,
+    qk_l2norm: bool,
+    block_v: int,
+    duplicate_table_size: int,
+    recurrent_num_warps: int,
+    norm_num_warps: int,
+) -> None:
+    _reset_validation_kernel[(triton.cdiv(duplicate_table_size, _VALIDATION_BLOCK),)](
+        duplicate_slots,
+        error_code,
+        TABLE_SIZE=int(duplicate_table_size),
+        BLOCK=_VALIDATION_BLOCK,
+        num_warps=1,
+        num_stages=1,
+    )
+    _validate_packed_metadata_kernel[(max_seqs,)](
+        query_start_loc,
+        num_accepted_tokens,
+        num_seqs,
+        num_tokens,
+        error_code,
+        MAX_SEQS=int(max_seqs),
+        MAX_TOKENS=int(max_tokens),
+        STATE_INDEX_COLUMNS=int(state_index_columns),
+        num_warps=1,
+        num_stages=1,
+    )
+    _validate_active_state_slots_kernel[(max_seqs * state_index_columns,)](
+        query_start_loc,
+        num_accepted_tokens,
+        state_indices,
+        num_seqs,
+        duplicate_slots,
+        error_code,
+        stride_indices_request=int(state_indices.stride(0)),
+        stride_indices_column=int(state_indices.stride(1)),
+        MAX_SEQS=int(max_seqs),
+        MAX_STATE_SLOTS=int(max_state_slots),
+        STATE_INDEX_COLUMNS=int(state_index_columns),
+        TABLE_SIZE=int(duplicate_table_size),
+        num_warps=1,
+        num_stages=1,
+    )
+    value_tiles = triton.cdiv(value_head_dim, block_v)
+    _packed_sequential_recurrent_decode_kernel[(value_tiles, max_seqs * value_heads)](
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        recurrent_state,
+        query_start_loc,
+        num_accepted_tokens,
+        state_indices,
+        num_seqs,
+        output,
+        error_code,
+        float(scale),
+        stride_mixed_token=int(mixed_qkv.stride(0)),
+        stride_a_token=int(a.stride(0)),
+        stride_b_token=int(b.stride(0)),
+        stride_state_slot=int(recurrent_state.stride(0)),
+        stride_state_head=int(recurrent_state.stride(1)),
+        stride_state_v=int(recurrent_state.stride(2)),
+        stride_indices_request=int(state_indices.stride(0)),
+        stride_indices_column=int(state_indices.stride(1)),
+        stride_output_token=int(output.stride(0)),
+        stride_output_head=int(output.stride(1)),
+        MAX_SEQS=int(max_seqs),
+        KEY_HEADS=int(key_heads),
+        VALUE_HEADS=int(value_heads),
+        KEY_HEAD_DIM=int(key_head_dim),
+        VALUE_HEAD_DIM=int(value_head_dim),
+        HEAD_RATIO=int(value_heads // key_heads),
+        STATE_INDEX_COLUMNS=int(state_index_columns),
+        BLOCK_V=int(block_v),
+        QK_L2NORM=bool(qk_l2norm),
+        num_warps=int(recurrent_num_warps),
+        num_stages=3,
+    )
+    _gated_rmsnorm_kernel[(max_tokens * value_heads,)](
+        output,
+        z,
+        norm_weight,
+        num_tokens,
+        error_code,
+        float(eps),
+        stride_output_token=int(output.stride(0)),
+        stride_output_head=int(output.stride(1)),
+        stride_z_token=int(z.stride(0)),
+        stride_z_head=int(z.stride(1)),
+        MAX_TOKENS=int(max_tokens),
+        VALUE_HEADS=int(value_heads),
+        VALUE_HEAD_DIM=int(value_head_dim),
+        SIGMOID_GATE=bool(sigmoid_gate),
+        NORM_WEIGHT_FP32=norm_weight.dtype == torch.float32,
+        num_warps=int(norm_num_warps),
+        num_stages=1,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::gdn_decode",
+    mutates_args=(
+        "recurrent_state",
+        "output",
+        "duplicate_slots",
+        "error_code",
+    ),
+)
+def _gdn_decode_op(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    z: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    output: torch.Tensor,
+    duplicate_slots: torch.Tensor,
+    error_code: torch.Tensor,
+    eps: float,
+    scale: float,
+    max_tokens: int,
+    max_seqs: int,
+    max_state_slots: int,
+    state_index_columns: int,
+    key_heads: int,
+    value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    sigmoid_gate: bool,
+    qk_l2norm: bool,
+    block_v: int,
+    duplicate_table_size: int,
+    recurrent_num_warps: int,
+    norm_num_warps: int,
+) -> None:
+    _launch_gdn_decode(
+        mixed_qkv,
+        a,
+        b,
+        z,
+        A_log,
+        dt_bias,
+        norm_weight,
+        recurrent_state,
+        query_start_loc,
+        num_accepted_tokens,
+        state_indices,
+        num_seqs,
+        num_tokens,
+        output,
+        duplicate_slots,
+        error_code,
+        eps,
+        scale,
+        max_tokens,
+        max_seqs,
+        max_state_slots,
+        state_index_columns,
+        key_heads,
+        value_heads,
+        key_head_dim,
+        value_head_dim,
+        sigmoid_gate,
+        qk_l2norm,
+        block_v,
+        duplicate_table_size,
+        recurrent_num_warps,
+        norm_num_warps,
+    )
+
+
+@_gdn_decode_op.register_fake
+def _gdn_decode_fake(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    z: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    output: torch.Tensor,
+    duplicate_slots: torch.Tensor,
+    error_code: torch.Tensor,
+    eps: float,
+    scale: float,
+    max_tokens: int,
+    max_seqs: int,
+    max_state_slots: int,
+    state_index_columns: int,
+    key_heads: int,
+    value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    sigmoid_gate: bool,
+    qk_l2norm: bool,
+    block_v: int,
+    duplicate_table_size: int,
+    recurrent_num_warps: int,
+    norm_num_warps: int,
+) -> None:
+    del mixed_qkv, a, b, z, A_log, dt_bias, norm_weight
+    del recurrent_state, query_start_loc, num_accepted_tokens, state_indices
+    del num_seqs, num_tokens, output, duplicate_slots, error_code
+    del eps, scale, max_tokens, max_seqs, max_state_slots, state_index_columns
+    del key_heads, value_heads, key_head_dim, value_head_dim, sigmoid_gate
+    del qk_l2norm, block_v, duplicate_table_size
+    del recurrent_num_warps, norm_num_warps
+
+
+def run_gdn_decode(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    z: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    output: torch.Tensor,
+    duplicate_slots: torch.Tensor,
+    error_code: torch.Tensor,
+    *,
+    eps: float,
+    scale: float,
+    max_tokens: int,
+    max_seqs: int,
+    max_state_slots: int,
+    state_index_columns: int,
+    key_heads: int,
+    value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    gate_activation: str,
+    qk_l2norm: bool,
+    block_v: int,
+    duplicate_table_size: int,
+    recurrent_num_warps: int,
+    norm_num_warps: int,
+) -> None:
+    torch.ops.b12x.gdn_decode(
+        mixed_qkv,
+        a,
+        b,
+        z,
+        A_log,
+        dt_bias,
+        norm_weight,
+        recurrent_state,
+        query_start_loc,
+        num_accepted_tokens,
+        state_indices,
+        num_seqs,
+        num_tokens,
+        output,
+        duplicate_slots,
+        error_code,
+        float(eps),
+        float(scale),
+        int(max_tokens),
+        int(max_seqs),
+        int(max_state_slots),
+        int(state_index_columns),
+        int(key_heads),
+        int(value_heads),
+        int(key_head_dim),
+        int(value_head_dim),
+        gate_activation == "sigmoid",
+        bool(qk_l2norm),
+        int(block_v),
+        int(duplicate_table_size),
+        int(recurrent_num_warps),
+        int(norm_num_warps),
+    )
+
+
+__all__ = ["run_gdn_decode"]
