@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
@@ -18,10 +19,15 @@ from b12x.sequence import ple_hash
 
 
 _SIGNED_INT64_MAX = (1 << 63) - 1
-_BF16_MODE = "bf16"
-_FP8_QUANT_MODE = "fp8_e4m3_per_tensor"
-_NVFP4_QUANT_MODE = "nvfp4_group16"
-_SUPPORTED_MODES = (_BF16_MODE, _FP8_QUANT_MODE, _NVFP4_QUANT_MODE)
+QuantMode = Literal["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"]
+_BF16_MODE: QuantMode = "bf16"
+_FP8_QUANT_MODE: QuantMode = "fp8_e4m3_per_tensor"
+_NVFP4_QUANT_MODE: QuantMode = "nvfp4_group16"
+_SUPPORTED_MODES: tuple[QuantMode, ...] = (
+    _BF16_MODE,
+    _FP8_QUANT_MODE,
+    _NVFP4_QUANT_MODE,
+)
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -71,7 +77,13 @@ def _overlaps(left: torch.Tensor, right: torch.Tensor) -> bool:
 
 @dataclass(frozen=True, kw_only=True)
 class Caps:
-    """Serving capacity, hash geometry inputs, and embedding storage policy."""
+    """Serving capacity, hash geometry, and persistent table storage policy.
+
+    ``quant_mode`` selects BF16 rows, FP8 E4M3 rows with one BF16
+    ``weight_scale``, or packed group-16 NVFP4 rows with FP8 E4M3
+    ``weight_scale`` blocks and one FP32 ``weight_scale_2`` global scale.
+    ``scale_dtype`` is validated against the selected storage format.
+    """
 
     device: torch.device | str
     max_tokens: int
@@ -86,7 +98,7 @@ class Caps:
     tp_size: int
     tp_rank: int
     table_alignment: int = 128
-    quant_mode: str = _FP8_QUANT_MODE
+    quant_mode: QuantMode = _FP8_QUANT_MODE
     scale_dtype: torch.dtype | None = None
     output_dtype: torch.dtype = torch.bfloat16
 
@@ -150,9 +162,7 @@ class Caps:
                     f"{scale_dtype}"
                 )
         else:
-            scale_dtype = (
-                torch.float8_e4m3fn if scale_dtype is None else scale_dtype
-            )
+            scale_dtype = torch.float8_e4m3fn if scale_dtype is None else scale_dtype
             if scale_dtype != torch.float8_e4m3fn:
                 raise TypeError(
                     "NVFP4 group-16 PLE scale must use torch.float8_e4m3fn, got "
@@ -188,6 +198,15 @@ class _ScratchLayout:
 
 @dataclass(frozen=True, kw_only=True)
 class Plan:
+    """Hash geometry, TP table shard, storage shapes, and scratch contract.
+
+    ``weight_scale`` and ``weight_scale_2`` retain checkpoint-compatible names.
+    For FP8, ``weight_scale`` is the BF16 per-table scale and
+    ``weight_scale_2`` is absent. For NVFP4, ``weight_scale`` contains one FP8
+    E4M3 block scale per group of 16 values and ``weight_scale_2`` is the FP32
+    global scale.
+    """
+
     caps: Caps
     multipliers: torch.Tensor
     prime_sizes: torch.Tensor
@@ -234,6 +253,13 @@ class Plan:
 
 @dataclass(frozen=True, kw_only=True)
 class Binding:
+    """Caller-owned fused hash, gather, and inline-dequantization tensors.
+
+    Persistent weights and scales are read-only. ``out`` and ``error_code``
+    are mutable caller-owned buffers; hash IDs and hash scratch remain private
+    implementation details.
+    """
+
     plan: Plan
     scratch: torch.Tensor
     weight: torch.Tensor

@@ -51,8 +51,9 @@ parallel).
 
 **the rest** — `norm.mhc` (fused RMSNorm + hyper-connection residual),
 `norm.hyperconnection` (learned multi-stream residual primitives),
-`sequence.{ple_hash,ple}` (prime-hashed embeddings and short-convolution
-state), `sequence.gdn_decode` (packed recurrent decode),
+`sequence.{ple_hash,ple_embedding,ple}` (prime-hashed embedding IDs, fused
+quantized lookup, and short-convolution state), `sequence.gdn_decode` (packed
+recurrent decode),
 `sequence.mtp_feedback` (MTP token/multi-stream feedback fusion),
 `quantization.{nvfp4,mxfp8}` (row quantizers), and `comm.pcie` (IPC-backed PCIe
 collectives). The Qwen3.8-Flash-Next QSA, HyperConnection, PLE, GDN decode,

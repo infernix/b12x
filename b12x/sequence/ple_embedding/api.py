@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from ..._lib.gating import default_is_supported
 from . import META
-from ._contracts import Binding, Caps, Plan, bind, plan, run
+from ._contracts import Binding, Caps, Plan, QuantMode, bind, plan, run
 
 
 def is_supported(device=None) -> bool:
@@ -13,6 +13,7 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "QuantMode",
     "Caps",
     "Plan",
     "Binding",

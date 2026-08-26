@@ -24,6 +24,7 @@ META = OpMeta(
     group="sequence",
     api_style="planned",
     entry_points=(
+        "QuantMode",
         "Caps",
         "Plan",
         "Binding",
@@ -41,7 +42,7 @@ META = OpMeta(
     requires=("triton",),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
-        commit="3a437ab51680",
+        commit="74d2023e6cdb705568011110ad3f8e9b0806b647",
         paths=("b12x/sequence/ple_embedding/",),
     ),
     test_path="tests/sequence/test_ple_embedding.py",
@@ -55,6 +56,15 @@ META = OpMeta(
 )
 
 if TYPE_CHECKING:
-    from .api import Binding, Caps, Plan, bind, is_supported, plan, run  # noqa: F401
+    from .api import (  # noqa: F401
+        Binding,
+        Caps,
+        Plan,
+        QuantMode,
+        bind,
+        is_supported,
+        plan,
+        run,
+    )
 
 install_lazy_api(globals(), META)

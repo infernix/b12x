@@ -46,6 +46,8 @@ def _next_power_of_two(value: int) -> int:
 
 @dataclass(frozen=True, kw_only=True)
 class Caps:
+    """Serving capacity, recurrent-state geometry, and gate policy."""
+
     device: torch.device | str
     max_tokens: int
     max_seqs: int
@@ -135,6 +137,8 @@ class Caps:
 
 @dataclass(frozen=True)
 class Plan:
+    """Fixed GDN launch policy and caller-allocated scratch contract."""
+
     caps: Caps
     duplicate_table_size: int
     duplicate_table_offset_bytes: int
@@ -166,6 +170,12 @@ class Plan:
 
 @dataclass(frozen=True)
 class Binding:
+    """Caller-owned GDN inputs, recurrent state, output, and scratch views.
+
+    ``recurrent_state`` is updated transactionally. All projection and norm
+    tensors are read-only; ``output`` is the caller-owned result buffer.
+    """
+
     plan: Plan
     scratch: torch.Tensor
     duplicate_slots: torch.Tensor
@@ -187,6 +197,8 @@ class Binding:
 
 
 def plan(caps: Caps) -> Plan:
+    """Plan GDN decode for a fixed serving capacity and state layout."""
+
     if not isinstance(caps, Caps):
         raise TypeError(f"caps must be Caps, got {type(caps)!r}")
     error_code_offset_bytes = align_up(0, SCRATCH_ALIGN_BYTES)

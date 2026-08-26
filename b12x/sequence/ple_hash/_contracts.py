@@ -140,6 +140,12 @@ class Caps:
 
 @dataclass(frozen=True, kw_only=True)
 class Binding:
+    """Caller-owned PLE hash inputs, output, and scratch views.
+
+    Token and request metadata are read-only. ``out`` and ``error_code`` are
+    mutable result buffers; ``request_ids`` is an internal scratch view.
+    """
+
     plan: Plan
     scratch: torch.Tensor
     token_ids: torch.Tensor
@@ -161,6 +167,8 @@ class _ScratchLayout:
 
 @dataclass(frozen=True, kw_only=True)
 class Plan:
+    """Immutable hash geometry and caller-allocated scratch contract."""
+
     caps: Caps
     prime_sizes: torch.Tensor
     table_offsets: torch.Tensor

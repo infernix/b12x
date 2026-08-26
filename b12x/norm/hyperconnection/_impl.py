@@ -22,6 +22,8 @@ def _canonical_device(device: torch.device | str) -> torch.device:
 
 @dataclass(frozen=True, kw_only=True)
 class HyperConnectionCaps:
+    """Token capacity and static multi-stream HyperConnection geometry."""
+
     device: torch.device | str
     max_tokens: int
     hidden_size: int
@@ -56,6 +58,8 @@ class HyperConnectionCaps:
 
 @dataclass(frozen=True)
 class HyperConnectionBinding:
+    """Caller-owned output views for one fixed-capacity execution plan."""
+
     plan: "HyperConnectionPlan"
     tokens: int
     normalized: torch.Tensor
@@ -66,6 +70,8 @@ class HyperConnectionBinding:
 
 @dataclass(frozen=True)
 class HyperConnectionPlan:
+    """HyperConnection launch policy with no anonymous scratch requirement."""
+
     caps: HyperConnectionCaps
     reduction_block_h: int
     pointwise_block: int
@@ -160,6 +166,8 @@ class HyperConnectionPlan:
 
 
 def plan_hyperconnection(caps: HyperConnectionCaps) -> HyperConnectionPlan:
+    """Plan fixed launch geometry for the supplied serving capacity."""
+
     if not isinstance(caps, HyperConnectionCaps):
         raise TypeError(f"caps must be HyperConnectionCaps, got {type(caps)!r}")
     reduction_block_h = 1 << (caps.hidden_size - 1).bit_length()

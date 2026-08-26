@@ -44,6 +44,8 @@ def _next_power_of_two(value: int) -> int:
 
 @dataclass(frozen=True, kw_only=True)
 class Caps:
+    """Token capacity and static token/multi-stream feedback geometry."""
+
     device: torch.device | str
     max_tokens: int
     hidden_size: int = 2560
@@ -86,6 +88,8 @@ class Caps:
 
 @dataclass(frozen=True)
 class Plan:
+    """Fixed MTP feedback launch policy and scratch-buffer contract."""
+
     caps: Caps
     token_normalized_offset_bytes: int
     state_partial_sums_offset_bytes: int
@@ -124,6 +128,12 @@ class Plan:
 
 @dataclass(frozen=True)
 class Binding:
+    """Caller-owned MTP feedback inputs, output, and scratch views.
+
+    Model inputs and weights are read-only; ``output`` is the mutable result
+    buffer and all intermediate tensors are views of ``scratch``.
+    """
+
     plan: Plan
     tokens: int
     scratch: torch.Tensor
@@ -141,6 +151,8 @@ class Binding:
 
 
 def plan(caps: Caps) -> Plan:
+    """Plan MTP feedback fusion for a fixed token capacity."""
+
     if not isinstance(caps, Caps):
         raise TypeError(f"caps must be Caps, got {type(caps)!r}")
     h = caps.hidden_size

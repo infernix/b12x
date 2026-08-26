@@ -34,7 +34,7 @@ META = OpMeta(
     requires=("triton",),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
-        commit="3a437ab51680",
+        commit="fa097786643f49d9e9591fd8b2eb0cb3398d8f79",
         paths=("b12x/sequence/mtp_feedback/",),
     ),
     test_path="tests/sequence/test_mtp_feedback.py",

@@ -1108,7 +1108,6 @@ def test_qsa_shared_pool_cuda_graph_replay_has_stable_addresses_and_allocation()
         max_speculative_tokens=1,
         main_page_size=64,
         compressed_page_size=16,
-        use_cuda_graph=True,
     )
     binding = _allocate_shared_compressed_raw_binding(caps)
     binding.main_block_table[:, 0] = 0
@@ -1602,7 +1601,6 @@ def _assert_qsa_negative_one_anchor_rejects_multi_token_initialization(
         max_speculative_tokens=2,
         main_page_size=64,
         compressed_page_size=16,
-        use_cuda_graph=cuda_graph_replay,
     )
     binding = _allocate_binding(caps)
     binding.main_block_table[0, 0] = 0
@@ -2190,7 +2188,6 @@ def test_qsa_tp4_geometry_matches_reference_under_cuda_graph_replay() -> None:
         position_axes=3,
         mrope_sections=(11, 11, 10),
         mrope_interleaved=True,
-        use_cuda_graph=True,
     )
     binding = _allocate_binding(caps)
     binding.main_block_table[0, 0] = 0

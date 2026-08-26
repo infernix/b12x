@@ -182,6 +182,12 @@ class LayerCaps:
 
 @dataclass(frozen=True, kw_only=True)
 class LayerBinding:
+    """Caller-owned PLE residual inputs, convolution state, and scratch views.
+
+    ``conv_state`` and ``out`` are mutable. Projection tensors and norm weights
+    are read-only; normalized inputs and gathered state are scratch views.
+    """
+
     plan: LayerPlan
     scratch: torch.Tensor
     residual: torch.Tensor
@@ -217,6 +223,8 @@ class _LayerScratchLayout:
 
 @dataclass(frozen=True, kw_only=True)
 class LayerPlan:
+    """Fixed PLE residual-state geometry and scratch-buffer contract."""
+
     caps: LayerCaps
     layout: _LayerScratchLayout
     _scratch_specs: tuple[ScratchBufferSpec, ...]

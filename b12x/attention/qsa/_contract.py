@@ -191,7 +191,6 @@ class Caps:
     mrope_interleaved: bool = False
     rms_norm_eps: float = 1e-6
     dtype: torch.dtype = torch.bfloat16
-    use_cuda_graph: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "device", _canonical_device(self.device))
@@ -386,6 +385,8 @@ class _ScratchLayout:
 
 @dataclass(frozen=True)
 class Plan:
+    """Fixed-capacity QSA policy and caller-allocated scratch contract."""
+
     caps: Caps
     score_chunk_groups: int
     score_workspace_width: int
@@ -406,6 +407,13 @@ class Plan:
 
 @dataclass(frozen=True)
 class Binding:
+    """Caller-owned QSA cache, state, output, and scratch views.
+
+    The main K/V cache and its block table are read-only. Compressed-cache and
+    raw-ring tensors are mutable decode state; ``output`` and
+    ``selected_positions`` are caller-owned result buffers.
+    """
+
     plan: Plan
     shared_compressed_raw_pool: bool
     scratch: torch.Tensor
