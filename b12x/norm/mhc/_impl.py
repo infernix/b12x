@@ -30,6 +30,7 @@ MHC_DEFAULT_BLOCK_H = 512
 MHC_SOURCE_TILE_H = 128
 MHC_GRAM_BLOCK_H = 1024
 MHC_SUPPORTED_HIDDEN_SIZES = (4096, 7168)
+MHC_SUPPORTED_RMS_EPS = (1.0e-6, 1.0e-5)
 
 
 def _required_mhc_split_k(hidden_size: int, block_k: int) -> int:
@@ -784,7 +785,7 @@ def _b12x_mhc_pre_impl(
             block_k=block_k,
             block_h=block_h,
         )
-        and float(rms_eps) == 1.0e-6
+        and float(rms_eps) in MHC_SUPPORTED_RMS_EPS
         and float(hc_eps) == 1.0e-6
         and sinkhorn_iters == 20
     ):
@@ -839,9 +840,11 @@ def _b12x_mhc_pre_impl(
         f"(hidden_size divisible by {MHC_GRAM_BLOCK_H}, "
         f"split_k=hc_mult*hidden_size/{MHC_DEFAULT_BLOCK_K}, "
         f"block_k={MHC_DEFAULT_BLOCK_K}, block_h={MHC_DEFAULT_BLOCK_H}, "
+        f"rms_eps in {MHC_SUPPORTED_RMS_EPS}, hc_eps=1e-06, "
         "sinkhorn_iters=20); got "
         f"hidden_size={hidden_size}, split_k={split_k}, block_k={block_k}, "
-        f"block_h={block_h}, sinkhorn_iters={sinkhorn_iters}"
+        f"block_h={block_h}, rms_eps={rms_eps}, hc_eps={hc_eps}, "
+        f"sinkhorn_iters={sinkhorn_iters}"
     )
 
 
@@ -1085,7 +1088,7 @@ def _b12x_mhc_post_pre_impl(
             block_k=block_k,
             block_h=block_h,
         )
-        and float(rms_eps) == 1.0e-6
+        and float(rms_eps) in MHC_SUPPORTED_RMS_EPS
         and float(hc_eps) == 1.0e-6
         and sinkhorn_iters == 20
     ):
@@ -1278,9 +1281,11 @@ def _b12x_mhc_post_pre_impl(
         f"(hidden_size divisible by {MHC_GRAM_BLOCK_H}, "
         f"split_k=hc_mult*hidden_size/{MHC_DEFAULT_BLOCK_K}, "
         f"block_k={MHC_DEFAULT_BLOCK_K}, block_h={MHC_DEFAULT_BLOCK_H}, "
+        f"rms_eps in {MHC_SUPPORTED_RMS_EPS}, hc_eps=1e-06, "
         "sinkhorn_iters=20); got "
         f"hidden_size={hidden_size}, split_k={split_k}, block_k={block_k}, "
-        f"block_h={block_h}, sinkhorn_iters={sinkhorn_iters}"
+        f"block_h={block_h}, rms_eps={rms_eps}, hc_eps={hc_eps}, "
+        f"sinkhorn_iters={sinkhorn_iters}"
     )
 
 

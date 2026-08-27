@@ -82,6 +82,8 @@ def _validate_active_state_slots_kernel(
     MAX_STATE_SLOTS: tl.constexpr,
     STATE_INDEX_COLUMNS: tl.constexpr,
     TABLE_SIZE: tl.constexpr,
+    HAS_NULL_STATE_INDEX: tl.constexpr,
+    NULL_STATE_INDEX: tl.constexpr,
 ):
     cell = tl.program_id(0)
     request = cell // STATE_INDEX_COLUMNS
@@ -97,11 +99,26 @@ def _validate_active_state_slots_kernel(
     if not active:
         return
 
+    if HAS_NULL_STATE_INDEX:
+        safe_accepted_column = tl.maximum(
+            0, tl.minimum(accepted_column, STATE_INDEX_COLUMNS - 1)
+        )
+        source_idx = tl.load(
+            state_indices
+            + request.to(tl.int64) * stride_indices_request
+            + safe_accepted_column.to(tl.int64) * stride_indices_column
+        ).to(tl.int64)
+        if source_idx == NULL_STATE_INDEX:
+            return
+
     state_idx = tl.load(
         state_indices
         + request.to(tl.int64) * stride_indices_request
         + column.to(tl.int64) * stride_indices_column
     ).to(tl.int64)
+    if HAS_NULL_STATE_INDEX:
+        if state_idx == NULL_STATE_INDEX:
+            return
     if (state_idx < 0) | (state_idx >= MAX_STATE_SLOTS):
         tl.atomic_or(error_code, 4)
         return
@@ -138,9 +155,13 @@ def _packed_sequential_recurrent_decode_kernel(
     output,
     error_code,
     scale,
+    lower_bound,
     stride_mixed_token: tl.constexpr,
     stride_a_token: tl.constexpr,
+    stride_a_head: tl.constexpr,
     stride_b_token: tl.constexpr,
+    stride_b_head: tl.constexpr,
+    stride_dt_bias_head: tl.constexpr,
     stride_state_slot: tl.constexpr,
     stride_state_head: tl.constexpr,
     stride_state_v: tl.constexpr,
@@ -157,6 +178,9 @@ def _packed_sequential_recurrent_decode_kernel(
     STATE_INDEX_COLUMNS: tl.constexpr,
     BLOCK_V: tl.constexpr,
     QK_L2NORM: tl.constexpr,
+    LOWER_BOUNDED_KDA: tl.constexpr,
+    HAS_NULL_STATE_INDEX: tl.constexpr,
+    NULL_STATE_INDEX: tl.constexpr,
 ):
     value_tile = tl.program_id(0)
     request_value_head = tl.program_id(1)
@@ -186,6 +210,19 @@ def _packed_sequential_recurrent_decode_kernel(
     key_mask = key_cols < KEY_HEAD_DIM
     value_mask = value_rows < VALUE_HEAD_DIM
     state_mask = value_mask[:, None] & key_mask[None, :]
+
+    if HAS_NULL_STATE_INDEX:
+        if source_idx == NULL_STATE_INDEX:
+            for relative_token in range(STATE_INDEX_COLUMNS):
+                if relative_token < (end - start):
+                    token = start + relative_token
+                    output_offsets = (
+                        token.to(tl.int64) * stride_output_token
+                        + value_head.to(tl.int64) * stride_output_head
+                        + value_rows.to(tl.int64)
+                    )
+                    tl.store(output + output_offsets, 0.0, mask=value_mask)
+            return
 
     # Pool-scaled arithmetic is explicitly Int64. Valid serving pools can place
     # recycled state slots beyond the signed-32-bit element-offset boundary.
@@ -223,24 +260,52 @@ def _packed_sequential_recurrent_decode_kernel(
                 k = k * tl.rsqrt(tl.sum(k * k, axis=0) + 1.0e-6)
             q *= scale
 
-            a_value = tl.load(a + token_i64 * stride_a_token + value_head).to(
-                tl.float32
-            )
-            b_value = tl.load(b + token_i64 * stride_b_token + value_head).to(
-                tl.float32
-            )
+            b_value = tl.load(
+                b
+                + token_i64 * stride_b_token
+                + value_head.to(tl.int64) * stride_b_head
+            ).to(tl.float32)
             A_log_value = tl.load(A_log + value_head).to(tl.float32)
-            dt_bias_value = tl.load(dt_bias + value_head).to(tl.float32)
-            softplus_input = a_value + dt_bias_value
-            softplus = tl.where(
-                softplus_input <= 20.0,
-                tl.log(1.0 + tl.exp(softplus_input)),
-                softplus_input,
-            )
-            decay = tl.exp(-tl.exp(A_log_value) * softplus)
-            beta = tl.sigmoid(b_value).to(tl.bfloat16).to(tl.float32)
+            if LOWER_BOUNDED_KDA:
+                raw_gate = tl.load(
+                    a
+                    + token_i64 * stride_a_token
+                    + value_head.to(tl.int64) * stride_a_head
+                    + key_cols.to(tl.int64),
+                    mask=key_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                gate_bias = tl.load(
+                    dt_bias
+                    + value_head.to(tl.int64) * stride_dt_bias_head
+                    + key_cols.to(tl.int64),
+                    mask=key_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                log_decay = lower_bound * tl.sigmoid(
+                    tl.exp(A_log_value) * (raw_gate + gate_bias)
+                )
+                state *= tl.exp(log_decay)[None, :]
+                beta = tl.sigmoid(b_value)
+            else:
+                a_value = tl.load(
+                    a
+                    + token_i64 * stride_a_token
+                    + value_head.to(tl.int64) * stride_a_head
+                ).to(tl.float32)
+                dt_bias_value = tl.load(
+                    dt_bias + value_head.to(tl.int64) * stride_dt_bias_head
+                ).to(tl.float32)
+                softplus_input = a_value + dt_bias_value
+                softplus = tl.where(
+                    softplus_input <= 20.0,
+                    tl.log(1.0 + tl.exp(softplus_input)),
+                    softplus_input,
+                )
+                decay = tl.exp(-tl.exp(A_log_value) * softplus)
+                state *= decay
+                beta = tl.sigmoid(b_value).to(tl.bfloat16).to(tl.float32)
 
-            state *= decay
             value -= tl.sum(state * k[None, :], axis=1)
             value *= beta
             state += value[:, None] * k[None, :]
@@ -263,7 +328,14 @@ def _packed_sequential_recurrent_decode_kernel(
                 + value_rows[:, None].to(tl.int64) * stride_state_v
                 + key_cols[None, :].to(tl.int64)
             )
-            tl.store(recurrent_state + destination_offsets, state, mask=state_mask)
+            destination_mask = state_mask
+            if HAS_NULL_STATE_INDEX:
+                destination_mask &= destination_idx != NULL_STATE_INDEX
+            tl.store(
+                recurrent_state + destination_offsets,
+                state,
+                mask=destination_mask,
+            )
 
 
 @triton.jit
@@ -283,6 +355,7 @@ def _gated_rmsnorm_kernel(
     VALUE_HEAD_DIM: tl.constexpr,
     SIGMOID_GATE: tl.constexpr,
     NORM_WEIGHT_FP32: tl.constexpr,
+    KDA_NORM_FP32: tl.constexpr,
 ):
     token_value_head = tl.program_id(0)
     token = token_value_head // VALUE_HEADS
@@ -311,11 +384,16 @@ def _gated_rmsnorm_kernel(
     )
     values = tl.load(output + output_offsets, mask=mask, other=0.0).to(tl.float32)
     variance = tl.sum(values * values, axis=0) / VALUE_HEAD_DIM
-    normalized = (values * tl.rsqrt(variance + eps)).to(tl.bfloat16)
-    if NORM_WEIGHT_FP32:
+    normalized = values * tl.rsqrt(variance + eps)
+    if KDA_NORM_FP32:
+        weight = tl.load(norm_weight + cols, mask=mask, other=0.0).to(tl.float32)
+        weighted = normalized * weight
+    elif NORM_WEIGHT_FP32:
+        normalized = normalized.to(tl.bfloat16)
         weight = tl.load(norm_weight + cols, mask=mask, other=0.0).to(tl.float32)
         weighted = normalized.to(tl.float32) * weight
     else:
+        normalized = normalized.to(tl.bfloat16)
         weight = tl.load(norm_weight + cols, mask=mask, other=0.0).to(tl.bfloat16)
         weighted = (normalized * weight).to(tl.bfloat16).to(tl.float32)
     gate_input = tl.load(z + z_offsets, mask=mask, other=0.0).to(tl.float32)
@@ -344,6 +422,7 @@ def _launch_gdn_decode(
     error_code: torch.Tensor,
     eps: float,
     scale: float,
+    lower_bound: float,
     max_tokens: int,
     max_seqs: int,
     max_state_slots: int,
@@ -354,6 +433,9 @@ def _launch_gdn_decode(
     value_head_dim: int,
     sigmoid_gate: bool,
     qk_l2norm: bool,
+    lower_bounded_kda: bool,
+    has_null_state_index: bool,
+    null_state_index: int,
     block_v: int,
     duplicate_table_size: int,
     recurrent_num_warps: int,
@@ -392,6 +474,8 @@ def _launch_gdn_decode(
         MAX_STATE_SLOTS=int(max_state_slots),
         STATE_INDEX_COLUMNS=int(state_index_columns),
         TABLE_SIZE=int(duplicate_table_size),
+        HAS_NULL_STATE_INDEX=bool(has_null_state_index),
+        NULL_STATE_INDEX=int(null_state_index),
         num_warps=1,
         num_stages=1,
     )
@@ -410,9 +494,13 @@ def _launch_gdn_decode(
         output,
         error_code,
         float(scale),
+        float(lower_bound),
         stride_mixed_token=int(mixed_qkv.stride(0)),
         stride_a_token=int(a.stride(0)),
+        stride_a_head=int(a.stride(1)),
         stride_b_token=int(b.stride(0)),
+        stride_b_head=int(b.stride(1)),
+        stride_dt_bias_head=int(dt_bias.stride(0)),
         stride_state_slot=int(recurrent_state.stride(0)),
         stride_state_head=int(recurrent_state.stride(1)),
         stride_state_v=int(recurrent_state.stride(2)),
@@ -429,6 +517,9 @@ def _launch_gdn_decode(
         STATE_INDEX_COLUMNS=int(state_index_columns),
         BLOCK_V=int(block_v),
         QK_L2NORM=bool(qk_l2norm),
+        LOWER_BOUNDED_KDA=bool(lower_bounded_kda),
+        HAS_NULL_STATE_INDEX=bool(has_null_state_index),
+        NULL_STATE_INDEX=int(null_state_index),
         num_warps=int(recurrent_num_warps),
         num_stages=3,
     )
@@ -448,6 +539,7 @@ def _launch_gdn_decode(
         VALUE_HEAD_DIM=int(value_head_dim),
         SIGMOID_GATE=bool(sigmoid_gate),
         NORM_WEIGHT_FP32=norm_weight.dtype == torch.float32,
+        KDA_NORM_FP32=bool(lower_bounded_kda),
         num_warps=int(norm_num_warps),
         num_stages=1,
     )
@@ -481,6 +573,7 @@ def _gdn_decode_op(
     error_code: torch.Tensor,
     eps: float,
     scale: float,
+    lower_bound: float,
     max_tokens: int,
     max_seqs: int,
     max_state_slots: int,
@@ -491,6 +584,9 @@ def _gdn_decode_op(
     value_head_dim: int,
     sigmoid_gate: bool,
     qk_l2norm: bool,
+    lower_bounded_kda: bool,
+    has_null_state_index: bool,
+    null_state_index: int,
     block_v: int,
     duplicate_table_size: int,
     recurrent_num_warps: int,
@@ -515,6 +611,7 @@ def _gdn_decode_op(
         error_code,
         eps,
         scale,
+        lower_bound,
         max_tokens,
         max_seqs,
         max_state_slots,
@@ -525,6 +622,9 @@ def _gdn_decode_op(
         value_head_dim,
         sigmoid_gate,
         qk_l2norm,
+        lower_bounded_kda,
+        has_null_state_index,
+        null_state_index,
         block_v,
         duplicate_table_size,
         recurrent_num_warps,
@@ -552,6 +652,7 @@ def _gdn_decode_fake(
     error_code: torch.Tensor,
     eps: float,
     scale: float,
+    lower_bound: float,
     max_tokens: int,
     max_seqs: int,
     max_state_slots: int,
@@ -562,6 +663,9 @@ def _gdn_decode_fake(
     value_head_dim: int,
     sigmoid_gate: bool,
     qk_l2norm: bool,
+    lower_bounded_kda: bool,
+    has_null_state_index: bool,
+    null_state_index: int,
     block_v: int,
     duplicate_table_size: int,
     recurrent_num_warps: int,
@@ -570,9 +674,11 @@ def _gdn_decode_fake(
     del mixed_qkv, a, b, z, A_log, dt_bias, norm_weight
     del recurrent_state, query_start_loc, num_accepted_tokens, state_indices
     del num_seqs, num_tokens, output, duplicate_slots, error_code
-    del eps, scale, max_tokens, max_seqs, max_state_slots, state_index_columns
+    del eps, scale, lower_bound, max_tokens, max_seqs, max_state_slots
+    del state_index_columns
     del key_heads, value_heads, key_head_dim, value_head_dim, sigmoid_gate
-    del qk_l2norm, block_v, duplicate_table_size
+    del qk_l2norm, lower_bounded_kda, has_null_state_index, null_state_index
+    del block_v, duplicate_table_size
     del recurrent_num_warps, norm_num_warps
 
 
@@ -605,7 +711,10 @@ def run_gdn_decode(
     key_head_dim: int,
     value_head_dim: int,
     gate_activation: str,
+    decay_recipe: str,
+    lower_bound: float,
     qk_l2norm: bool,
+    null_state_index: int | None,
     block_v: int,
     duplicate_table_size: int,
     recurrent_num_warps: int,
@@ -630,6 +739,7 @@ def run_gdn_decode(
         error_code,
         float(eps),
         float(scale),
+        float(lower_bound),
         int(max_tokens),
         int(max_seqs),
         int(max_state_slots),
@@ -640,6 +750,9 @@ def run_gdn_decode(
         int(value_head_dim),
         gate_activation == "sigmoid",
         bool(qk_l2norm),
+        decay_recipe == "kda",
+        null_state_index is not None,
+        0 if null_state_index is None else int(null_state_index),
         int(block_v),
         int(duplicate_table_size),
         int(recurrent_num_warps),

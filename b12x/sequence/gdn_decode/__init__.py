@@ -1,10 +1,14 @@
 """Stateful packed Gated Delta Network decode.
 
-The op consumes already-projected and convolved packed Q/K/V plus the A, B,
-and Z projections. It updates a caller-owned recurrent-state pool in place,
-then applies per-value-head RMSNorm and either a SiLU or sigmoid output gate.
-Projection GEMMs and causal-convolution state are intentionally outside this
-package.
+The op consumes already-projected and convolved packed Q/K/V plus decay,
+update, and output-gate projections. It updates a caller-owned recurrent-state
+pool in place, then applies per-value-head RMSNorm and either a SiLU or sigmoid
+output gate. Projection GEMMs and causal-convolution state are intentionally
+outside this package.
+
+``bind`` / ``run`` implements scalar per-head Qwen GDN decay. ``bind_kda`` /
+``run_kda`` implements GLM/Kimi lower-bounded KDA decay from a per-key-coordinate
+raw gate while preserving the same state, transaction, and serving lifecycle.
 
 The recurrent-state pool uses the optimized physical layout
 ``[slot, value_head, value_dim, key_dim]``. This is the transpose of the
@@ -20,7 +24,10 @@ Packed requests use fixed-capacity device metadata. Request ``r`` consumes
 from state-index column ``num_accepted_tokens[r] - 1``. Tokens execute
 sequentially per request and persist their post-token checkpoints to columns
 starting at zero. A one-column plan with one token per request is ordinary
-decode.
+decode. ``Caps.null_state_index`` may reserve one index as a null checkpoint.
+Requests whose selected initial checkpoint is null produce zero output without
+reading or writing recurrent state; null destination cells are not written.
+The default ``None`` leaves every in-range slot, including slot zero, usable.
 
 Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` -> ``run``. Runtime launches
 use caller-owned scratch, allocate no tensor storage, and are opaque to
@@ -44,14 +51,17 @@ META = OpMeta(
         "Caps",
         "Plan",
         "Binding",
+        "KdaBinding",
         "plan",
         "bind",
+        "bind_kda",
         "run",
+        "run_kda",
         "reference",
         "is_supported",
     ),
     dtypes=("bf16", "fp32", "int32", "int64"),
-    recipes=("silu", "sigmoid"),
+    recipes=("silu", "sigmoid", "lower_bounded_kda"),
     requires=("triton",),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
@@ -66,9 +76,10 @@ META = OpMeta(
     notes=(
         "Qualified for 128-wide K/V heads, value/key ratios 1,2,3,4,8, "
         "BF16 model tensors, BF16 or FP32 norm weights, and BF16 or FP32 "
-        "recurrent state. The Triton "
-        "implementation is a correctness reference and is not "
-        "throughput-qualified."
+        "recurrent state. Lower-bounded KDA is qualified for equal 128-wide "
+        "Q/K/V head counts, per-key decay gates, scalar update gates, and a "
+        "sigmoid output gate. The Triton implementation is a correctness "
+        "reference and is not throughput-qualified."
     ),
 )
 
@@ -76,12 +87,15 @@ if TYPE_CHECKING:
     from .api import (  # noqa: F401
         Binding,
         Caps,
+        KdaBinding,
         Plan,
         bind,
+        bind_kda,
         is_supported,
         plan,
         reference,
         run,
+        run_kda,
     )
 
 install_lazy_api(globals(), META)

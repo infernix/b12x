@@ -61,6 +61,7 @@ class Caps:
     state_dtype: torch.dtype = torch.float32
     gate_activation: GateActivation = "silu"
     qk_l2norm: bool = True
+    null_state_index: int | None = None
 
     def __post_init__(self) -> None:
         device = _canonical_device(self.device)
@@ -117,11 +118,19 @@ class Caps:
                 "gate_activation must be 'silu' or 'sigmoid', got "
                 f"{self.gate_activation!r}"
             )
+        null_state_index = self.null_state_index
+        if null_state_index is not None:
+            if isinstance(null_state_index, bool):
+                raise TypeError("null_state_index must be an integer or None")
+            null_state_index = int(null_state_index)
+            if not -(1 << 63) <= null_state_index < (1 << 63):
+                raise ValueError("null_state_index must fit in a signed 64-bit integer")
         object.__setattr__(self, "device", device)
         object.__setattr__(self, "key_head_dim", key_head_dim)
         object.__setattr__(self, "value_head_dim", value_head_dim)
         object.__setattr__(self, "state_index_columns", columns)
         object.__setattr__(self, "qk_l2norm", bool(self.qk_l2norm))
+        object.__setattr__(self, "null_state_index", null_state_index)
 
     @property
     def value_heads_per_key_head(self) -> int:
@@ -183,6 +192,34 @@ class Binding:
     mixed_qkv: torch.Tensor
     a: torch.Tensor
     b: torch.Tensor
+    z: torch.Tensor
+    A_log: torch.Tensor
+    dt_bias: torch.Tensor
+    norm_weight: torch.Tensor
+    recurrent_state: torch.Tensor
+    query_start_loc: torch.Tensor
+    num_accepted_tokens: torch.Tensor
+    state_indices: torch.Tensor
+    num_seqs: torch.Tensor
+    num_tokens: torch.Tensor
+    output: torch.Tensor
+
+
+@dataclass(frozen=True)
+class KdaBinding:
+    """Caller-owned inputs for lower-bounded KDA decode.
+
+    ``raw_g`` is the unactivated per-key-coordinate forget gate and
+    ``raw_beta`` is the unactivated scalar update gate for each head.
+    """
+
+    plan: Plan
+    scratch: torch.Tensor
+    duplicate_slots: torch.Tensor
+    error_code: torch.Tensor
+    mixed_qkv: torch.Tensor
+    raw_g: torch.Tensor
+    raw_beta: torch.Tensor
     z: torch.Tensor
     A_log: torch.Tensor
     dt_bias: torch.Tensor
@@ -478,6 +515,210 @@ def bind(
     )
 
 
+def bind_kda(
+    plan: Plan,
+    *,
+    scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+    mixed_qkv: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    z: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    output: torch.Tensor,
+) -> KdaBinding:
+    """Bind lower-bounded KDA tensors to a GDN decode plan.
+
+    KDA uses one Q/K/V head per recurrent state head. ``raw_g`` has shape
+    ``[max_tokens, heads, key_head_dim]`` and ``raw_beta`` has shape
+    ``[max_tokens, heads]``. The recurrent-state and packed-request contracts
+    are identical to :func:`bind`.
+    """
+    if not isinstance(plan, Plan):
+        raise TypeError(f"plan must be Plan, got {type(plan)!r}")
+    caps = plan.caps
+    if caps.key_heads != caps.value_heads:
+        raise ValueError(
+            "KDA decode requires key_heads=value_heads, got "
+            f"{caps.key_heads}/{caps.value_heads}"
+        )
+    if caps.gate_activation != "sigmoid":
+        raise ValueError(
+            "KDA decode requires gate_activation='sigmoid', got "
+            f"{caps.gate_activation!r}"
+        )
+
+    scratch_storage = scratch_tensor(scratch, plan.scratch_specs(), owner="KDA decode")
+    error_code, _ = materialize_scratch_view(
+        scratch_storage,
+        offset_bytes=plan.error_code_offset_bytes,
+        shape=(1,),
+        dtype=torch.int32,
+    )
+    duplicate_slots, _ = materialize_scratch_view(
+        scratch_storage,
+        offset_bytes=plan.duplicate_table_offset_bytes,
+        shape=(plan.duplicate_table_size,),
+        dtype=torch.int64,
+    )
+    model = (caps.model_dtype,)
+    parameter = (torch.bfloat16, torch.float32)
+    _require_tensor(
+        "mixed_qkv",
+        mixed_qkv,
+        shape=(caps.max_tokens, caps.packed_qkv_width),
+        device=caps.device,
+        dtypes=model,
+    )
+    _require_tensor(
+        "raw_g",
+        raw_g,
+        shape=(caps.max_tokens, caps.value_heads, caps.key_head_dim),
+        device=caps.device,
+        dtypes=model,
+    )
+    _require_tensor(
+        "raw_beta",
+        raw_beta,
+        shape=(caps.max_tokens, caps.value_heads),
+        device=caps.device,
+        dtypes=model,
+    )
+    _require_tensor(
+        "z",
+        z,
+        shape=(caps.max_tokens, caps.value_heads, caps.value_head_dim),
+        device=caps.device,
+        dtypes=model,
+    )
+    _require_tensor(
+        "A_log",
+        A_log,
+        shape=(caps.value_heads,),
+        device=caps.device,
+        dtypes=parameter,
+    )
+    _require_tensor(
+        "dt_bias",
+        dt_bias,
+        shape=(caps.value_heads, caps.key_head_dim),
+        device=caps.device,
+        dtypes=parameter,
+    )
+    _require_tensor(
+        "norm_weight",
+        norm_weight,
+        shape=(caps.value_head_dim,),
+        device=caps.device,
+        dtypes=parameter,
+    )
+    _require_paged_recurrent_state(
+        recurrent_state,
+        shape=(
+            caps.max_state_slots,
+            caps.value_heads,
+            caps.value_head_dim,
+            caps.key_head_dim,
+        ),
+        device=caps.device,
+        dtype=caps.state_dtype,
+    )
+    _require_tensor(
+        "query_start_loc",
+        query_start_loc,
+        shape=(caps.max_seqs + 1,),
+        device=caps.device,
+        dtypes=(torch.int32,),
+    )
+    _require_tensor(
+        "num_accepted_tokens",
+        num_accepted_tokens,
+        shape=(caps.max_seqs,),
+        device=caps.device,
+        dtypes=(torch.int32,),
+    )
+    _require_tensor(
+        "state_indices",
+        state_indices,
+        shape=(caps.max_seqs, caps.state_index_columns),
+        device=caps.device,
+        dtypes=(torch.int32, torch.int64),
+    )
+    for name, tensor in (("num_seqs", num_seqs), ("num_tokens", num_tokens)):
+        _require_tensor(
+            name,
+            tensor,
+            shape=(1,),
+            device=caps.device,
+            dtypes=(torch.int32,),
+        )
+    _require_tensor(
+        "output",
+        output,
+        shape=(caps.max_tokens, caps.value_heads, caps.value_head_dim),
+        device=caps.device,
+        dtypes=model,
+    )
+    mutable = (
+        ("scratch", scratch_storage),
+        ("recurrent_state", recurrent_state),
+        ("output", output),
+    )
+    read_only = (
+        ("mixed_qkv", mixed_qkv),
+        ("raw_g", raw_g),
+        ("raw_beta", raw_beta),
+        ("z", z),
+        ("A_log", A_log),
+        ("dt_bias", dt_bias),
+        ("norm_weight", norm_weight),
+        ("query_start_loc", query_start_loc),
+        ("num_accepted_tokens", num_accepted_tokens),
+        ("state_indices", state_indices),
+        ("num_seqs", num_seqs),
+        ("num_tokens", num_tokens),
+    )
+    for index, (left_name, left) in enumerate(mutable):
+        for right_name, right in mutable[index + 1 :]:
+            if _overlaps(left, right):
+                raise ValueError(
+                    f"mutable buffers {left_name} and {right_name} must not overlap"
+                )
+        for right_name, right in read_only:
+            if _overlaps(left, right):
+                raise ValueError(
+                    f"mutable buffer {left_name} must not overlap read-only "
+                    f"tensor {right_name}"
+                )
+    return KdaBinding(
+        plan=plan,
+        scratch=scratch_storage,
+        duplicate_slots=duplicate_slots,
+        error_code=error_code,
+        mixed_qkv=mixed_qkv,
+        raw_g=raw_g,
+        raw_beta=raw_beta,
+        z=z,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        norm_weight=norm_weight,
+        recurrent_state=recurrent_state,
+        query_start_loc=query_start_loc,
+        num_accepted_tokens=num_accepted_tokens,
+        state_indices=state_indices,
+        num_seqs=num_seqs,
+        num_tokens=num_tokens,
+        output=output,
+    )
+
+
 def run(
     binding: Binding,
     *,
@@ -496,7 +737,9 @@ def run(
     Device-side metadata validation is transactional. Invalid counts, sequence
     bounds, accepted-token counts, state slots, or duplicate active state-index
     cells poison the complete output with NaNs and leave recurrent state
-    untouched. Capacity rows beyond ``num_tokens`` are zeroed.
+    untouched. If configured, null state cells are excluded from state access
+    and duplicate validation; a null initial checkpoint zeroes that request's
+    output. Capacity rows beyond ``num_tokens`` are zeroed.
     """
     if not isinstance(binding, Binding):
         raise TypeError(f"binding must be Binding, got {type(binding)!r}")
@@ -537,7 +780,10 @@ def run(
         key_head_dim=caps.key_head_dim,
         value_head_dim=caps.value_head_dim,
         gate_activation=caps.gate_activation,
+        decay_recipe="qwen",
+        lower_bound=0.0,
         qk_l2norm=caps.qk_l2norm,
+        null_state_index=caps.null_state_index,
         block_v=binding.plan.recurrent_block_v,
         duplicate_table_size=binding.plan.duplicate_table_size,
         recurrent_num_warps=binding.plan.recurrent_num_warps,
@@ -546,4 +792,79 @@ def run(
     return binding.output
 
 
-__all__ = ["Caps", "Plan", "Binding", "plan", "bind", "run"]
+def run_kda(
+    binding: KdaBinding,
+    *,
+    lower_bound: float = -5.0,
+    eps: float = 1e-6,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Run packed lower-bounded KDA decode into caller-owned buffers."""
+    if not isinstance(binding, KdaBinding):
+        raise TypeError(f"binding must be KdaBinding, got {type(binding)!r}")
+    lower_bound_value = float(lower_bound)
+    if not math.isfinite(lower_bound_value) or lower_bound_value >= 0.0:
+        raise ValueError(
+            "lower_bound must be finite and negative, got "
+            f"{lower_bound_value}"
+        )
+    eps_value = float(eps)
+    if not math.isfinite(eps_value) or eps_value <= 0.0:
+        raise ValueError(f"eps must be finite and positive, got {eps_value}")
+    caps = binding.plan.caps
+    scale_value = caps.key_head_dim**-0.5 if scale is None else float(scale)
+    if not math.isfinite(scale_value) or scale_value <= 0.0:
+        raise ValueError(f"scale must be finite and positive, got {scale_value}")
+    from ._kernels import run_gdn_decode
+
+    run_gdn_decode(
+        binding.mixed_qkv,
+        binding.raw_g,
+        binding.raw_beta,
+        binding.z,
+        binding.A_log,
+        binding.dt_bias,
+        binding.norm_weight,
+        binding.recurrent_state,
+        binding.query_start_loc,
+        binding.num_accepted_tokens,
+        binding.state_indices,
+        binding.num_seqs,
+        binding.num_tokens,
+        binding.output,
+        binding.duplicate_slots,
+        binding.error_code,
+        eps=eps_value,
+        scale=scale_value,
+        max_tokens=caps.max_tokens,
+        max_seqs=caps.max_seqs,
+        state_index_columns=caps.state_index_columns,
+        max_state_slots=caps.max_state_slots,
+        key_heads=caps.key_heads,
+        value_heads=caps.value_heads,
+        key_head_dim=caps.key_head_dim,
+        value_head_dim=caps.value_head_dim,
+        gate_activation="sigmoid",
+        decay_recipe="kda",
+        lower_bound=lower_bound_value,
+        qk_l2norm=caps.qk_l2norm,
+        null_state_index=caps.null_state_index,
+        block_v=binding.plan.recurrent_block_v,
+        duplicate_table_size=binding.plan.duplicate_table_size,
+        recurrent_num_warps=binding.plan.recurrent_num_warps,
+        norm_num_warps=binding.plan.norm_num_warps,
+    )
+    return binding.output
+
+
+__all__ = [
+    "Caps",
+    "Plan",
+    "Binding",
+    "KdaBinding",
+    "plan",
+    "bind",
+    "bind_kda",
+    "run",
+    "run_kda",
+]
