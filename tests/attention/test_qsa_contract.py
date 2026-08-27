@@ -596,19 +596,19 @@ def test_qsa_plan_chunks_scores_with_bounded_workspace(monkeypatch) -> None:
     assert planned._layout.score_nbytes == 516 * torch.float32.itemsize
 
 
-def test_qsa_caps_reject_unmodeled_or_inconsistent_state(monkeypatch) -> None:
-    caps = _caps()
+def test_qsa_caps_reject_unmodeled_or_inconsistent_state() -> None:
+    caps = _caps(
+        main_page_size=16,
+        compressed_page_size=4,
+        q_heads=12,
+        kv_heads=1,
+        head_dim=256,
+    )
     with pytest.raises(ValueError, match="requires a CUDA device"):
         replace(caps, device="cpu")
-    with monkeypatch.context() as context:
-        context.setattr(torch.cuda, "get_device_capability", lambda _device: (9, 0))
-        with pytest.raises(ValueError, match="requires SM120 or SM121"):
-            replace(caps)
     speculative = replace(
         caps,
         max_speculative_tokens=1,
-        main_page_size=64,
-        compressed_page_size=16,
     )
     assert speculative.raw_ring_capacity == 8
     with pytest.raises(ValueError, match="nonnegative"):
@@ -655,16 +655,12 @@ def test_qsa_caps_reject_unmodeled_or_inconsistent_state(monkeypatch) -> None:
             position_axes=3,
             mrope_sections=(1, 2, 1),
             mrope_interleaved=True,
-            main_page_size=64,
-            compressed_page_size=16,
         )
     target = replace(
         caps,
         position_axes=3,
         mrope_sections=(2, 1, 1),
         mrope_interleaved=True,
-        main_page_size=64,
-        compressed_page_size=16,
     )
     assert target.mrope_sections == (2, 1, 1)
 

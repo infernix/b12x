@@ -15,7 +15,7 @@ from b12x.attention.qsa._contract import _target_splits
 from ..conftest import require_b12x as require_sm120
 
 
-def test_qsa_caps_reject_non_sm120_and_non_qwen_geometry(
+def test_qsa_caps_do_not_gate_architecture_and_reject_non_qwen_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     values = dict(
@@ -33,10 +33,8 @@ def test_qsa_caps_reject_non_sm120_and_non_qwen_geometry(
         head_dim=256,
     )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 1))
-    with pytest.raises(ValueError, match="requires the CuTe SM120 path"):
-        qsa.Caps(**values)
+    assert qsa.Caps(**values).device == torch.device("cuda:0")
 
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
     values["q_heads"] = 8
     with pytest.raises(NotImplementedError, match="CuTe Qwen sparse-GQA geometry"):
         qsa.Caps(**values)
@@ -217,7 +215,6 @@ def test_cute_candidate_accepts_all_qwen_rows_for_interleaved_blh_cache_views(
     kv_heads: int,
     expected: bool,
 ) -> None:
-    monkeypatch.setattr(cute_config, "_is_sm120", lambda _device: True)
     pages, layers, page_size = 128, 64, 1504
     allocation = torch.empty(
         (
@@ -327,7 +324,7 @@ def test_qwen_geometry_rejects_invalid_cute_contract_instead_of_fallback(
     )
     monkeypatch.setattr(sparse_gqa, "_cute_is_candidate", lambda **_kwargs: False)
 
-    with pytest.raises(RuntimeError, match="requires its CuTe SM120"):
+    with pytest.raises(RuntimeError, match="requires its CuTe layout"):
         launch_sparse_paged_gqa(
             query=query,
             key_cache=key_cache,

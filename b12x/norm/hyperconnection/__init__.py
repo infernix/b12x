@@ -47,9 +47,9 @@ META = OpMeta(
     since="1.3.0",
     notes=(
         "The Qwen3.8 Flash Next S=4, H=2560, R=320 BF16 contract uses the "
-        "CuTeDSL combine+norm kernel for every non-empty live token count on "
-        "SM120. Unsupported geometry, layout, or capability fails instead of "
-        "falling back. Triton is used only for the auxiliary normalization, "
+        "CuTeDSL combine+norm kernel for every non-empty live token count. "
+        "Unsupported geometry or layout fails instead of falling back. Triton "
+        "is used only for the auxiliary normalization, "
         "activation, gate-reduction, and final residual-injection stages."
     ),
 )

@@ -175,23 +175,19 @@ def test_unqualified_projection_geometries_are_rejected(
         )
 
 
-def test_qwen_projection_rejects_unsupported_compute_capability() -> None:
-    assert not supports_prefill(
+def test_qwen_projection_does_not_gate_compute_capability() -> None:
+    assert supports_prefill(
         tokens=17,
         streams=4,
         hidden_size=2560,
         compute_capability=(12, 1),
     )
-    with pytest.raises(
-        RuntimeError,
-        match=r"require the CuTe SM120 kernels.*12\.1",
-    ):
-        projection_capacity_rows(
-            max_tokens=32,
-            streams=4,
-            hidden_size=2560,
-            compute_capability=(12, 1),
-        )
+    assert projection_capacity_rows(
+        max_tokens=32,
+        streams=4,
+        hidden_size=2560,
+        compute_capability=(12, 1),
+    ) == (32, 128)
 
 
 def test_qwen_dispatch_rejects_tensors_outside_tma_contract() -> None:

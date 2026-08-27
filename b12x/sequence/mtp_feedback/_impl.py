@@ -21,7 +21,6 @@ from b12x._lib.scratch_layout import (
 )
 
 from ._cute_prefill_config import (
-    QWEN_COMPUTE_CAPABILITY,
     QWEN_HIDDEN_SIZE,
     QWEN_STREAMS,
     projection_capacity_rows,
@@ -60,12 +59,6 @@ class Caps:
         device = _canonical_device(self.device)
         if device.type != "cuda":
             raise ValueError(f"MTP feedback requires a CUDA device, got {device}")
-        capability = torch.cuda.get_device_capability(device)
-        if tuple(capability) != QWEN_COMPUTE_CAPABILITY:
-            raise ValueError(
-                "Qwen3.8 MTP feedback requires the CuTe SM120 kernels, got "
-                f"compute capability {capability[0]}.{capability[1]}"
-            )
         max_tokens = _positive("max_tokens", self.max_tokens)
         hidden_size = _positive("hidden_size", self.hidden_size)
         streams = _positive("streams", self.streams)

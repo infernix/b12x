@@ -266,6 +266,9 @@ def test_qwen38_cute_recurrence_classification_is_exact() -> None:
     }
 
     assert _is_qualified_qwen38_cute_recurrence(**tensors, **geometry)
+    assert _is_qualified_qwen38_cute_recurrence(
+        **tensors, **(geometry | {"compute_capability": (12, 1)})
+    )
 
     for name, value in (
         ("max_tokens", 128),
@@ -275,7 +278,6 @@ def test_qwen38_cute_recurrence_classification_is_exact() -> None:
         ("value_heads", 48),
         ("lower_bounded_kda", True),
         ("has_null_state_index", True),
-        ("compute_capability", (12, 1)),
     ):
         incompatible = geometry | {name: value}
         assert not _is_qualified_qwen38_cute_recurrence(
@@ -602,7 +604,7 @@ def test_unqualified_qwen_layouts_fail_instead_of_using_triton(
     state_before = binding.recurrent_state.clone()
     output_before = binding.output.clone()
 
-    with pytest.raises(RuntimeError, match="qualified CuTe SM120 TP2 contract"):
+    with pytest.raises(RuntimeError, match="qualified CuTe TP2 contract"):
         gdn.run(binding)
 
     torch.testing.assert_close(binding.recurrent_state, state_before, rtol=0, atol=0)

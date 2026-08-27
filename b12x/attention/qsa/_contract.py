@@ -203,12 +203,6 @@ class Caps:
         object.__setattr__(self, "device", _canonical_device(self.device))
         if self.device.type != "cuda":
             raise ValueError(f"QSA decode requires a CUDA device, got {self.device}")
-        capability = torch.cuda.get_device_capability(self.device)
-        if capability != (12, 0):
-            raise ValueError(
-                "QSA decode in b12x requires the CuTe SM120 path, got "
-                f"compute capability {capability[0]}.{capability[1]}"
-            )
         positive = {
             "max_batch": self.max_batch,
             "max_raw_state_slots": self.max_raw_state_slots,
@@ -2549,13 +2543,11 @@ def run(
 
 
 def is_supported(device: torch.device | str | None = None) -> bool:
-    """Return whether the mandatory SM120 CuTe QSA path is available."""
-    from ..._lib.gating import default_is_supported, get_compute_capability
-    from . import META
+    """Return whether the mandatory CuTe QSA dependencies are available."""
+    from ..._lib.gating import has_cutlass_dsl, has_triton
 
-    return default_is_supported(
-        device, requires=META.requires
-    ) and get_compute_capability(device) == (12, 0)
+    del device
+    return has_cutlass_dsl() and has_triton()
 
 
 __all__ = [

@@ -173,7 +173,7 @@ def test_cute_combine_norm_dispatch_contract_is_explicit() -> None:
         hidden_size=2560,
         compute_capability=(12, 0),
     )
-    assert not _cute_config.supports_combine_norm(
+    assert _cute_config.supports_combine_norm(
         streams=4,
         hidden_size=2560,
         compute_capability=(12, 1),
@@ -966,39 +966,6 @@ def test_combine_norm_uses_cute_and_rejects_non_qwen_geometry(
 
     assert cute_shapes == [(4, 10240), (64, 10240)]
     assert not hasattr(_kernels, "_combine_norm_kernel")
-
-
-def test_qwen_combine_norm_rejects_unsupported_cute_arch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from b12x.norm.hyperconnection import _cute_config
-
-    device = require_sm120()
-    tokens, streams, hidden_size = 1, 4, 2560
-    width = streams * hidden_size
-    plan = hc.plan(
-        hc.Caps(
-            device=device,
-            max_tokens=tokens,
-            hidden_size=hidden_size,
-            streams=streams,
-        )
-    )
-    monkeypatch.setattr(
-        _cute_config,
-        "_compute_capability",
-        lambda _: (12, 1),
-    )
-
-    with pytest.raises(RuntimeError, match="requires the CuTe SM120 kernel"):
-        hc.run_combine_norm(
-            torch.zeros((tokens, width), dtype=torch.bfloat16, device=device),
-            torch.zeros((tokens, hidden_size), dtype=torch.bfloat16, device=device),
-            torch.zeros((tokens, streams), dtype=torch.bfloat16, device=device),
-            torch.zeros((width,), dtype=torch.bfloat16, device=device),
-            eps=1.0e-6,
-            plan=plan,
-        )
 
 
 @pytest.mark.filterwarnings("ignore:The CUDA Graph is empty.*:UserWarning")

@@ -412,13 +412,9 @@ def _is_qualified_qwen38_cute_recurrence(
     compute_capability: tuple[int, int] | None = None,
 ) -> bool:
     """Return whether this binding is the qualified Qwen3.8 TP2 contract."""
-    if compute_capability is None:
-        if not mixed_qkv.is_cuda:
-            return False
-        compute_capability = torch.cuda.get_device_capability(mixed_qkv.device)
+    del compute_capability
     return (
-        tuple(map(int, compute_capability)) == (12, 0)
-        and int(max_tokens) == _QWEN38_CUTE_MAX_TOKENS
+        int(max_tokens) == _QWEN38_CUTE_MAX_TOKENS
         and int(max_seqs) == _QWEN38_CUTE_MAX_SEQS
         and int(state_index_columns) == _QWEN38_CUTE_STATE_INDEX_COLUMNS
         and int(key_heads) == _QWEN38_CUTE_KEY_HEADS
@@ -579,7 +575,7 @@ def _launch_gdn_decode(
             )
     elif not qualified_qwen38_cute:
         raise RuntimeError(
-            "Qwen3.8 GDN decode requires the qualified CuTe SM120 TP2 "
+            "Qwen3.8 GDN decode requires the qualified CuTe TP2 "
             "contract: max_tokens=16, max_seqs=4, state_index_columns=4, "
             "key_heads=8, value_heads=24, 128-wide heads, BF16 model tensors, "
             "FP32 A_log, BF16 or FP32 dt_bias and recurrent state, int32 state "

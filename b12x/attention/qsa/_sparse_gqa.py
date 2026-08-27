@@ -238,7 +238,7 @@ def launch_sparse_paged_gqa(
         splits=splits,
     ):
         raise RuntimeError(
-            "Qwen sparse GQA requires its CuTe SM120 layout and capacity contract"
+            "Qwen sparse GQA requires its CuTe layout and capacity contract"
         )
 
     from ._sparse_gqa_cute import (

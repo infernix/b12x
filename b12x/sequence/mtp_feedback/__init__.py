@@ -40,11 +40,10 @@ META = OpMeta(
     test_path="tests/sequence/test_mtp_feedback.py",
     since="1.3.0",
     notes=(
-        "Qualified SM120 Qwen S=4,H=2560 uses mandatory capacity-specialized "
+        "Qualified Qwen S=4,H=2560 uses mandatory capacity-specialized "
         "CuTeDSL projection GEMMs with runtime live-row grids. Triton is used "
         "only by the normalization and reduction auxiliaries feeding those "
-        "projections. Other geometries, capabilities, or tensor contracts are "
-        "unsupported."
+        "projections. Other geometries or tensor contracts are unsupported."
     ),
 )
 

@@ -2,18 +2,10 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 import torch
 
 
 VECTOR_ALIGNMENT_BYTES = 16
-
-
-@lru_cache(maxsize=None)
-def _compute_capability(device: torch.device) -> tuple[int, int]:
-    major, minor = torch.cuda.get_device_capability(device)
-    return int(major), int(minor)
 
 
 def is_qwen_combine_norm_contract(*, streams: int, hidden_size: int) -> bool:
@@ -34,11 +26,8 @@ def supports_combine_norm(
         hidden_size=hidden_size,
     ):
         return False
-    if compute_capability is None:
-        if device is None:
-            raise ValueError("device or compute_capability is required")
-        compute_capability = _compute_capability(device)
-    return tuple(map(int, compute_capability)) == (12, 0)
+    del device, compute_capability
+    return True
 
 
 def require_cute_combine_norm(
@@ -64,13 +53,6 @@ def require_cute_combine_norm(
         raise RuntimeError(
             "Qwen3.8 HyperConnection combine+norm requires the CuTe CUDA path"
         )
-    capability = _compute_capability(state.device)
-    if capability != (12, 0):
-        raise RuntimeError(
-            "Qwen3.8 HyperConnection combine+norm requires the CuTe SM120 "
-            f"kernel; device {state.device} has compute capability {capability}"
-        )
-
     tokens = int(state.shape[0])
     tensors = (
         state,
@@ -133,13 +115,8 @@ def require_cute_combine_norm(
         )
 
 
-def clear_device_cache() -> None:
-    _compute_capability.cache_clear()
-
-
 __all__ = [
     "VECTOR_ALIGNMENT_BYTES",
-    "clear_device_cache",
     "is_qwen_combine_norm_contract",
     "require_cute_combine_norm",
     "supports_combine_norm",

@@ -2,21 +2,13 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import torch
 
 
 TMA_ALIGNMENT_BYTES = 16
 PROJECTION_ROW_ALIGNMENT = 16
-QWEN_COMPUTE_CAPABILITY = (12, 0)
 QWEN_STREAMS = 4
 QWEN_HIDDEN_SIZE = 2_560
-
-
-@lru_cache(maxsize=None)
-def _compute_capability(device: torch.device) -> tuple[int, int]:
-    major, minor = torch.cuda.get_device_capability(device)
-    return int(major), int(minor)
 
 
 def _padded_rows(rows: int) -> int:
@@ -45,11 +37,8 @@ def supports_prefill(
         hidden_size=hidden_size,
     ):
         return False
-    if compute_capability is None:
-        if device is None:
-            raise ValueError("device or compute_capability is required")
-        compute_capability = _compute_capability(device)
-    return tuple(map(int, compute_capability)) == QWEN_COMPUTE_CAPABILITY
+    del device, compute_capability
+    return True
 
 
 def projection_capacity_rows(
@@ -75,16 +64,7 @@ def projection_capacity_rows(
             f"S={stream_count},H={int(hidden_size)}"
         )
 
-    if compute_capability is None:
-        if device is None:
-            raise ValueError("device or compute_capability is required")
-        compute_capability = _compute_capability(device)
-    capability = tuple(map(int, compute_capability))
-    if capability != QWEN_COMPUTE_CAPABILITY:
-        raise RuntimeError(
-            "Qwen3.8 MTP projections require the CuTe SM120 kernels; compute "
-            f"capability {capability[0]}.{capability[1]} is unsupported"
-        )
+    del device, compute_capability
     return _padded_rows(capacity), _padded_rows(capacity * stream_count)
 
 
@@ -117,7 +97,6 @@ def require_qwen_cute_tensors(**tensors: torch.Tensor) -> None:
 
 __all__ = [
     "PROJECTION_ROW_ALIGNMENT",
-    "QWEN_COMPUTE_CAPABILITY",
     "QWEN_HIDDEN_SIZE",
     "QWEN_STREAMS",
     "TMA_ALIGNMENT_BYTES",

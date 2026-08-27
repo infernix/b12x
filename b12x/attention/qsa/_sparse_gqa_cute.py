@@ -30,7 +30,6 @@ from ._sparse_gqa_cute_config import BLOCK_N as _BLOCK_N
 from ._sparse_gqa_cute_config import HEAD_DIM as _HEAD_DIM
 from ._sparse_gqa_cute_config import NUM_SPLITS as _NUM_SPLITS
 from ._sparse_gqa_cute_config import SELECTION_WIDTH as _SELECTION_WIDTH
-from ._sparse_gqa_cute_config import clear_device_cache
 from ._sparse_gqa_cute_config import is_candidate
 
 
@@ -746,7 +745,6 @@ def clear_caches() -> None:
         _WARMED.clear()
         _MERGE_CACHE.clear()
         _MERGE_WARMED.clear()
-    clear_device_cache()
 
 
 __all__ = [

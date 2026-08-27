@@ -67,12 +67,6 @@ class Caps:
         device = _canonical_device(self.device)
         if device.type != "cuda":
             raise ValueError(f"GDN decode requires a CUDA device, got {device}")
-        capability = torch.cuda.get_device_capability(device)
-        if capability not in ((12, 0), (12, 1)):
-            raise ValueError(
-                "GDN decode in b12x requires SM120 or SM121, got "
-                f"compute capability {capability[0]}.{capability[1]}"
-            )
         for name in (
             "max_tokens",
             "max_seqs",

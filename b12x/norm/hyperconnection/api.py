@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from ..._lib.gating import default_is_supported, get_compute_capability
-from . import META
+from ..._lib.gating import has_cutlass_dsl, has_triton
 from . import reference
 from ._impl import HyperConnectionBinding as Binding
 from ._impl import HyperConnectionCaps as Caps
@@ -23,9 +22,8 @@ def bind(plan: Plan, **kwargs) -> Binding:
 
 def is_supported(device=None) -> bool:
     """True when the mandatory CuTe main path and Triton auxiliaries can run."""
-    return default_is_supported(
-        device, requires=META.requires
-    ) and get_compute_capability(device) == (12, 0)
+    del device
+    return has_cutlass_dsl() and has_triton()
 
 
 __all__ = [

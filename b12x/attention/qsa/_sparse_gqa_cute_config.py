@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 import torch
 
 HEAD_DIM = 256
@@ -17,11 +15,6 @@ BENCHMARKED_ROW_LIMITS = {
     (12, 1): 4,
     (24, 2): 2,
 }
-
-
-@lru_cache(maxsize=None)
-def _is_sm120(device: torch.device) -> bool:
-    return torch.cuda.get_device_capability(device) == (12, 0)
 
 
 def _is_page_token_head_layout(tensor: torch.Tensor) -> bool:
@@ -108,7 +101,7 @@ def is_candidate(
         and int(selected_positions.shape[0]) >= rows
     ):
         return False
-    if not query.is_cuda or not _is_sm120(query.device):
+    if not query.is_cuda:
         return False
     if (
         query.dtype != torch.bfloat16
@@ -151,10 +144,6 @@ def is_candidate(
     )
 
 
-def clear_device_cache() -> None:
-    _is_sm120.cache_clear()
-
-
 __all__ = [
     "BENCHMARKED_ROW_LIMITS",
     "BLOCK_N",
@@ -163,7 +152,6 @@ __all__ = [
     "SELECTION_WIDTH",
     "SUPPORTED_HEAD_LAYOUTS",
     "SUPPORTED_PAGE_SIZES",
-    "clear_device_cache",
     "is_candidate",
     "is_qwen_geometry",
 ]

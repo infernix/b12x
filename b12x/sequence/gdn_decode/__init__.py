@@ -74,7 +74,7 @@ META = OpMeta(
     test_path="tests/sequence/test_gdn_decode.py",
     since="1.3.0",
     notes=(
-        "Qwen3.8 Flash Next GDN is qualified only for the SM120 TP2 capacity "
+        "Qwen3.8 Flash Next GDN is qualified only for the TP2 capacity "
         "max_tokens=16,max_seqs=4,state_index_columns=4 with 8 Q/K heads, 24 "
         "value heads, BF16 or FP32 recurrent state, and int32 state indices. "
         "Its "
