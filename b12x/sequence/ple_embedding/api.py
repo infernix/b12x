@@ -4,7 +4,17 @@ from __future__ import annotations
 
 from ..._lib.gating import default_is_supported
 from . import META
-from ._contracts import Binding, Caps, Plan, QuantMode, bind, plan, run
+from ._contracts import (
+    Binding,
+    Caps,
+    Plan,
+    QuantMode,
+    TableMemory,
+    bind,
+    plan,
+    run,
+)
+from ._storage import TableStorage, allocate_storage
 
 
 def is_supported(device=None) -> bool:
@@ -14,10 +24,13 @@ def is_supported(device=None) -> bool:
 
 __all__ = [
     "QuantMode",
+    "TableMemory",
+    "TableStorage",
     "Caps",
     "Plan",
     "Binding",
     "plan",
+    "allocate_storage",
     "bind",
     "run",
     "is_supported",

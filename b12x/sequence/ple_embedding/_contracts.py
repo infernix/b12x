@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -17,9 +17,13 @@ from b12x._lib.scratch_layout import (
 )
 from b12x.sequence import ple_hash
 
+if TYPE_CHECKING:
+    from ._storage import TableStorage
+
 
 _SIGNED_INT64_MAX = (1 << 63) - 1
 QuantMode = Literal["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"]
+TableMemory = Literal["device", "mapped_host"]
 _BF16_MODE: QuantMode = "bf16"
 _FP8_QUANT_MODE: QuantMode = "fp8_e4m3_per_tensor"
 _NVFP4_QUANT_MODE: QuantMode = "nvfp4_group16"
@@ -28,6 +32,7 @@ _SUPPORTED_MODES: tuple[QuantMode, ...] = (
     _FP8_QUANT_MODE,
     _NVFP4_QUANT_MODE,
 )
+_SUPPORTED_TABLE_MEMORY: tuple[TableMemory, ...] = ("device", "mapped_host")
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -62,6 +67,27 @@ def _require_tensor(
         raise ValueError(f"{name} must be contiguous")
 
 
+def _require_mapped_host_tensor(
+    name: str, tensor: torch.Tensor, *, device: torch.device
+) -> None:
+    from cuda.bindings import runtime as cudart
+
+    with torch.cuda.device(device):
+        error, attributes = cudart.cudaPointerGetAttributes(tensor.data_ptr())
+    if error != cudart.cudaError_t.cudaSuccess:
+        raise ValueError(
+            f"{name} must use CUDA-mapped host storage; pointer query failed: {error}"
+        )
+    if attributes.type != cudart.cudaMemoryType.cudaMemoryTypeHost:
+        raise ValueError(
+            f"{name} must use CUDA-mapped host storage, got memory type "
+            f"{attributes.type}"
+        )
+    device_pointer = int(attributes.devicePointer or 0)
+    if device_pointer == 0 or device_pointer != tensor.data_ptr():
+        raise ValueError(f"{name} does not expose the mapped device alias on {device}")
+
+
 def _byte_interval(tensor: torch.Tensor) -> tuple[int, int]:
     start = int(tensor.untyped_storage().data_ptr()) + int(
         tensor.storage_offset()
@@ -83,6 +109,9 @@ class Caps:
     ``weight_scale``, or packed group-16 NVFP4 rows with FP8 E4M3
     ``weight_scale`` blocks and one FP32 ``weight_scale_2`` global scale.
     ``scale_dtype`` is validated against the selected storage format.
+    ``table_memory="mapped_host"`` places row payloads and row-associated
+    scales in CUDA-mapped, write-combined host memory while scalar scales stay
+    device-resident.
     """
 
     device: torch.device | str
@@ -99,6 +128,7 @@ class Caps:
     tp_rank: int
     table_alignment: int = 128
     quant_mode: QuantMode = _FP8_QUANT_MODE
+    table_memory: TableMemory = "device"
     scale_dtype: torch.dtype | None = None
     output_dtype: torch.dtype = torch.bfloat16
 
@@ -147,6 +177,18 @@ class Caps:
                 f"got {self.quant_mode!r}"
             )
         object.__setattr__(self, "quant_mode", quant_mode)
+        table_memory = str(self.table_memory)
+        if table_memory not in _SUPPORTED_TABLE_MEMORY:
+            raise ValueError(
+                f"table_memory must be one of {_SUPPORTED_TABLE_MEMORY!r}, "
+                f"got {self.table_memory!r}"
+            )
+        if table_memory == "mapped_host" and self.device.type != "cuda":
+            raise ValueError(
+                "mapped-host PLE table storage requires a CUDA device, "
+                f"got {self.device}"
+            )
+        object.__setattr__(self, "table_memory", table_memory)
         scale_dtype = self.scale_dtype
         if quant_mode == _BF16_MODE:
             if scale_dtype is not None:
@@ -249,6 +291,12 @@ class Plan:
 
     def bind(self, **kwargs) -> Binding:
         return bind(self, **kwargs)
+
+    def allocate_storage(self) -> TableStorage:
+        """Allocate persistent table tensors according to ``caps.table_memory``."""
+        from ._storage import allocate_storage
+
+        return allocate_storage(self)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -421,6 +469,8 @@ def bind(
         dtype=plan.weight_dtype,
         device=caps.device,
     )
+    if caps.table_memory == "mapped_host":
+        _require_mapped_host_tensor("weight", weight, device=caps.device)
     if plan.weight_scale_shape is None:
         if weight_scale is not None:
             raise ValueError(
@@ -439,6 +489,10 @@ def bind(
             dtype=plan.weight_scale_dtype,
             device=caps.device,
         )
+        if caps.table_memory == "mapped_host" and caps.quant_mode == _NVFP4_QUANT_MODE:
+            _require_mapped_host_tensor(
+                "weight_scale", weight_scale, device=caps.device
+            )
     if plan.weight_scale_2_shape is None:
         if weight_scale_2 is not None:
             raise ValueError(
@@ -530,4 +584,13 @@ def run(binding: Binding) -> torch.Tensor:
     return binding.out
 
 
-__all__ = ["Caps", "Plan", "Binding", "plan", "bind", "run"]
+__all__ = [
+    "QuantMode",
+    "TableMemory",
+    "Caps",
+    "Plan",
+    "Binding",
+    "plan",
+    "bind",
+    "run",
+]

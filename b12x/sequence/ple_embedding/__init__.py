@@ -1,11 +1,12 @@
 """Prime-hashed PLE embedding lookup.
 
 ``plan`` owns the hash geometry, tensor-parallel table partition, and fixed
-serving capacity. ``bind`` maps caller-owned model tensors, packed request
-metadata, output, and scratch without allocation. ``run`` hashes tokens,
-gathers selected rows from the local table shard, applies inline
-dequantization when the table uses FP8 or NVFP4 storage, and writes a BF16
-flattened embedding contribution.
+serving capacity. ``Plan.allocate_storage`` materializes device-resident or
+CUDA-mapped host table storage according to the planned policy. ``bind`` maps
+the resulting model tensors, packed request metadata, output, and scratch
+without allocation. ``run`` hashes tokens, gathers selected rows from the
+local table shard, applies inline dequantization when the table uses FP8 or
+NVFP4 storage, and writes a BF16 flattened embedding contribution.
 
 The expressed operation is one hash, gather, and dequantization call. Its
 binding exposes only caller-owned inputs, the output, and a device error code;
@@ -25,10 +26,13 @@ META = OpMeta(
     api_style="planned",
     entry_points=(
         "QuantMode",
+        "TableMemory",
+        "TableStorage",
         "Caps",
         "Plan",
         "Binding",
         "plan",
+        "allocate_storage",
         "bind",
         "run",
         "is_supported",
@@ -51,7 +55,9 @@ META = OpMeta(
         "FP8 E4M3 and NVFP4 tables remain quantized in persistent storage; "
         "only selected local rows are dequantized. The expressed API is one "
         "opaque hash, local-shard gather, and inline-dequantization operation. "
-        "Its Triton implementation is functional but not throughput-qualified."
+        "Device-resident and CUDA-mapped host table storage share the same "
+        "binding contract. Its Triton implementation is functional but not "
+        "throughput-qualified."
     ),
 )
 
@@ -61,6 +67,9 @@ if TYPE_CHECKING:
         Caps,
         Plan,
         QuantMode,
+        TableMemory,
+        TableStorage,
+        allocate_storage,
         bind,
         is_supported,
         plan,

@@ -277,6 +277,10 @@ def test_caps_and_plan_reject_unsupported_storage_contracts() -> None:
         ple_embedding.Caps(**{**common, "tp_rank": 2})
     with pytest.raises(ValueError, match="quant_mode"):
         ple_embedding.Caps(**{**common, "quant_mode": "int8"})
+    with pytest.raises(ValueError, match="table_memory"):
+        ple_embedding.Caps(**{**common, "table_memory": "managed"})
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        ple_embedding.Caps(**{**common, "table_memory": "mapped_host"})
     with pytest.raises(TypeError, match="BF16.*scale_dtype must be None"):
         ple_embedding.Caps(
             **{**common, "quant_mode": "bf16", "scale_dtype": torch.bfloat16}
@@ -315,9 +319,7 @@ def test_caps_and_plan_reject_unsupported_storage_contracts() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"]
-)
+@pytest.mark.parametrize("quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"])
 def test_bind_uses_caller_storage_and_rejects_bad_quant_tensors(
     quant_mode: str,
 ) -> None:
@@ -404,17 +406,13 @@ def test_bind_uses_caller_storage_and_rejects_bad_quant_tensors(
         ple_embedding.run(binding)
 
 
-@pytest.mark.parametrize(
-    "quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"]
-)
+@pytest.mark.parametrize("quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"])
 def test_reference_composes_hash_tp_lookup_and_dequantization(
     quant_mode: str,
 ) -> None:
     plan0 = _small_plan("cpu", tp_rank=0, quant_mode=quant_mode)
     plan1 = _small_plan("cpu", tp_rank=1, quant_mode=quant_mode)
-    full_plan = _small_plan(
-        "cpu", tp_rank=0, tp_size=1, quant_mode=quant_mode
-    )
+    full_plan = _small_plan("cpu", tp_rank=0, tp_size=1, quant_mode=quant_mode)
     full_weight, full_scale, full_scale_2 = _storage(full_plan)
     token_ids = torch.tensor([3, 4, 5, 6, 0], dtype=torch.int64)
     starts = torch.tensor([0, 2, 4], dtype=torch.int32)
@@ -590,9 +588,7 @@ def test_reference_gathers_only_selected_rows_and_zeros_nonlocal_heads(
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize(
-    "quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"]
-)
+@pytest.mark.parametrize("quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"])
 def test_cuda_matches_reference_and_preserves_read_only_tensors(
     quant_mode: str,
 ) -> None:
@@ -612,9 +608,7 @@ def test_cuda_matches_reference_and_preserves_read_only_tensors(
         read_names.append("weight_scale")
     if binding.weight_scale_2 is not None:
         read_names.append("weight_scale_2")
-    read_only = {
-        name: getattr(binding, name).clone() for name in read_names
-    }
+    read_only = {name: getattr(binding, name).clone() for name in read_names}
 
     actual = ple_embedding.run(binding)
     torch.cuda.synchronize(device)
@@ -657,9 +651,7 @@ def test_cuda_public_run_exports_as_one_opaque_fullgraph_custom_op(
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize(
-    "quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"]
-)
+@pytest.mark.parametrize("quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"])
 def test_cuda_graph_replay_uses_bound_storage_without_allocating(
     quant_mode: str,
 ) -> None:
@@ -734,9 +726,7 @@ def test_cuda_large_local_row_uses_int64_scaled_addressing() -> None:
         multipliers=torch.tensor([1, 1], dtype=torch.int64),
     )
     assert target_id * plan.head_dim > 2**31
-    weight = torch.empty(
-        plan.weight_shape, dtype=torch.float8_e4m3fn, device=device
-    )
+    weight = torch.empty(plan.weight_shape, dtype=torch.float8_e4m3fn, device=device)
     weight[target_id].fill_(2.0)
     scratch_spec = plan.scratch_specs()[0]
     binding = plan.bind(
