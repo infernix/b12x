@@ -23,7 +23,6 @@ from b12x._lib.scratch_layout import (
 
 
 GateActivation = Literal["silu", "sigmoid"]
-_SUPPORTED_RATIOS = frozenset((1, 2, 3, 4, 8))
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -92,12 +91,6 @@ class Caps:
             )
         if self.value_heads % self.key_heads:
             raise ValueError("value_heads must be divisible by key_heads")
-        ratio = self.value_heads // self.key_heads
-        if ratio not in _SUPPORTED_RATIOS:
-            raise ValueError(
-                f"value_heads/key_heads ratio must be one of "
-                f"{sorted(_SUPPORTED_RATIOS)}, got {ratio}"
-            )
         if self.model_dtype != torch.bfloat16:
             raise TypeError(
                 f"model_dtype must be torch.bfloat16, got {self.model_dtype}"

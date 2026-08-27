@@ -33,7 +33,7 @@ def test_qwen38_profiles_preserve_selector_and_rank_local_gqa_geometry() -> None
     }
 
 
-def test_default_corpus_is_tp2_and_bounds_synthetic_cache_capacity() -> None:
+def test_default_cases_use_tp2_and_bound_synthetic_cache_capacity() -> None:
     args = benchmark_qsa._parse_args([])
     cases = benchmark_qsa._resolve_cases(args)
 
@@ -76,7 +76,7 @@ def test_cli_filters_tp_profiles_rows_and_full_context() -> None:
     }
 
 
-def test_all_profile_alias_and_full_context_corpus_are_explicit() -> None:
+def test_all_profile_alias_and_full_context_cases_are_explicit() -> None:
     args = benchmark_qsa._parse_args(
         ["--profiles", "all", "--contexts", "2048,8192,32768,131072,full"]
     )

@@ -8,12 +8,6 @@ HEAD_DIM = 256
 SELECTION_WIDTH = 2051
 BLOCK_N = 16
 NUM_SPLITS = 64
-SUPPORTED_HEAD_LAYOUTS = frozenset({(6, 1), (12, 1), (24, 2)})
-BENCHMARKED_ROW_LIMITS = {
-    (6, 1): 8,
-    (12, 1): 4,
-    (24, 2): 2,
-}
 
 
 def _is_page_token_head_layout(tensor: torch.Tensor) -> bool:
@@ -45,7 +39,9 @@ def is_qwen_geometry(
 ) -> bool:
     """Return whether scalar dimensions select the Qwen sparse-GQA kernel."""
     return (
-        (int(q_heads), int(kv_heads)) in SUPPORTED_HEAD_LAYOUTS
+        int(q_heads) > 0
+        and int(kv_heads) > 0
+        and int(q_heads) % int(kv_heads) == 0
         and int(head_dim) == HEAD_DIM
         and int(selection_width) == SELECTION_WIDTH
         and int(block_n) == BLOCK_N
@@ -141,12 +137,10 @@ def is_candidate(
 
 
 __all__ = [
-    "BENCHMARKED_ROW_LIMITS",
     "BLOCK_N",
     "HEAD_DIM",
     "NUM_SPLITS",
     "SELECTION_WIDTH",
-    "SUPPORTED_HEAD_LAYOUTS",
     "is_candidate",
     "is_qwen_geometry",
 ]

@@ -640,7 +640,7 @@ def _selector_rank_group_ids(
     )
 
 
-def _initialize_selector_corpus(
+def _initialize_selector_dataset(
     *,
     prepared_query_by_request: torch.Tensor,
     compressed_by_request: torch.Tensor,
@@ -973,7 +973,7 @@ def _prepare_case(
         if case.request_count == case.rows
         else prepared_selector_query[:1]
     )
-    _initialize_selector_corpus(
+    _initialize_selector_dataset(
         prepared_query_by_request=prepared_query_by_request,
         compressed_by_request=compressed_by_request,
         raw_ring=raw_ring,
@@ -1660,11 +1660,6 @@ def main(argv: list[str] | None = None) -> int:
         if device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
         torch.cuda.set_device(device)
-        capability = torch.cuda.get_device_capability(device)
-        if capability != (12, 0):
-            raise BenchmarkFailure(
-                f"QSA benchmarking requires SM120, got SM{capability[0]}{capability[1]}"
-            )
         cases = _resolve_cases(args)
         l2_flush = make_l2_flush_fn(args.flush_l2, bytes_hint=args.l2_flush_bytes)
         properties = torch.cuda.get_device_properties(device)
@@ -1706,7 +1701,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"{args.main_cache_layout} K/V storage"
                 ),
                 "selector_state": "independent per request",
-                "selector_corpus": (
+                "selector_dataset": (
                     "context-spanning rank-separated exact-oracle representatives"
                 ),
                 "default_profile": "tp2",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark Qwen3.8 Flash Next MTP feedback through its public API.
 
-The corpus fixes the production geometry at four residual streams and hidden
+The benchmark matrix fixes the production geometry at four residual streams and hidden
 size 2560, then covers single-token decode, a four-token speculative step, and
 four prefill sizes including a padded-row boundary. Every case validates the
 seeded PyTorch oracle before recording eager-launch and CUDA-graph-replay
@@ -137,7 +137,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--list-profiles",
         action="store_true",
-        help="print the profile corpus as JSON and exit without requiring CUDA",
+        help="print the profile set as JSON and exit without requiring CUDA",
     )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--samples", type=int, default=100)
@@ -539,9 +539,6 @@ def main(argv: list[str] | None = None) -> None:
         device = torch.device("cuda", torch.cuda.current_device())
     torch.cuda.set_device(device)
     device = torch.device("cuda", torch.cuda.current_device())
-    major, minor = torch.cuda.get_device_capability(device)
-    if (major, minor) != (12, 0):
-        raise SystemExit(f"SM120 is required, got SM{major}{minor}")
 
     properties = torch.cuda.get_device_properties(device)
     mode_before = nvidia_smi_gpu_mode_snapshot()

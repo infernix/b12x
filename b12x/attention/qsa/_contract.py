@@ -268,8 +268,8 @@ class Caps:
         ):
             raise NotImplementedError(
                 "QSA requires the CuTe Qwen sparse-GQA geometry "
-                "(q_heads, kv_heads) in {(6, 1), (12, 1), (24, 2)}, "
-                "head_dim=256, and selection_width=2051"
+                "with q_heads divisible by kv_heads, head_dim=256, and "
+                "selection_width=2051"
             )
         if not _is_power_of_two(self.head_dim) or int(self.head_dim) < 16:
             raise ValueError("head_dim must be a power of two at least 16")
@@ -513,7 +513,6 @@ def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
     from ._sparse_gqa_cute_config import (
         BLOCK_N as QWEN_CUTE_BLOCK_N,
         NUM_SPLITS as QWEN_CUTE_NUM_SPLITS,
-        SUPPORTED_HEAD_LAYOUTS,
         is_qwen_geometry,
     )
 
@@ -529,8 +528,8 @@ def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
     ):
         return QWEN_CUTE_BLOCK_N, QWEN_CUTE_NUM_SPLITS
     raise NotImplementedError(
-        "QSA requires the CuTe Qwen sparse-GQA geometry: q_heads/kv_heads in "
-        f"{sorted(SUPPORTED_HEAD_LAYOUTS)}, head_dim=256, selection_width=2051; "
+        "QSA requires the CuTe Qwen sparse-GQA geometry: q_heads divisible by "
+        "kv_heads, head_dim=256, selection_width=2051; "
         f"got q_heads={caps.q_heads}, "
         f"kv_heads={caps.kv_heads}, head_dim={caps.head_dim}, "
         f"main_page_size={caps.main_page_size}, "

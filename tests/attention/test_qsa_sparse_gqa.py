@@ -15,9 +15,7 @@ from b12x.attention.qsa._contract import _target_splits
 from ..conftest import require_b12x as require_sm120
 
 
-def test_qsa_caps_do_not_gate_architecture_and_reject_non_qwen_geometry(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_qsa_caps_do_not_gate_architecture_or_tensor_parallel_layout() -> None:
     values = dict(
         device="cuda:0",
         max_batch=1,
@@ -32,20 +30,21 @@ def test_qsa_caps_do_not_gate_architecture_and_reject_non_qwen_geometry(
         kv_heads=1,
         head_dim=256,
     )
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 1))
     assert qsa.Caps(**values).device == torch.device("cuda:0")
 
     values["q_heads"] = 8
-    with pytest.raises(NotImplementedError, match="CuTe Qwen sparse-GQA geometry"):
+    values["kv_heads"] = 2
+    assert qsa.Caps(**values).q_heads == 8
+
+    values["q_heads"] = 7
+    with pytest.raises(ValueError, match="q_heads must be divisible by kv_heads"):
         qsa.Caps(**values)
 
 
 @pytest.mark.parametrize("page_size", [16, 1504, 3008])
 def test_qsa_caps_accepts_runtime_qwen_page_sizes(
-    monkeypatch: pytest.MonkeyPatch,
     page_size: int,
 ) -> None:
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
     caps = qsa.Caps(
         device="cuda:0",
         max_batch=1,
@@ -294,7 +293,7 @@ def test_qwen_split_policy_does_not_route_large_rows_to_triton() -> None:
         _target_splits(
             SimpleNamespace(
                 q_heads=8,
-                kv_heads=2,
+                kv_heads=3,
                 head_dim=64,
                 main_page_size=4,
                 selection_width=67,
@@ -393,9 +392,10 @@ def test_non_qwen_geometry_has_no_sparse_gqa_fallback(
         "splits",
         "layout",
     ),
-    [
-        (1, 24, 2, 256, 16, 2051, 16, 64, "contiguous"),
-        (1, 6, 1, 256, 16, 2051, 16, 64, "interleaved_page"),
+        [
+            (1, 24, 2, 256, 16, 2051, 16, 64, "contiguous"),
+            (1, 8, 2, 256, 16, 2051, 16, 64, "contiguous"),
+            (1, 6, 1, 256, 16, 2051, 16, 64, "interleaved_page"),
         (5, 12, 1, 256, 16, 2051, 16, 64, "interleaved_page"),
     ],
 )

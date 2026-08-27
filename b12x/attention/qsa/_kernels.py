@@ -1787,8 +1787,8 @@ def launch_topk_groups(
     topk_group_ids: torch.Tensor,
     group_budget: int,
 ) -> None:
-    # This is the existing exact single-row radix kernel, not the cooperative
-    # multi-CTA persistent path that is forbidden on SM120.
+    # This is the exact single-row radix kernel, not the cooperative multi-CTA
+    # persistent path.
     from ..dsa_indexer.tiled_topk import run_row_topk
 
     run_row_topk(
