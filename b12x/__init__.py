@@ -1,8 +1,7 @@
 """b12x — consumer-Blackwell (SM120/SM121) kernels.
 
 CuTe-DSL and Triton kernels for NVFP4/MXFP4/MXFP8 GEMM, fused MoE, attention
-(paged, dense/sparse/compressed MLA, DSA indexing, QSA decode, and GLM pooled
-indexing),
+(paged, dense/sparse/compressed MLA, DSA indexing, and QSA decode),
 quantization, multi-stream residual mixing, recurrent/sequence features, and
 PCIe collectives. One grammar everywhere:
 
@@ -47,7 +46,6 @@ _OPS: tuple[str, ...] = (
     "attention.compressed_sparse_mla",
     "attention.dsa_indexer",
     "attention.qsa",
-    "attention.glm_pooled_indexer",
     "attention.varlen",
     "comm.pcie",
     "gemm.bf16_gemv",

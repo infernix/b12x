@@ -76,6 +76,24 @@ def test_fused_indexer_warmup_rows_cover_sm120_c4_policies(monkeypatch):
     assert rows == tuple(range(1, 17))
 
 
+def test_fused_indexer_warmup_rows_cover_glm53_flash_c4_policies(monkeypatch):
+    props = type(
+        "Props",
+        (),
+        {"major": 12, "minor": 0, "multi_processor_count": 188},
+    )()
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
+
+    rows = fused_indexer_decode_warmup_rows(
+        topk=512,
+        num_heads=32,
+        max_pages=1024,
+        device=torch.device("cuda"),
+    )
+
+    assert rows == tuple(range(1, 17))
+
+
 def test_coop_merge_co_residency_guard():
     """A group that oversubscribes the SMs must drop the coop grid-barrier arm.
 
@@ -200,6 +218,20 @@ def test_fused_indexer_route_covers_sm12x_c4_decode_buckets(compute_capability, 
         num_rows=rows,
         width=1024 * 64,
         num_heads=64,
+        compute_capability=compute_capability,
+    )
+
+
+@pytest.mark.parametrize("compute_capability", [(12, 0), (12, 1)])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
+def test_fused_indexer_route_covers_glm53_flash_c4_decode_buckets(
+    compute_capability, rows
+):
+    assert resolve_fused_indexer_path(
+        topk=512,
+        num_rows=rows,
+        width=1024 * 64,
+        num_heads=32,
         compute_capability=compute_capability,
     )
 

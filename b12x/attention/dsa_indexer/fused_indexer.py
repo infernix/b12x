@@ -126,11 +126,11 @@ KV_LAYOUT_CONTIGUOUS_MLA = 0
 KV_LAYOUT_PAGED = 1
 
 # Route metadata is capture-static; live seqlen is deliberately not a policy input,
-# so vLLM graph replay cannot switch backends.  The generic policy retains its
-# measured small-row limit.  C4's heads=64/topk=512 and GLM's heads=32/topk=2048
-# shapes are materially different. GLM was measured at 8K, 16K, 32K, and 131K
-# capacity. L2-flushed DSV4F measurements select fused through B16 for C4 on
-# both RTX-class SM120 and GB10/SM121.
+# so vLLM graph replay cannot switch backends. The generic policy retains its
+# measured small-row limit. C4 uses top-k 512 with either 64 heads (DeepSeek V4)
+# or 32 heads (GLM-5.3-Flash), while GLM-5.2 uses 32 heads and top-k 2048.
+# L2-flushed DSV4F measurements select fused through B16 for C4 on both
+# RTX-class SM120 and GB10/SM121.
 # Prefill remains packed-contiguous and never reaches this decode-only resolver.
 FUSED_MAX_ROWS = 6
 _C4_B12X_FUSED_MAX_ROWS = 16
@@ -540,16 +540,16 @@ def resolve_fused_indexer_path(
     Row count, head count, top-k, and width here are all capture-time workspace
     metadata; live seqlen is deliberately absent, so the selected route is stable
     across vLLM CUDA-graph replays. The general small-decode gate remains six
-    rows. C4's 64-head/top-k-512 shape uses fused through B16 on SM120 and
-    SM121. GLM's 32-head/top-k-2048 shape uses fused through B16 and the
-    streamed tiled route beyond. Prefill is selected before this decode-only
-    resolver and remains packed-contiguous.
+    rows. C4's 64-head and 32-head top-k-512 shapes use fused through B16 on
+    SM120 and SM121. GLM-5.2's 32-head/top-k-2048 shape uses fused through B16
+    and the streamed tiled route beyond. Prefill is selected before this
+    decode-only resolver and remains packed-contiguous.
     """
     if not supports_fused_indexer(topk=topk, num_rows=num_rows, width=width):
         return False
-    if int(topk) == 512 and num_heads is not None and int(num_heads) == 64:
-        # C4 (DSV4, heads=64/topk=512): both RTX-class SM120 and GB10/SM121
-        # favor the single-launch fused path through the measured B16 bucket.
+    if int(topk) == 512 and num_heads is not None and int(num_heads) in {32, 64}:
+        # C4 (DSV4 heads=64, GLM-5.3-Flash heads=32): both RTX-class SM120 and
+        # GB10/SM121 use the same fixed-page scorer and top-k specialization.
         return (
             compute_capability in {(12, 0), (12, 1)}
             and int(num_rows) <= _C4_B12X_FUSED_MAX_ROWS
@@ -569,7 +569,7 @@ def fused_indexer_scratch_max_rows(
 
     if (
         int(topk) == 512
-        and int(num_heads) == 64
+        and int(num_heads) in {32, 64}
         and compute_capability in {(12, 0), (12, 1)}
     ):
         return _C4_B12X_FUSED_MAX_ROWS
