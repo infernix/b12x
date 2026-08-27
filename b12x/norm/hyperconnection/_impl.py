@@ -58,14 +58,29 @@ class HyperConnectionCaps:
 
 @dataclass(frozen=True)
 class HyperConnectionBinding:
-    """Caller-owned output views for one fixed-capacity execution plan."""
+    """Caller-owned output capacity with token-limited accessors.
+
+    Mutating custom ops target the capacity tensors directly. The accessors
+    expose only the live token prefix to downstream operators.
+    """
 
     plan: "HyperConnectionPlan"
     tokens: int
-    normalized: torch.Tensor
-    bottleneck: torch.Tensor
-    block_input: torch.Tensor
-    combined: torch.Tensor
+    normalized_capacity: torch.Tensor
+    bottleneck_capacity: torch.Tensor
+    block_input_capacity: torch.Tensor
+
+    @property
+    def normalized(self) -> torch.Tensor:
+        return self.normalized_capacity[: self.tokens]
+
+    @property
+    def bottleneck(self) -> torch.Tensor:
+        return self.bottleneck_capacity[: self.tokens]
+
+    @property
+    def block_input(self) -> torch.Tensor:
+        return self.block_input_capacity[: self.tokens]
 
 
 @dataclass(frozen=True)
@@ -89,7 +104,6 @@ class HyperConnectionPlan:
             "normalized": (live_tokens, width),
             "bottleneck": (live_tokens, caps.lowrank),
             "block_input": (live_tokens, caps.hidden_size),
-            "combined": (live_tokens, width),
         }
 
     def _live_tokens(self, tokens: int | None) -> int:
@@ -106,62 +120,45 @@ class HyperConnectionPlan:
         normalized: torch.Tensor,
         bottleneck: torch.Tensor,
         block_input: torch.Tensor,
-        combined: torch.Tensor,
         tokens: int | None = None,
     ) -> HyperConnectionBinding:
         live_tokens = self._live_tokens(tokens)
         caps = self.caps
         width = caps.streams * caps.hidden_size
-        outputs = {
-            "normalized": _capacity_view(
-                normalized,
-                tokens=live_tokens,
-                tail=(width,),
-                dtype=caps.dtype,
-                device=caps.device,
-                name="normalized",
-            ),
-            "bottleneck": _capacity_view(
-                bottleneck,
-                tokens=live_tokens,
-                tail=(caps.lowrank,),
-                dtype=caps.dtype,
-                device=caps.device,
-                name="bottleneck",
-            ),
-            "block_input": _capacity_view(
-                block_input,
-                tokens=live_tokens,
-                tail=(caps.hidden_size,),
-                dtype=caps.dtype,
-                device=caps.device,
-                name="block_input",
-            ),
-            "combined": _capacity_view(
-                combined,
-                tokens=live_tokens,
-                tail=(width,),
-                dtype=caps.dtype,
-                device=caps.device,
-                name="combined",
-            ),
+        capacity_outputs = {
+            "normalized": normalized,
+            "bottleneck": bottleneck,
+            "block_input": block_input,
         }
+        tails = {
+            "normalized": (width,),
+            "bottleneck": (caps.lowrank,),
+            "block_input": (caps.hidden_size,),
+        }
+        for name, tensor in capacity_outputs.items():
+            _validate_capacity(
+                tensor,
+                tokens=live_tokens,
+                tail=tails[name],
+                dtype=caps.dtype,
+                device=caps.device,
+                name=name,
+            )
         # Dynamo cannot trace storage/data-pointer inspection. Callers that bind
         # fixed workspaces inside a compiled forward must validate the same
         # buffers once before compilation.
         if not torch.compiler.is_compiling():
-            for other_name in ("bottleneck", "block_input", "combined"):
-                if _overlaps(outputs["normalized"], outputs[other_name]):
+            for other_name in ("bottleneck", "block_input"):
+                if _overlaps(normalized, capacity_outputs[other_name]):
                     raise ValueError(
                         f"normalized and {other_name} outputs must not overlap"
                     )
         return HyperConnectionBinding(
             plan=self,
             tokens=live_tokens,
-            normalized=outputs["normalized"],
-            bottleneck=outputs["bottleneck"],
-            block_input=outputs["block_input"],
-            combined=outputs["combined"],
+            normalized_capacity=normalized,
+            bottleneck_capacity=bottleneck,
+            block_input_capacity=block_input,
         )
 
 
@@ -179,7 +176,7 @@ def plan_hyperconnection(caps: HyperConnectionCaps) -> HyperConnectionPlan:
     )
 
 
-def _capacity_view(
+def _validate_capacity(
     tensor: torch.Tensor,
     *,
     tokens: int,
@@ -187,7 +184,7 @@ def _capacity_view(
     dtype: torch.dtype,
     device: torch.device,
     name: str,
-) -> torch.Tensor:
+) -> None:
     if tensor.ndim != len(tail) + 1 or tuple(tensor.shape[1:]) != tail:
         raise ValueError(
             f"{name} must have tail shape {tail}, got {tuple(tensor.shape)}"
@@ -203,7 +200,6 @@ def _capacity_view(
         )
     if not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
-    return tensor[:tokens]
 
 
 def _byte_interval(tensor: torch.Tensor) -> tuple[int, int]:
@@ -223,10 +219,9 @@ def _validate_input(
     tensor: torch.Tensor,
     *,
     shape: tuple[int, ...],
-    binding: HyperConnectionBinding,
+    caps: HyperConnectionCaps,
     name: str,
 ) -> None:
-    caps = binding.plan.caps
     if tuple(tensor.shape) != shape:
         raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
     if tensor.dtype != caps.dtype or tensor.device != caps.device:
@@ -253,8 +248,8 @@ def _validate_output_disjoint(
             raise ValueError(f"{output_name} must not overlap {input_name}")
 
 
-def _require_cuda(binding: HyperConnectionBinding) -> None:
-    if binding.plan.caps.device.type != "cuda":
+def _require_cuda(plan: HyperConnectionPlan) -> None:
+    if plan.caps.device.type != "cuda":
         raise ValueError(
             "HyperConnection GPU entry points require CUDA; use the "
             "explicit reference module for an oracle"
@@ -275,14 +270,16 @@ def run_grouped_rmsnorm_impl(
     eps: float,
     binding: HyperConnectionBinding,
 ) -> torch.Tensor:
-    _require_cuda(binding)
+    _require_cuda(binding.plan)
     caps = binding.plan.caps
     width = caps.streams * caps.hidden_size
     shape = (binding.tokens, width)
-    _validate_input(state, shape=shape, binding=binding, name="state")
-    _validate_input(weight, shape=(width,), binding=binding, name="weight")
+    _validate_input(state, shape=shape, caps=caps, name="state")
+    _validate_input(weight, shape=(width,), caps=caps, name="weight")
     _validate_output_disjoint(
-        "normalized", binding.normalized, (("state", state), ("weight", weight))
+        "normalized",
+        binding.normalized_capacity,
+        (("state", state), ("weight", weight)),
     )
     eps = _require_eps(eps)
     if binding.tokens:
@@ -291,7 +288,7 @@ def run_grouped_rmsnorm_impl(
         run_grouped_rmsnorm(
             state,
             weight,
-            binding.normalized,
+            binding.normalized_capacity,
             eps=eps,
             streams=caps.streams,
             hidden_size=caps.hidden_size,
@@ -306,23 +303,25 @@ def run_scaled_silu_impl(
     *,
     binding: HyperConnectionBinding,
 ) -> torch.Tensor:
-    _require_cuda(binding)
+    _require_cuda(binding.plan)
     caps = binding.plan.caps
     _validate_input(
         projected_down,
         shape=(binding.tokens, caps.lowrank),
-        binding=binding,
+        caps=caps,
         name="projected_down",
     )
     _validate_output_disjoint(
-        "bottleneck", binding.bottleneck, (("projected_down", projected_down),)
+        "bottleneck",
+        binding.bottleneck_capacity,
+        (("projected_down", projected_down),),
     )
     if binding.tokens:
         from ._kernels import run_scaled_silu
 
         run_scaled_silu(
             projected_down,
-            binding.bottleneck,
+            binding.bottleneck_capacity,
             streams=caps.streams,
             block=binding.plan.pointwise_block,
         )
@@ -335,14 +334,14 @@ def run_gate_mean_impl(
     *,
     binding: HyperConnectionBinding,
 ) -> torch.Tensor:
-    _require_cuda(binding)
+    _require_cuda(binding.plan)
     caps = binding.plan.caps
     shape = (binding.tokens, caps.streams * caps.hidden_size)
-    _validate_input(normalized, shape=shape, binding=binding, name="normalized")
-    _validate_input(gate_logits, shape=shape, binding=binding, name="gate_logits")
+    _validate_input(normalized, shape=shape, caps=caps, name="normalized")
+    _validate_input(gate_logits, shape=shape, caps=caps, name="gate_logits")
     _validate_output_disjoint(
         "block_input",
-        binding.block_input,
+        binding.block_input_capacity,
         (("normalized", normalized), ("gate_logits", gate_logits)),
     )
     if binding.tokens:
@@ -351,7 +350,7 @@ def run_gate_mean_impl(
         run_gate_mean(
             normalized,
             gate_logits,
-            binding.block_input,
+            binding.block_input_capacity,
             streams=caps.streams,
             hidden_size=caps.hidden_size,
             block_h=binding.plan.pointwise_block,
@@ -363,25 +362,27 @@ def _validate_combine_inputs(
     state: torch.Tensor,
     block_output: torch.Tensor,
     injection_logits: torch.Tensor,
-    binding: HyperConnectionBinding,
+    *,
+    plan: HyperConnectionPlan,
+    tokens: int,
 ) -> None:
-    caps = binding.plan.caps
+    caps = plan.caps
     _validate_input(
         state,
-        shape=(binding.tokens, caps.streams * caps.hidden_size),
-        binding=binding,
+        shape=(tokens, caps.streams * caps.hidden_size),
+        caps=caps,
         name="state",
     )
     _validate_input(
         block_output,
-        shape=(binding.tokens, caps.hidden_size),
-        binding=binding,
+        shape=(tokens, caps.hidden_size),
+        caps=caps,
         name="block_output",
     )
     _validate_input(
         injection_logits,
-        shape=(binding.tokens, caps.streams),
-        binding=binding,
+        shape=(tokens, caps.streams),
+        caps=caps,
         name="injection_logits",
     )
 
@@ -391,34 +392,29 @@ def run_combine_impl(
     block_output: torch.Tensor,
     injection_logits: torch.Tensor,
     *,
-    binding: HyperConnectionBinding,
+    plan: HyperConnectionPlan,
 ) -> torch.Tensor:
-    _require_cuda(binding)
-    _validate_combine_inputs(state, block_output, injection_logits, binding)
-    _validate_output_disjoint(
-        "combined",
-        binding.combined,
-        (
-            ("state", state),
-            ("block_output", block_output),
-            ("injection_logits", injection_logits),
-        ),
+    _require_cuda(plan)
+    tokens = plan._live_tokens(state.shape[0])
+    _validate_combine_inputs(
+        state,
+        block_output,
+        injection_logits,
+        plan=plan,
+        tokens=tokens,
     )
-    if binding.tokens:
-        from ._kernels import run_combine
+    from ._kernels import run_combine
 
-        caps = binding.plan.caps
-        run_combine(
-            state,
-            block_output,
-            injection_logits,
-            binding.combined,
-            streams=caps.streams,
-            hidden_size=caps.hidden_size,
-            block_h=binding.plan.reduction_block_h,
-            num_warps=binding.plan.reduction_num_warps,
-        )
-    return binding.combined
+    caps = plan.caps
+    return run_combine(
+        state,
+        block_output,
+        injection_logits,
+        streams=caps.streams,
+        hidden_size=caps.hidden_size,
+        block_h=plan.reduction_block_h,
+        num_warps=plan.reduction_num_warps,
+    )
 
 
 def run_combine_norm_impl(
@@ -428,43 +424,38 @@ def run_combine_norm_impl(
     next_norm_weight: torch.Tensor,
     *,
     eps: float,
-    binding: HyperConnectionBinding,
+    plan: HyperConnectionPlan,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _require_cuda(binding)
-    caps = binding.plan.caps
-    _validate_combine_inputs(state, block_output, injection_logits, binding)
+    _require_cuda(plan)
+    caps = plan.caps
+    tokens = plan._live_tokens(state.shape[0])
+    _validate_combine_inputs(
+        state,
+        block_output,
+        injection_logits,
+        plan=plan,
+        tokens=tokens,
+    )
     _validate_input(
         next_norm_weight,
         shape=(caps.streams * caps.hidden_size,),
-        binding=binding,
+        caps=caps,
         name="next_norm_weight",
     )
-    inputs = (
-        ("state", state),
-        ("block_output", block_output),
-        ("injection_logits", injection_logits),
-        ("next_norm_weight", next_norm_weight),
-    )
-    _validate_output_disjoint("combined", binding.combined, inputs)
-    _validate_output_disjoint("normalized", binding.normalized, inputs)
     eps = _require_eps(eps)
-    if binding.tokens:
-        from ._kernels import run_combine_norm
+    from ._kernels import run_combine_norm
 
-        run_combine_norm(
-            state,
-            block_output,
-            injection_logits,
-            next_norm_weight,
-            binding.combined,
-            binding.normalized,
-            eps=eps,
-            streams=caps.streams,
-            hidden_size=caps.hidden_size,
-            block_h=binding.plan.reduction_block_h,
-            num_warps=binding.plan.reduction_num_warps,
-        )
-    return binding.combined, binding.normalized
+    return run_combine_norm(
+        state,
+        block_output,
+        injection_logits,
+        next_norm_weight,
+        eps=eps,
+        streams=caps.streams,
+        hidden_size=caps.hidden_size,
+        block_h=plan.reduction_block_h,
+        num_warps=plan.reduction_num_warps,
+    )
 
 
 __all__ = [

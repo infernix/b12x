@@ -360,36 +360,32 @@ def _gate_mean_fake(
     del normalized, gate_logits, out, streams, hidden_size, block_h
 
 
-@torch.library.custom_op("b12x::hyperconnection_combine", mutates_args=("combined",))
+@torch.library.custom_op(
+    "b12x::hyperconnection_combine",
+    mutates_args=(),
+)
 def _combine_op(
     state: torch.Tensor,
     block_output: torch.Tensor,
     injection_logits: torch.Tensor,
-    combined: torch.Tensor,
     streams: int,
     hidden_size: int,
     block_h: int,
     num_warps: int,
-) -> None:
-    _require_disjoint(
-        "combined",
-        combined,
-        (
-            ("state", state),
-            ("block_output", block_output),
-            ("injection_logits", injection_logits),
-        ),
-    )
-    _combine_launch(
-        state,
-        block_output,
-        injection_logits,
-        combined,
-        streams,
-        hidden_size,
-        block_h,
-        num_warps,
-    )
+) -> torch.Tensor:
+    combined = torch.empty_like(state)
+    if int(state.shape[0]) != 0:
+        _combine_launch(
+            state,
+            block_output,
+            injection_logits,
+            combined,
+            streams,
+            hidden_size,
+            block_h,
+            num_warps,
+        )
+    return combined
 
 
 @_combine_op.register_fake
@@ -397,54 +393,47 @@ def _combine_fake(
     state: torch.Tensor,
     block_output: torch.Tensor,
     injection_logits: torch.Tensor,
-    combined: torch.Tensor,
     streams: int,
     hidden_size: int,
     block_h: int,
     num_warps: int,
-) -> None:
-    del state, block_output, injection_logits, combined, streams, hidden_size
-    del block_h, num_warps
+) -> torch.Tensor:
+    del block_output, injection_logits, streams, hidden_size, block_h, num_warps
+    return torch.empty_like(state)
 
 
 @torch.library.custom_op(
     "b12x::hyperconnection_combine_norm",
-    mutates_args=("combined", "normalized"),
+    mutates_args=(),
 )
 def _combine_norm_op(
     state: torch.Tensor,
     block_output: torch.Tensor,
     injection_logits: torch.Tensor,
     next_norm_weight: torch.Tensor,
-    combined: torch.Tensor,
-    normalized: torch.Tensor,
     eps: float,
     streams: int,
     hidden_size: int,
     block_h: int,
     num_warps: int,
-) -> None:
-    inputs = (
-        ("state", state),
-        ("block_output", block_output),
-        ("injection_logits", injection_logits),
-        ("next_norm_weight", next_norm_weight),
-    )
-    _require_disjoint("combined", combined, inputs + (("normalized", normalized),))
-    _require_disjoint("normalized", normalized, inputs)
-    _combine_norm_launch(
-        state,
-        block_output,
-        injection_logits,
-        next_norm_weight,
-        combined,
-        normalized,
-        eps,
-        streams,
-        hidden_size,
-        block_h,
-        num_warps,
-    )
+) -> tuple[torch.Tensor, torch.Tensor]:
+    combined = torch.empty_like(state)
+    normalized = torch.empty_like(state)
+    if int(state.shape[0]) != 0:
+        _combine_norm_launch(
+            state,
+            block_output,
+            injection_logits,
+            next_norm_weight,
+            combined,
+            normalized,
+            eps,
+            streams,
+            hidden_size,
+            block_h,
+            num_warps,
+        )
+    return combined, normalized
 
 
 @_combine_norm_op.register_fake
@@ -453,16 +442,15 @@ def _combine_norm_fake(
     block_output: torch.Tensor,
     injection_logits: torch.Tensor,
     next_norm_weight: torch.Tensor,
-    combined: torch.Tensor,
-    normalized: torch.Tensor,
     eps: float,
     streams: int,
     hidden_size: int,
     block_h: int,
     num_warps: int,
-) -> None:
-    del state, block_output, injection_logits, next_norm_weight
-    del combined, normalized, eps, streams, hidden_size, block_h, num_warps
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del block_output, injection_logits, next_norm_weight, eps
+    del streams, hidden_size, block_h, num_warps
+    return torch.empty_like(state), torch.empty_like(state)
 
 
 def run_grouped_rmsnorm(
@@ -523,18 +511,16 @@ def run_combine(
     state: torch.Tensor,
     block_output: torch.Tensor,
     injection_logits: torch.Tensor,
-    combined: torch.Tensor,
     *,
     streams: int,
     hidden_size: int,
     block_h: int,
     num_warps: int,
-) -> None:
-    torch.ops.b12x.hyperconnection_combine(
+) -> torch.Tensor:
+    return torch.ops.b12x.hyperconnection_combine(
         state,
         block_output,
         injection_logits,
-        combined,
         int(streams),
         int(hidden_size),
         int(block_h),
@@ -547,22 +533,18 @@ def run_combine_norm(
     block_output: torch.Tensor,
     injection_logits: torch.Tensor,
     next_norm_weight: torch.Tensor,
-    combined: torch.Tensor,
-    normalized: torch.Tensor,
     *,
     eps: float,
     streams: int,
     hidden_size: int,
     block_h: int,
     num_warps: int,
-) -> None:
-    torch.ops.b12x.hyperconnection_combine_norm(
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops.b12x.hyperconnection_combine_norm(
         state,
         block_output,
         injection_logits,
         next_norm_weight,
-        combined,
-        normalized,
         float(eps),
         int(streams),
         int(hidden_size),

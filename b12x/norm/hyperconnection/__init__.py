@@ -4,10 +4,12 @@ The residual state is BF16 ``[T, S*H]`` and is logically ``[T, S, H]``.
 Projection GEMMs stay outside this op; this package owns the grouped norm,
 scaled activation, gate reduction, and residual injection kernels around them.
 
-Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` (views only) -> ``run_*``.
-All output storage is caller-owned and fixed before launch. The explicitly
-named ``reference`` module contains PyTorch correctness oracles and is never a
-runtime fallback for the public GPU entry points.
+Planned lifecycle: ``plan(Caps(...))`` supplies fixed launch policy. ``bind``
+attaches capacity storage for the grouped norm, scaled activation, and gate
+reduction launches. The combine launches return live-sized tensors owned by
+PyTorch so compiled graphs do not functionalize capacity-sized mutations. The
+explicitly named ``reference`` module contains PyTorch correctness oracles and
+is never a runtime fallback for the public GPU entry points.
 """
 
 from __future__ import annotations

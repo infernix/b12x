@@ -40,7 +40,6 @@ def _allocate_binding(
         block_input=torch.empty(
             (capacity, hidden_size), dtype=torch.bfloat16, device=device
         ),
-        combined=torch.empty((capacity, width), dtype=torch.bfloat16, device=device),
     )
 
 
@@ -144,12 +143,14 @@ def test_plan_bind_uses_live_views_and_no_scratch() -> None:
         "normalized": (3, 256),
         "bottleneck": (3, 16),
         "block_input": (3, 64),
-        "combined": (3, 256),
     }
     assert binding.normalized.shape == (3, 256)
     assert binding.bottleneck.shape == (3, 16)
     assert binding.block_input.shape == (3, 64)
-    assert binding.combined.shape == (3, 256)
+    assert binding.normalized_capacity.shape == (8, 256)
+    assert binding.bottleneck_capacity.shape == (8, 16)
+    assert binding.block_input_capacity.shape == (8, 64)
+    assert binding.normalized.data_ptr() == binding.normalized_capacity.data_ptr()
 
 
 def test_production_entry_point_never_falls_back_to_torch_on_cpu() -> None:
@@ -169,9 +170,8 @@ def test_bind_rejects_overlapping_outputs() -> None:
         hc.bind(
             plan,
             normalized=normalized,
-            bottleneck=torch.empty((2, 8), dtype=torch.bfloat16),
+            bottleneck=storage[:16].view(2, 8),
             block_input=torch.empty((2, 8), dtype=torch.bfloat16),
-            combined=storage.view(2, 32),
         )
 
 
@@ -185,7 +185,6 @@ def test_bind_rejects_normalized_live_range_alias(overlap_name: str) -> None:
         "normalized": normalized,
         "bottleneck": torch.empty((2, 8), dtype=torch.bfloat16),
         "block_input": torch.empty((2, 8), dtype=torch.bfloat16),
-        "combined": torch.empty((2, 32), dtype=torch.bfloat16),
     }
     outputs[overlap_name] = storage[:16].view(2, 8)
     with pytest.raises(ValueError, match=f"normalized and {overlap_name}"):
@@ -201,7 +200,6 @@ def test_bind_allows_outputs_with_disjoint_live_ranges_to_share_storage() -> Non
         normalized=torch.empty((2, 32), dtype=torch.bfloat16),
         bottleneck=shared,
         block_input=shared,
-        combined=torch.empty((2, 32), dtype=torch.bfloat16),
     )
     assert binding.bottleneck.data_ptr() == binding.block_input.data_ptr()
 
@@ -233,9 +231,6 @@ def test_live_launches_preserve_capacity_tails_and_read_only_inputs() -> None:
         "block_input": torch.full(
             (capacity, hidden_size), 7.0, dtype=torch.bfloat16, device=device
         ),
-        "combined": torch.full(
-            (capacity, width), 7.0, dtype=torch.bfloat16, device=device
-        ),
     }
     binding = hc.bind(plan, tokens=tokens, **outputs)
     state = randn((tokens, width))
@@ -258,14 +253,14 @@ def test_live_launches_preserve_capacity_tails_and_read_only_inputs() -> None:
     normalized = hc.run_grouped_rmsnorm(state, norm_weight, eps=1e-6, binding=binding)
     hc.run_scaled_silu(projected_down, binding=binding)
     hc.run_gate_mean(normalized, gate_logits, binding=binding)
-    hc.run_combine(state, block_output, injection_logits, binding=binding)
+    hc.run_combine(state, block_output, injection_logits, plan=plan)
     hc.run_combine_norm(
         state,
         block_output,
         injection_logits,
         norm_weight,
         eps=1e-6,
-        binding=binding,
+        plan=plan,
     )
     torch.cuda.synchronize(device)
 
@@ -351,19 +346,18 @@ def test_target_kernels_match_reference(tokens: int) -> None:
     block_input_ref = hc.reference.gate_mean(normalized, gate_logits, streams=streams)
     torch.testing.assert_close(block_input, block_input_ref, rtol=0, atol=8e-3)
 
-    combined = hc.run_combine(state, block_output, injection_logits, binding=binding)
+    combined = hc.run_combine(state, block_output, injection_logits, plan=binding.plan)
     combined_ref = hc.reference.combine(
         state, block_output, injection_logits, streams=streams
     )
     torch.testing.assert_close(combined, combined_ref, rtol=0, atol=8e-3)
-
     combined, next_normalized = hc.run_combine_norm(
         state,
         block_output,
         injection_logits,
         norm_weight,
         eps=eps,
-        binding=binding,
+        plan=binding.plan,
     )
     combined_ref, next_normalized_ref = hc.reference.combine_norm(
         state,
@@ -377,7 +371,7 @@ def test_target_kernels_match_reference(tokens: int) -> None:
     torch.testing.assert_close(next_normalized, next_normalized_ref, rtol=0, atol=2e-2)
 
 
-def test_combine_norm_cuda_graph_replay_uses_bound_outputs() -> None:
+def test_combine_norm_cuda_graph_replay_uses_stable_outputs() -> None:
     device = require_sm120()
     tokens, streams, hidden_size = 2, 4, 2560
     width = streams * hidden_size
@@ -393,11 +387,13 @@ def test_combine_norm_cuda_graph_replay_uses_bound_outputs() -> None:
     weight = (
         torch.randn((width,), dtype=torch.bfloat16, device=device).div_(32).contiguous()
     )
-    binding = _allocate_binding(
-        device=device,
-        tokens=tokens,
-        hidden_size=hidden_size,
-        streams=streams,
+    plan = hc.plan(
+        hc.Caps(
+            device=device,
+            max_tokens=tokens,
+            hidden_size=hidden_size,
+            streams=streams,
+        )
     )
 
     hc.run_combine_norm(
@@ -406,7 +402,7 @@ def test_combine_norm_cuda_graph_replay_uses_bound_outputs() -> None:
         injection_logits,
         weight,
         eps=1e-6,
-        binding=binding,
+        plan=plan,
     )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -416,8 +412,9 @@ def test_combine_norm_cuda_graph_replay_uses_bound_outputs() -> None:
             injection_logits,
             weight,
             eps=1e-6,
-            binding=binding,
+            plan=plan,
         )
+    output_addresses = combined.data_ptr(), normalized.data_ptr()
 
     state.copy_(torch.randn_like(state))
     block_output.copy_(torch.randn_like(block_output))
@@ -435,14 +432,13 @@ def test_combine_norm_cuda_graph_replay_uses_bound_outputs() -> None:
     torch.cuda.synchronize(device)
     allocated_after = torch.cuda.memory_allocated(device)
 
-    assert combined.data_ptr() == binding.combined.data_ptr()
-    assert normalized.data_ptr() == binding.normalized.data_ptr()
+    assert (combined.data_ptr(), normalized.data_ptr()) == output_addresses
     assert allocated_after == allocated_before
     torch.testing.assert_close(combined, expected_combined, rtol=0, atol=8e-3)
     torch.testing.assert_close(normalized, expected_normalized, rtol=0, atol=2e-2)
 
 
-def test_target_full_chain_cuda_graph_replay_uses_bound_outputs() -> None:
+def test_target_full_chain_cuda_graph_replay_uses_stable_outputs() -> None:
     device = require_sm120()
     tokens, streams, hidden_size, lowrank = 3, 4, 2560, 320
     width = streams * hidden_size
@@ -476,7 +472,7 @@ def test_target_full_chain_cuda_graph_replay_uses_bound_outputs() -> None:
             injection_logits,
             norm_weight,
             eps=1e-6,
-            binding=binding,
+            plan=binding.plan,
         )
         return bottleneck, block_input, combined, next_normalized
 
@@ -512,11 +508,9 @@ def test_target_full_chain_cuda_graph_replay_uses_bound_outputs() -> None:
     allocated_after_replay = torch.cuda.memory_allocated(device)
 
     assert tuple(tensor.data_ptr() for tensor in captured) == output_addresses
-    assert output_addresses == (
+    assert output_addresses[:2] == (
         binding.bottleneck.data_ptr(),
         binding.block_input.data_ptr(),
-        binding.combined.data_ptr(),
-        binding.normalized.data_ptr(),
     )
     assert allocated_after_replay == allocated_before_replay
     torch.testing.assert_close(captured[0], bottleneck_ref, rtol=0, atol=8e-3)
@@ -525,7 +519,7 @@ def test_target_full_chain_cuda_graph_replay_uses_bound_outputs() -> None:
     torch.testing.assert_close(captured[3], next_normalized_ref, rtol=0, atol=2e-2)
 
 
-def test_combine_norm_torch_compile_fullgraph_uses_bound_outputs() -> None:
+def test_combine_norm_torch_compile_fullgraph_returns_live_outputs() -> None:
     device = require_sm120()
     tokens, streams, hidden_size = 2, 4, 2560
     width = streams * hidden_size
@@ -541,11 +535,13 @@ def test_combine_norm_torch_compile_fullgraph_uses_bound_outputs() -> None:
     weight = (
         torch.randn((width,), dtype=torch.bfloat16, device=device).div_(32).contiguous()
     )
-    binding = _allocate_binding(
-        device=device,
-        tokens=tokens,
-        hidden_size=hidden_size,
-        streams=streams,
+    plan = hc.plan(
+        hc.Caps(
+            device=device,
+            max_tokens=tokens,
+            hidden_size=hidden_size,
+            streams=streams,
+        )
     )
 
     def run(
@@ -557,7 +553,7 @@ def test_combine_norm_torch_compile_fullgraph_uses_bound_outputs() -> None:
             injection_logits,
             weight,
             eps=1e-6,
-            binding=binding,
+            plan=plan,
         )
 
     # Warm the Triton specialization before compiling, matching serving setup.
@@ -576,10 +572,72 @@ def test_combine_norm_torch_compile_fullgraph_uses_bound_outputs() -> None:
     combined, normalized = compiled(state)
     torch.cuda.synchronize(device)
 
-    assert combined.data_ptr() == binding.combined.data_ptr()
-    assert normalized.data_ptr() == binding.normalized.data_ptr()
+    assert combined.shape == state.shape
+    assert normalized.shape == state.shape
     torch.testing.assert_close(combined, expected_combined, rtol=0, atol=8e-3)
     torch.testing.assert_close(normalized, expected_normalized, rtol=0, atol=2e-2)
+
+
+def test_combine_norm_compile_avoids_recurrent_capacity_writebacks() -> None:
+    device = require_sm120()
+    tokens, capacity, streams, hidden_size = 2, 4096, 4, 2560
+    width = streams * hidden_size
+    plan = hc.plan(
+        hc.Caps(
+            device=device,
+            max_tokens=capacity,
+            hidden_size=hidden_size,
+            streams=streams,
+        )
+    )
+    state_capacity = torch.randn(
+        (capacity, width), dtype=torch.bfloat16, device=device
+    ).contiguous()
+    state = state_capacity[:tokens]
+    state_before = state.clone()
+    block_output = torch.randn(
+        (tokens, hidden_size), dtype=torch.bfloat16, device=device
+    ).contiguous()
+    injection_logits = torch.randn(
+        (tokens, streams), dtype=torch.bfloat16, device=device
+    ).contiguous()
+    weight = torch.randn((width,), dtype=torch.bfloat16, device=device).contiguous()
+
+    def run(live_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        combined, _ = hc.run_combine_norm(
+            live_state,
+            block_output,
+            injection_logits,
+            weight,
+            eps=1e-6,
+            plan=plan,
+        )
+        return hc.run_combine_norm(
+            combined,
+            block_output,
+            injection_logits,
+            weight,
+            eps=1e-6,
+            plan=plan,
+        )
+
+    run(state)
+    compiled = torch.compile(run, fullgraph=True, dynamic=True)
+    compiled(state)
+    torch.cuda.synchronize(device)
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as profiler:
+        compiled(state)
+        torch.cuda.synchronize(device)
+
+    event_names = {event.name for event in profiler.events()}
+    assert "_combine_norm_kernel" in event_names
+    assert not {name for name in event_names if name.startswith("triton_poi_fused")}
+    torch.testing.assert_close(state, state_before, rtol=0, atol=0)
 
 
 def test_bind_inside_torch_compile_fullgraph_uses_live_views() -> None:
@@ -605,25 +663,16 @@ def test_bind_inside_torch_compile_fullgraph_uses_live_views() -> None:
         "block_input": torch.empty(
             (capacity, hidden_size), dtype=torch.bfloat16, device=device
         ),
-        "combined": torch.empty((capacity, width), dtype=torch.bfloat16, device=device),
     }
-    block_output = torch.randn(
-        (tokens, hidden_size), dtype=torch.bfloat16, device=device
-    ).contiguous()
-    injection_logits = torch.randn(
-        (tokens, streams), dtype=torch.bfloat16, device=device
-    ).contiguous()
     weight = torch.randn((width,), dtype=torch.bfloat16, device=device).contiguous()
 
     # Validate the fixed workspace before compiling its live-prefix binding.
     hc.bind(plan, tokens=capacity, **outputs)
 
-    def run(live_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def run(live_state: torch.Tensor) -> torch.Tensor:
         binding = hc.bind(plan, tokens=live_state.shape[0], **outputs)
-        return hc.run_combine_norm(
+        return hc.run_grouped_rmsnorm(
             live_state,
-            block_output,
-            injection_logits,
             weight,
             eps=1e-6,
             binding=binding,
@@ -634,10 +683,9 @@ def test_bind_inside_torch_compile_fullgraph_uses_live_views() -> None:
     ).contiguous()
     run(state)
     compiled = torch.compile(run, fullgraph=True)
-    combined, normalized = compiled(state)
+    normalized = compiled(state)
     torch.cuda.synchronize(device)
 
-    assert combined.data_ptr() == outputs["combined"].data_ptr()
     assert normalized.data_ptr() == outputs["normalized"].data_ptr()
 
 

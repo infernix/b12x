@@ -17,7 +17,7 @@ from ._impl import run_scaled_silu_impl as run_scaled_silu
 
 
 def bind(plan: Plan, **kwargs) -> Binding:
-    """Bind caller-owned output storage; creates views and never allocates."""
+    """Bind caller-owned capacity storage and expose live-prefix views."""
     return plan.bind(**kwargs)
 
 
