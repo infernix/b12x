@@ -211,7 +211,6 @@ def launch_sparse_paged_gqa(
         q_heads=int(query.shape[1]),
         kv_heads=int(key_cache.shape[2]),
         head_dim=int(query.shape[2]),
-        page_size=int(key_cache.shape[1]),
         selection_width=int(selected_positions.shape[1]),
         block_n=block_n,
         splits=splits,

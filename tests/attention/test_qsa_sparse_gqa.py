@@ -40,8 +40,8 @@ def test_qsa_caps_do_not_gate_architecture_and_reject_non_qwen_geometry(
         qsa.Caps(**values)
 
 
-@pytest.mark.parametrize("page_size", [16, 1504])
-def test_qsa_caps_accepts_supported_qwen_page_sizes(
+@pytest.mark.parametrize("page_size", [16, 1504, 3008])
+def test_qsa_caps_accepts_runtime_qwen_page_sizes(
     monkeypatch: pytest.MonkeyPatch,
     page_size: int,
 ) -> None:
@@ -587,11 +587,11 @@ def test_sparse_gqa_matches_reference_for_1504_token_pages() -> None:
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=2e-2)
 
 
-def test_sparse_gqa_fp8_cache_matches_dequantized_reference_and_graph_replay() -> None:
+def test_sparse_gqa_fp8_3008_page_matches_reference_and_graph_replay() -> None:
     device = require_sm120()
     generator = torch.Generator(device="cpu").manual_seed(93803)
     rows, q_heads, kv_heads, head_dim = 1, 12, 1, 256
-    page_size, selection_width, splits = 16, 2051, 64
+    page_size, selection_width, splits = 3008, 2051, 64
     pages = 6
     key_source, value_source = _cache_layout(
         pages=pages,
@@ -614,13 +614,25 @@ def test_sparse_gqa_fp8_cache_matches_dequantized_reference_and_graph_replay() -
         device="cpu",
     ).to(device=device, dtype=torch.bfloat16)
     request_ids = torch.zeros((rows,), dtype=torch.int64, device=device)
-    query_positions = torch.tensor([63], dtype=torch.int64, device=device)
+    query_positions = torch.tensor(
+        [4 * page_size - 1], dtype=torch.int64, device=device
+    )
     selected_positions = torch.full(
         (rows, selection_width), -1, dtype=torch.int32, device=device
     )
-    selected_positions[0, :64] = torch.randperm(
-        64, generator=generator, dtype=torch.int64
-    ).to(device=device, dtype=torch.int32)
+    selected_positions[0, :64] = torch.tensor(
+        [
+            0,
+            page_size - 1,
+            page_size,
+            2 * page_size - 1,
+            2 * page_size,
+            3 * page_size - 1,
+            *range(1, 59),
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
     output = torch.empty_like(query)
     partial_output = torch.empty(
         (rows, splits, q_heads, head_dim), dtype=torch.float32, device=device
@@ -863,7 +875,7 @@ def test_sparse_gqa_reuses_binaries_across_runtime_rows_and_page_sizes(
         assert compiled_after_first_launch.count("_SparseGqaMergeKernel") == 1
 
         freeze_kernel_resolution("QSA runtime-row cache reuse test")
-        assert torch.count_nonzero(launch(17, 1504)).item() == 0
+        assert torch.count_nonzero(launch(17, 3008)).item() == 0
         assert tuple(compile_targets) == compiled_after_first_launch
     finally:
         unfreeze_kernel_resolution()

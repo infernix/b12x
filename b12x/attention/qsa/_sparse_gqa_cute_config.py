@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 
 HEAD_DIM = 256
-SUPPORTED_PAGE_SIZES = frozenset({16, 1504})
 SELECTION_WIDTH = 2051
 BLOCK_N = 16
 NUM_SPLITS = 64
@@ -40,7 +39,6 @@ def is_qwen_geometry(
     q_heads: int,
     kv_heads: int,
     head_dim: int,
-    page_size: int,
     selection_width: int,
     block_n: int,
     splits: int,
@@ -49,7 +47,6 @@ def is_qwen_geometry(
     return (
         (int(q_heads), int(kv_heads)) in SUPPORTED_HEAD_LAYOUTS
         and int(head_dim) == HEAD_DIM
-        and int(page_size) in SUPPORTED_PAGE_SIZES
         and int(selection_width) == SELECTION_WIDTH
         and int(block_n) == BLOCK_N
         and int(splits) == NUM_SPLITS
@@ -91,7 +88,6 @@ def is_candidate(
             q_heads=q_heads,
             kv_heads=head_layout[1],
             head_dim=head_dim,
-            page_size=int(key_cache.shape[1]),
             selection_width=int(selected_positions.shape[1]),
             block_n=block_n,
             splits=splits,
@@ -151,7 +147,6 @@ __all__ = [
     "NUM_SPLITS",
     "SELECTION_WIDTH",
     "SUPPORTED_HEAD_LAYOUTS",
-    "SUPPORTED_PAGE_SIZES",
     "is_candidate",
     "is_qwen_geometry",
 ]

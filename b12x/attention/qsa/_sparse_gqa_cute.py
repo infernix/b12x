@@ -472,7 +472,7 @@ def is_supported(
     block_n: int,
     splits: int,
 ) -> bool:
-    """Return whether tensors match the qualified Qwen split specialization."""
+    """Return whether tensors match the Qwen split-kernel contract."""
     return is_candidate(
         query=query,
         key_cache=key_cache,

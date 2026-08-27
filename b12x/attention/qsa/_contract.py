@@ -255,7 +255,6 @@ class Caps:
         from ._sparse_gqa_cute_config import (
             BLOCK_N as QWEN_CUTE_BLOCK_N,
             NUM_SPLITS as QWEN_CUTE_NUM_SPLITS,
-            SUPPORTED_PAGE_SIZES as QWEN_CUTE_PAGE_SIZES,
             is_qwen_geometry,
         )
 
@@ -263,7 +262,6 @@ class Caps:
             q_heads=int(self.q_heads),
             kv_heads=int(self.kv_heads),
             head_dim=int(self.head_dim),
-            page_size=int(self.main_page_size),
             selection_width=int(self.selection_width),
             block_n=QWEN_CUTE_BLOCK_N,
             splits=QWEN_CUTE_NUM_SPLITS,
@@ -271,8 +269,7 @@ class Caps:
             raise NotImplementedError(
                 "QSA requires the CuTe Qwen sparse-GQA geometry "
                 "(q_heads, kv_heads) in {(6, 1), (12, 1), (24, 2)}, "
-                "head_dim=256, main_page_size in "
-                f"{sorted(QWEN_CUTE_PAGE_SIZES)}, and selection_width=2051"
+                "head_dim=256, and selection_width=2051"
             )
         if not _is_power_of_two(self.head_dim) or int(self.head_dim) < 16:
             raise ValueError("head_dim must be a power of two at least 16")
@@ -517,7 +514,6 @@ def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
         BLOCK_N as QWEN_CUTE_BLOCK_N,
         NUM_SPLITS as QWEN_CUTE_NUM_SPLITS,
         SUPPORTED_HEAD_LAYOUTS,
-        SUPPORTED_PAGE_SIZES,
         is_qwen_geometry,
     )
 
@@ -527,7 +523,6 @@ def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
         q_heads=int(caps.q_heads),
         kv_heads=int(caps.kv_heads),
         head_dim=int(caps.head_dim),
-        page_size=int(caps.main_page_size),
         selection_width=int(caps.selection_width),
         block_n=QWEN_CUTE_BLOCK_N,
         splits=QWEN_CUTE_NUM_SPLITS,
@@ -535,9 +530,8 @@ def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
         return QWEN_CUTE_BLOCK_N, QWEN_CUTE_NUM_SPLITS
     raise NotImplementedError(
         "QSA requires the CuTe Qwen sparse-GQA geometry: q_heads/kv_heads in "
-        f"{sorted(SUPPORTED_HEAD_LAYOUTS)}, head_dim=256, main_page_size in "
-        f"{sorted(SUPPORTED_PAGE_SIZES)}, "
-        f"selection_width=2051; got q_heads={caps.q_heads}, "
+        f"{sorted(SUPPORTED_HEAD_LAYOUTS)}, head_dim=256, selection_width=2051; "
+        f"got q_heads={caps.q_heads}, "
         f"kv_heads={caps.kv_heads}, head_dim={caps.head_dim}, "
         f"main_page_size={caps.main_page_size}, "
         f"selection_width={caps.selection_width}"
