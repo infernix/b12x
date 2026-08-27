@@ -40,10 +40,11 @@ META = OpMeta(
     test_path="tests/sequence/test_mtp_feedback.py",
     since="1.3.0",
     notes=(
-        "Qualified SM120 Qwen token counts use Triton normalization and "
-        "CuTeDSL projection GEMMs. Research-only CuTeDSL normalization stages "
-        "are retained for direct qualification. Unqualified counts and layouts "
-        "retain the Triton projection implementation."
+        "Qualified SM120 Qwen S=4,H=2560 uses mandatory capacity-specialized "
+        "CuTeDSL projection GEMMs with runtime live-row grids. Triton is used "
+        "only by the normalization and reduction auxiliaries feeding those "
+        "projections. Other geometries, capabilities, or tensor contracts are "
+        "unsupported."
     ),
 )
 

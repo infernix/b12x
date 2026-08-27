@@ -40,8 +40,7 @@ def _sum_block(value: Float32, reduction: cute.Tensor) -> Float32:
 
 
 class _TokenNorm:
-    def __init__(self, tokens: int, hidden_size: int) -> None:
-        self.tokens = int(tokens)
+    def __init__(self, hidden_size: int) -> None:
         self.hidden_size = int(hidden_size)
         self.items = (self.hidden_size + _THREADS - 1) // _THREADS
 
@@ -52,10 +51,11 @@ class _TokenNorm:
         weight: cute.Pointer,
         output: cute.Pointer,
         eps: Float32,
+        tokens: Int32,
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(source, weight, output, eps).launch(
-            grid=(self.tokens, 1, 1),
+            grid=(tokens, 1, 1),
             block=(_THREADS, 1, 1),
             stream=stream,
         )
@@ -110,8 +110,7 @@ class _TokenNorm:
 
 
 class _StateNorm:
-    def __init__(self, tokens: int, streams: int, hidden_size: int) -> None:
-        self.tokens = int(tokens)
+    def __init__(self, streams: int, hidden_size: int) -> None:
         self.streams = int(streams)
         self.hidden_size = int(hidden_size)
         self.items = (self.hidden_size + _THREADS - 1) // _THREADS
@@ -123,10 +122,11 @@ class _StateNorm:
         weight: cute.Pointer,
         output: cute.Pointer,
         eps: Float32,
+        tokens: Int32,
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(source, weight, output, eps).launch(
-            grid=(self.tokens, 1, 1),
+            grid=(tokens, 1, 1),
             block=(_THREADS, 1, 1),
             stream=stream,
         )
@@ -216,7 +216,7 @@ def _launch(
     device_index = source.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    key = (kind, int(device_index), int(tokens), int(streams), int(hidden_size))
+    key = (kind, int(device_index), int(streams), int(hidden_size))
     with torch.cuda.device(device_index):
         capturing = torch.cuda.is_current_stream_capturing()
         with _LOCK:
@@ -240,10 +240,11 @@ def _launch(
                         _fake_pointer(),
                         _fake_pointer(),
                         Float32(1.0e-6),
+                        Int32(1),
                         current_cuda_stream(),
                         compile_spec=KernelCompileSpec.from_key(
                             "sequence.mtp_feedback.norm",
-                            1,
+                            2,
                             key,
                         ),
                     )
@@ -255,6 +256,7 @@ def _launch(
                 _pointer(weight),
                 _pointer(output),
                 float(eps),
+                int(tokens),
                 current_cuda_stream(),
             ),
         )
@@ -275,7 +277,7 @@ def token_norm(
     tokens = int(source.shape[0])
     _launch(
         "token",
-        _TokenNorm(tokens, hidden_size),
+        _TokenNorm(hidden_size),
         source,
         weight,
         output,
@@ -298,7 +300,7 @@ def state_norm(
     tokens = int(source.shape[0])
     _launch(
         "state",
-        _StateNorm(tokens, streams, hidden_size),
+        _StateNorm(streams, hidden_size),
         source,
         weight,
         output,

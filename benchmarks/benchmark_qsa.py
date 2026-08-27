@@ -1606,10 +1606,9 @@ def main(argv: list[str] | None = None) -> int:
             device = torch.device("cuda", torch.cuda.current_device())
         torch.cuda.set_device(device)
         capability = torch.cuda.get_device_capability(device)
-        if capability not in ((12, 0), (12, 1)):
+        if capability != (12, 0):
             raise BenchmarkFailure(
-                "QSA benchmarking requires SM120/SM121, got "
-                f"SM{capability[0]}{capability[1]}"
+                f"QSA benchmarking requires SM120, got SM{capability[0]}{capability[1]}"
             )
         cases = _resolve_cases(args)
         l2_flush = make_l2_flush_fn(args.flush_l2, bytes_hint=args.l2_flush_bytes)

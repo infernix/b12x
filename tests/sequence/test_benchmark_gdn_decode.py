@@ -19,14 +19,21 @@ def test_cli_refuses_to_overwrite_existing_evidence(tmp_path) -> None:
     assert output.read_text(encoding="utf-8") == "preserved\n"
 
 
-def test_release_corpus_contains_exact_qwen_tp2_and_compatibility_geometries() -> None:
+def test_release_corpus_contains_only_exact_qwen_tp2_geometry() -> None:
     by_name = {case.name: case for case in benchmark.QWEN38_GDN_CASES}
-    release = by_name["tp2-decode-bs1"]
-    assert (release.key_heads, release.value_heads) == (8, 24)
-    assert release.state_dtype == torch.float32
-    assert by_name["tp1-decode-bs1"].key_heads == 16
-    assert by_name["tp4-decode-bs4"].key_heads == 4
-    assert all(case.value_heads == 3 * case.key_heads for case in by_name.values())
+    assert set(by_name) == {
+        "tp2-decode-bs1",
+        "tp2-decode-bs4",
+        "tp2-spec2-bs4",
+        "tp2-spec4-bs1",
+        "tp2-spec4-uneven",
+        "tp2-spec4-bs4",
+    }
+    assert all(
+        (case.key_heads, case.value_heads, case.state_dtype)
+        == (8, 24, torch.float32)
+        for case in by_name.values()
+    )
 
 
 def test_speculative_cases_preserve_sequential_request_geometry() -> None:
@@ -36,29 +43,31 @@ def test_speculative_cases_preserve_sequential_request_geometry() -> None:
     assert case.tokens == 10
     assert case.sequences == 4
     assert case.columns == 4
+    assert by_name["tp2-spec2-bs4"].query_lengths == (2, 2, 2, 2)
+    assert by_name["tp2-spec4-bs4"].query_lengths == (4, 4, 4, 4)
 
 
 def test_fixed_serving_capacity_is_independent_of_live_metadata() -> None:
     by_name = {case.name: case for case in benchmark.QWEN38_GDN_CASES}
     for name in ("tp2-decode-bs1", "tp2-decode-bs4", "tp2-spec4-bs1"):
         assert benchmark.resolve_capacity(
-            by_name[name], capacity_seqs=32, capacity_columns=4
-        ) == (32, 4, 128)
+            by_name[name], capacity_seqs=None, capacity_columns=None
+        ) == (4, 4, 16)
 
-    with pytest.raises(ValueError, match="live sequences"):
+    with pytest.raises(ValueError, match="qualified fixed capacity"):
         benchmark.resolve_capacity(
-            by_name["tp2-decode-bs4"], capacity_seqs=3, capacity_columns=4
+            by_name["tp2-decode-bs4"], capacity_seqs=32, capacity_columns=4
         )
-    with pytest.raises(ValueError, match="live width"):
+    with pytest.raises(ValueError, match="qualified fixed capacity"):
         benchmark.resolve_capacity(
-            by_name["tp2-spec4-bs1"], capacity_seqs=32, capacity_columns=3
+            by_name["tp2-spec4-bs1"], capacity_seqs=4, capacity_columns=3
         )
 
 
 def test_case_selection_is_ordered_and_rejects_unknown_names() -> None:
-    selected = benchmark.select_cases("tp4-decode-bs4,tp2-decode-bs1")
+    selected = benchmark.select_cases("tp2-spec4-bs4,tp2-decode-bs1")
     assert [case.name for case in selected] == [
-        "tp4-decode-bs4",
+        "tp2-spec4-bs4",
         "tp2-decode-bs1",
     ]
     with pytest.raises(ValueError, match="unknown cases"):

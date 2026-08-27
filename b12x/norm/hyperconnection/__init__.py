@@ -46,9 +46,11 @@ META = OpMeta(
     test_path="tests/norm/test_hyperconnection.py",
     since="1.3.0",
     notes=(
-        "Triton production kernels for the Qwen3.8 Flash Next S=4, H=2560, "
-        "R=320 BF16 contract. Research-only CuTeDSL kernels are available in "
-        "the private _cute module; they do not match Triton throughput."
+        "The Qwen3.8 Flash Next S=4, H=2560, R=320 BF16 contract uses the "
+        "CuTeDSL combine+norm kernel for every non-empty live token count on "
+        "SM120. Unsupported geometry, layout, or capability fails instead of "
+        "falling back. Triton is used only for the auxiliary normalization, "
+        "activation, gate-reduction, and final residual-injection stages."
     ),
 )
 

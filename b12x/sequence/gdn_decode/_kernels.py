@@ -1,4 +1,4 @@
-"""Opaque Triton launches for packed sequential GDN decode and output gating."""
+"""Opaque launches for packed sequential GDN decode and output gating."""
 
 from __future__ import annotations
 
@@ -8,6 +8,12 @@ import triton.language as tl
 
 
 _VALIDATION_BLOCK = 256
+_QWEN38_CUTE_MAX_TOKENS = 16
+_QWEN38_CUTE_MAX_SEQS = 4
+_QWEN38_CUTE_STATE_INDEX_COLUMNS = 4
+_QWEN38_CUTE_KEY_HEADS = 8
+_QWEN38_CUTE_VALUE_HEADS = 24
+_QWEN38_CUTE_HEAD_DIM = 128
 
 
 @triton.jit
@@ -141,7 +147,7 @@ def _validate_active_state_slots_kernel(
 
 
 @triton.jit
-def _packed_sequential_recurrent_decode_kernel(
+def _packed_sequential_kda_decode_kernel(
     mixed_qkv,
     a,
     b,
@@ -174,11 +180,9 @@ def _packed_sequential_recurrent_decode_kernel(
     VALUE_HEADS: tl.constexpr,
     KEY_HEAD_DIM: tl.constexpr,
     VALUE_HEAD_DIM: tl.constexpr,
-    HEAD_RATIO: tl.constexpr,
     STATE_INDEX_COLUMNS: tl.constexpr,
     BLOCK_V: tl.constexpr,
     QK_L2NORM: tl.constexpr,
-    LOWER_BOUNDED_KDA: tl.constexpr,
     HAS_NULL_STATE_INDEX: tl.constexpr,
     NULL_STATE_INDEX: tl.constexpr,
 ):
@@ -186,7 +190,7 @@ def _packed_sequential_recurrent_decode_kernel(
     request_value_head = tl.program_id(1)
     request = request_value_head // VALUE_HEADS
     value_head = request_value_head % VALUE_HEADS
-    key_head = value_head // HEAD_RATIO
+    key_head = value_head
 
     live_seqs = tl.load(num_seqs).to(tl.int32)
     if (request >= tl.maximum(0, tl.minimum(live_seqs, MAX_SEQS))) | (
@@ -266,45 +270,26 @@ def _packed_sequential_recurrent_decode_kernel(
                 + value_head.to(tl.int64) * stride_b_head
             ).to(tl.float32)
             A_log_value = tl.load(A_log + value_head).to(tl.float32)
-            if LOWER_BOUNDED_KDA:
-                raw_gate = tl.load(
-                    a
-                    + token_i64 * stride_a_token
-                    + value_head.to(tl.int64) * stride_a_head
-                    + key_cols.to(tl.int64),
-                    mask=key_mask,
-                    other=0.0,
-                ).to(tl.float32)
-                gate_bias = tl.load(
-                    dt_bias
-                    + value_head.to(tl.int64) * stride_dt_bias_head
-                    + key_cols.to(tl.int64),
-                    mask=key_mask,
-                    other=0.0,
-                ).to(tl.float32)
-                log_decay = lower_bound * tl.sigmoid(
-                    tl.exp(A_log_value) * (raw_gate + gate_bias)
-                )
-                state *= tl.exp(log_decay)[None, :]
-                beta = tl.sigmoid(b_value)
-            else:
-                a_value = tl.load(
-                    a
-                    + token_i64 * stride_a_token
-                    + value_head.to(tl.int64) * stride_a_head
-                ).to(tl.float32)
-                dt_bias_value = tl.load(
-                    dt_bias + value_head.to(tl.int64) * stride_dt_bias_head
-                ).to(tl.float32)
-                softplus_input = a_value + dt_bias_value
-                softplus = tl.where(
-                    softplus_input <= 20.0,
-                    tl.log(1.0 + tl.exp(softplus_input)),
-                    softplus_input,
-                )
-                decay = tl.exp(-tl.exp(A_log_value) * softplus)
-                state *= decay
-                beta = tl.sigmoid(b_value).to(tl.bfloat16).to(tl.float32)
+            raw_gate = tl.load(
+                a
+                + token_i64 * stride_a_token
+                + value_head.to(tl.int64) * stride_a_head
+                + key_cols.to(tl.int64),
+                mask=key_mask,
+                other=0.0,
+            ).to(tl.float32)
+            gate_bias = tl.load(
+                dt_bias
+                + value_head.to(tl.int64) * stride_dt_bias_head
+                + key_cols.to(tl.int64),
+                mask=key_mask,
+                other=0.0,
+            ).to(tl.float32)
+            log_decay = lower_bound * tl.sigmoid(
+                tl.exp(A_log_value) * (raw_gate + gate_bias)
+            )
+            state *= tl.exp(log_decay)[None, :]
+            beta = tl.sigmoid(b_value)
 
             value -= tl.sum(state * k[None, :], axis=1)
             value *= beta
@@ -403,6 +388,130 @@ def _gated_rmsnorm_kernel(
     tl.store(output + output_offsets, weighted * gate, mask=mask)
 
 
+def _is_qualified_qwen38_cute_recurrence(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    max_tokens: int,
+    max_seqs: int,
+    state_index_columns: int,
+    key_heads: int,
+    value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    sigmoid_gate: bool,
+    qk_l2norm: bool,
+    lower_bounded_kda: bool,
+    has_null_state_index: bool,
+    compute_capability: tuple[int, int] | None = None,
+) -> bool:
+    """Return whether this binding is the qualified Qwen3.8 TP2 contract."""
+    if compute_capability is None:
+        if not mixed_qkv.is_cuda:
+            return False
+        compute_capability = torch.cuda.get_device_capability(mixed_qkv.device)
+    return (
+        tuple(map(int, compute_capability)) == (12, 0)
+        and int(max_tokens) == _QWEN38_CUTE_MAX_TOKENS
+        and int(max_seqs) == _QWEN38_CUTE_MAX_SEQS
+        and int(state_index_columns) == _QWEN38_CUTE_STATE_INDEX_COLUMNS
+        and int(key_heads) == _QWEN38_CUTE_KEY_HEADS
+        and int(value_heads) == _QWEN38_CUTE_VALUE_HEADS
+        and int(key_head_dim) == _QWEN38_CUTE_HEAD_DIM
+        and int(value_head_dim) == _QWEN38_CUTE_HEAD_DIM
+        and bool(sigmoid_gate)
+        and bool(qk_l2norm)
+        and not bool(lower_bounded_kda)
+        and not bool(has_null_state_index)
+        and mixed_qkv.dtype == torch.bfloat16
+        and a.dtype == torch.bfloat16
+        and b.dtype == torch.bfloat16
+        and A_log.dtype == torch.float32
+        and dt_bias.dtype in (torch.bfloat16, torch.float32)
+        and recurrent_state.dtype in (torch.bfloat16, torch.float32)
+        and state_indices.dtype == torch.int32
+        and output.dtype == torch.bfloat16
+    )
+
+
+def _make_qwen_binding(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    z: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    output: torch.Tensor,
+    duplicate_slots: torch.Tensor,
+    error_code: torch.Tensor,
+    *,
+    max_tokens: int,
+    max_seqs: int,
+    max_state_slots: int,
+    state_index_columns: int,
+    key_heads: int,
+    value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    sigmoid_gate: bool,
+    qk_l2norm: bool,
+    duplicate_table_size: int,
+):
+    from ._impl import Binding, Caps, plan
+
+    caps = Caps(
+        device=mixed_qkv.device,
+        max_tokens=max_tokens,
+        max_seqs=max_seqs,
+        max_state_slots=max_state_slots,
+        key_heads=key_heads,
+        value_heads=value_heads,
+        key_head_dim=key_head_dim,
+        value_head_dim=value_head_dim,
+        state_index_columns=state_index_columns,
+        model_dtype=mixed_qkv.dtype,
+        state_dtype=recurrent_state.dtype,
+        gate_activation="sigmoid" if sigmoid_gate else "silu",
+        qk_l2norm=qk_l2norm,
+    )
+    launch_plan = plan(caps)
+    if launch_plan.duplicate_table_size != duplicate_table_size:
+        raise ValueError("GDN duplicate-table capacity does not match the plan")
+    return Binding(
+        plan=launch_plan,
+        scratch=duplicate_slots,
+        duplicate_slots=duplicate_slots,
+        error_code=error_code,
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        z=z,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        norm_weight=norm_weight,
+        recurrent_state=recurrent_state,
+        query_start_loc=query_start_loc,
+        num_accepted_tokens=num_accepted_tokens,
+        state_indices=state_indices,
+        num_seqs=num_seqs,
+        num_tokens=num_tokens,
+        output=output,
+    )
+
+
 def _launch_gdn_decode(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -441,6 +550,43 @@ def _launch_gdn_decode(
     recurrent_num_warps: int,
     norm_num_warps: int,
 ) -> None:
+    qualified_qwen38_cute = _is_qualified_qwen38_cute_recurrence(
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        recurrent_state,
+        state_indices,
+        output,
+        max_tokens=max_tokens,
+        max_seqs=max_seqs,
+        state_index_columns=state_index_columns,
+        key_heads=key_heads,
+        value_heads=value_heads,
+        key_head_dim=key_head_dim,
+        value_head_dim=value_head_dim,
+        sigmoid_gate=sigmoid_gate,
+        qk_l2norm=qk_l2norm,
+        lower_bounded_kda=lower_bounded_kda,
+        has_null_state_index=has_null_state_index,
+    )
+    if lower_bounded_kda:
+        if key_heads != value_heads or not sigmoid_gate:
+            raise RuntimeError(
+                "GLM/KDA decode requires equal Q/K/V head counts and a "
+                "sigmoid output gate"
+            )
+    elif not qualified_qwen38_cute:
+        raise RuntimeError(
+            "Qwen3.8 GDN decode requires the qualified CuTe SM120 TP2 "
+            "contract: max_tokens=16, max_seqs=4, state_index_columns=4, "
+            "key_heads=8, value_heads=24, 128-wide heads, BF16 model tensors, "
+            "FP32 A_log, BF16 or FP32 dt_bias and recurrent state, int32 state "
+            "indices, sigmoid output gate, "
+            "Q/K L2 normalization, and no null state index"
+        )
+
     _reset_validation_kernel[(triton.cdiv(duplicate_table_size, _VALIDATION_BLOCK),)](
         duplicate_slots,
         error_code,
@@ -479,50 +625,84 @@ def _launch_gdn_decode(
         num_warps=1,
         num_stages=1,
     )
-    value_tiles = triton.cdiv(value_head_dim, block_v)
-    _packed_sequential_recurrent_decode_kernel[(value_tiles, max_seqs * value_heads)](
-        mixed_qkv,
-        a,
-        b,
-        A_log,
-        dt_bias,
-        recurrent_state,
-        query_start_loc,
-        num_accepted_tokens,
-        state_indices,
-        num_seqs,
-        output,
-        error_code,
-        float(scale),
-        float(lower_bound),
-        stride_mixed_token=int(mixed_qkv.stride(0)),
-        stride_a_token=int(a.stride(0)),
-        stride_a_head=int(a.stride(1)),
-        stride_b_token=int(b.stride(0)),
-        stride_b_head=int(b.stride(1)),
-        stride_dt_bias_head=int(dt_bias.stride(0)),
-        stride_state_slot=int(recurrent_state.stride(0)),
-        stride_state_head=int(recurrent_state.stride(1)),
-        stride_state_v=int(recurrent_state.stride(2)),
-        stride_indices_request=int(state_indices.stride(0)),
-        stride_indices_column=int(state_indices.stride(1)),
-        stride_output_token=int(output.stride(0)),
-        stride_output_head=int(output.stride(1)),
-        MAX_SEQS=int(max_seqs),
-        KEY_HEADS=int(key_heads),
-        VALUE_HEADS=int(value_heads),
-        KEY_HEAD_DIM=int(key_head_dim),
-        VALUE_HEAD_DIM=int(value_head_dim),
-        HEAD_RATIO=int(value_heads // key_heads),
-        STATE_INDEX_COLUMNS=int(state_index_columns),
-        BLOCK_V=int(block_v),
-        QK_L2NORM=bool(qk_l2norm),
-        LOWER_BOUNDED_KDA=bool(lower_bounded_kda),
-        HAS_NULL_STATE_INDEX=bool(has_null_state_index),
-        NULL_STATE_INDEX=int(null_state_index),
-        num_warps=int(recurrent_num_warps),
-        num_stages=3,
-    )
+    if qualified_qwen38_cute:
+        binding = _make_qwen_binding(
+            mixed_qkv,
+            a,
+            b,
+            z,
+            A_log,
+            dt_bias,
+            norm_weight,
+            recurrent_state,
+            query_start_loc,
+            num_accepted_tokens,
+            state_indices,
+            num_seqs,
+            num_tokens,
+            output,
+            duplicate_slots,
+            error_code,
+            max_tokens=max_tokens,
+            max_seqs=max_seqs,
+            max_state_slots=max_state_slots,
+            state_index_columns=state_index_columns,
+            key_heads=key_heads,
+            value_heads=value_heads,
+            key_head_dim=key_head_dim,
+            value_head_dim=value_head_dim,
+            sigmoid_gate=sigmoid_gate,
+            qk_l2norm=qk_l2norm,
+            duplicate_table_size=duplicate_table_size,
+        )
+        from ._cute_kernels import run_packed_recurrent_qwen
+
+        run_packed_recurrent_qwen(binding, scale=scale)
+    else:
+        value_tiles = triton.cdiv(value_head_dim, block_v)
+        _packed_sequential_kda_decode_kernel[
+            (value_tiles, max_seqs * value_heads)
+        ](
+            mixed_qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            recurrent_state,
+            query_start_loc,
+            num_accepted_tokens,
+            state_indices,
+            num_seqs,
+            output,
+            error_code,
+            float(scale),
+            float(lower_bound),
+            stride_mixed_token=int(mixed_qkv.stride(0)),
+            stride_a_token=int(a.stride(0)),
+            stride_a_head=int(a.stride(1)),
+            stride_b_token=int(b.stride(0)),
+            stride_b_head=int(b.stride(1)),
+            stride_dt_bias_head=int(dt_bias.stride(0)),
+            stride_state_slot=int(recurrent_state.stride(0)),
+            stride_state_head=int(recurrent_state.stride(1)),
+            stride_state_v=int(recurrent_state.stride(2)),
+            stride_indices_request=int(state_indices.stride(0)),
+            stride_indices_column=int(state_indices.stride(1)),
+            stride_output_token=int(output.stride(0)),
+            stride_output_head=int(output.stride(1)),
+            MAX_SEQS=int(max_seqs),
+            KEY_HEADS=int(key_heads),
+            VALUE_HEADS=int(value_heads),
+            KEY_HEAD_DIM=int(key_head_dim),
+            VALUE_HEAD_DIM=int(value_head_dim),
+            STATE_INDEX_COLUMNS=int(state_index_columns),
+            BLOCK_V=int(block_v),
+            QK_L2NORM=bool(qk_l2norm),
+            HAS_NULL_STATE_INDEX=bool(has_null_state_index),
+            NULL_STATE_INDEX=int(null_state_index),
+            num_warps=int(recurrent_num_warps),
+            num_stages=3,
+        )
     _gated_rmsnorm_kernel[(max_tokens * value_heads,)](
         output,
         z,

@@ -3,8 +3,9 @@
 
 The corpus fixes the production geometry at four residual streams and hidden
 size 2560, then covers single-token decode, a four-token speculative step, and
-three prefill sizes.  Every case validates the seeded PyTorch oracle before
-recording eager-launch and CUDA-graph-replay samples.
+four prefill sizes including a padded-row boundary. Every case validates the
+seeded PyTorch oracle before recording eager-launch and CUDA-graph-replay
+samples.
 """
 
 from __future__ import annotations
@@ -65,6 +66,7 @@ class Profile:
 PROFILES = (
     Profile(name="decode-t1", phase="decode", tokens=1),
     Profile(name="spec-t4", phase="spec", tokens=4),
+    Profile(name="prefill-t17", phase="prefill", tokens=17),
     Profile(name="prefill-t128", phase="prefill", tokens=128),
     Profile(name="prefill-t512", phase="prefill", tokens=512),
     Profile(name="prefill-t4096", phase="prefill", tokens=4096),
@@ -247,29 +249,41 @@ def _make_binding(
             generator=generator,
             device=device,
         ),
-        token_norm_weight=_randn_bf16(
-            (_HIDDEN_SIZE,),
-            scale=0.05,
-            generator=generator,
-            device=device,
+        token_norm_weight=torch.nn.Parameter(
+            _randn_bf16(
+                (_HIDDEN_SIZE,),
+                scale=0.05,
+                generator=generator,
+                device=device,
+            ),
+            requires_grad=False,
         ),
-        state_norm_weight=_randn_bf16(
-            (_STREAMS * _HIDDEN_SIZE,),
-            scale=0.05,
-            generator=generator,
-            device=device,
+        state_norm_weight=torch.nn.Parameter(
+            _randn_bf16(
+                (_STREAMS * _HIDDEN_SIZE,),
+                scale=0.05,
+                generator=generator,
+                device=device,
+            ),
+            requires_grad=False,
         ),
-        embedding_fc_weight=_randn_bf16(
-            (_HIDDEN_SIZE, _HIDDEN_SIZE),
-            scale=_HIDDEN_SIZE**-0.5,
-            generator=generator,
-            device=device,
+        embedding_fc_weight=torch.nn.Parameter(
+            _randn_bf16(
+                (_HIDDEN_SIZE, _HIDDEN_SIZE),
+                scale=_HIDDEN_SIZE**-0.5,
+                generator=generator,
+                device=device,
+            ),
+            requires_grad=False,
         ),
-        hidden_fc_weight=_randn_bf16(
-            (_HIDDEN_SIZE, _HIDDEN_SIZE),
-            scale=_HIDDEN_SIZE**-0.5,
-            generator=generator,
-            device=device,
+        hidden_fc_weight=torch.nn.Parameter(
+            _randn_bf16(
+                (_HIDDEN_SIZE, _HIDDEN_SIZE),
+                scale=_HIDDEN_SIZE**-0.5,
+                generator=generator,
+                device=device,
+            ),
+            requires_grad=False,
         ),
         output=output,
         tokens=profile.tokens,
@@ -526,8 +540,8 @@ def main(argv: list[str] | None = None) -> None:
     torch.cuda.set_device(device)
     device = torch.device("cuda", torch.cuda.current_device())
     major, minor = torch.cuda.get_device_capability(device)
-    if (major, minor) not in ((12, 0), (12, 1)):
-        raise SystemExit(f"SM120/SM121 is required, got SM{major}{minor}")
+    if (major, minor) != (12, 0):
+        raise SystemExit(f"SM120 is required, got SM{major}{minor}")
 
     properties = torch.cuda.get_device_properties(device)
     mode_before = nvidia_smi_gpu_mode_snapshot()
@@ -571,6 +585,9 @@ def main(argv: list[str] | None = None) -> None:
             "hidden_size": _HIDDEN_SIZE,
             "dtype": "bfloat16",
             "reference": "b12x.sequence.mtp_feedback.reference.feedback",
+            "projection_backend": "cutedsl",
+            "projection_specialization": "fixed_capacity_runtime_live_rows",
+            "triton_role": "normalization_and_reduction_auxiliaries",
             "eager_timed": True,
             "cuda_graph_replay_timed": True,
             "raw_samples_preserved": True,

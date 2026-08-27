@@ -1,14 +1,68 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from b12x.attention import qsa
 from b12x.attention.qsa._sparse_gqa import launch_sparse_paged_gqa
 from b12x.attention.qsa import _sparse_gqa_cute_config as cute_config
+from b12x.attention.qsa import _sparse_gqa as sparse_gqa
+from b12x.attention.qsa._contract import _target_splits
 
 from ..conftest import require_b12x as require_sm120
+
+
+def test_qsa_caps_reject_non_sm120_and_non_qwen_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = dict(
+        device="cuda:0",
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=1,
+        max_seq_len=32,
+        num_main_cache_pages=2,
+        num_compressed_cache_pages=2,
+        main_page_size=16,
+        compressed_page_size=4,
+        q_heads=12,
+        kv_heads=1,
+        head_dim=256,
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 1))
+    with pytest.raises(ValueError, match="requires the CuTe SM120 path"):
+        qsa.Caps(**values)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
+    values["q_heads"] = 8
+    with pytest.raises(NotImplementedError, match="CuTe Qwen sparse-GQA geometry"):
+        qsa.Caps(**values)
+
+
+@pytest.mark.parametrize("page_size", [16, 1504])
+def test_qsa_caps_accepts_supported_qwen_page_sizes(
+    monkeypatch: pytest.MonkeyPatch,
+    page_size: int,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
+    caps = qsa.Caps(
+        device="cuda:0",
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=1,
+        max_seq_len=page_size,
+        num_main_cache_pages=1,
+        num_compressed_cache_pages=1,
+        main_page_size=page_size,
+        compressed_page_size=page_size // 4,
+        q_heads=12,
+        kv_heads=1,
+        head_dim=256,
+    )
+    assert caps.main_page_size == page_size
 
 
 def _dense_gathered_reference(
@@ -149,14 +203,14 @@ class _CandidateTensor:
     [
         (2, 6, 1, True),
         (8, 6, 1, True),
-        (9, 6, 1, False),
+        (9, 6, 1, True),
         (4, 12, 1, True),
-        (5, 12, 1, False),
+        (5, 12, 1, True),
         (2, 24, 2, True),
-        (4, 24, 2, False),
+        (4, 24, 2, True),
     ],
 )
-def test_cute_candidate_uses_qualified_rows_for_interleaved_blh_cache_views(
+def test_cute_candidate_accepts_all_qwen_rows_for_interleaved_blh_cache_views(
     monkeypatch: pytest.MonkeyPatch,
     rows: int,
     q_heads: int,
@@ -164,13 +218,13 @@ def test_cute_candidate_uses_qualified_rows_for_interleaved_blh_cache_views(
     expected: bool,
 ) -> None:
     monkeypatch.setattr(cute_config, "_is_sm120", lambda _device: True)
-    pages, layers = 128, 64
+    pages, layers, page_size = 128, 64, 1504
     allocation = torch.empty(
         (
             pages,
             layers,
             2,
-            cute_config.PAGE_SIZE,
+            page_size,
             kv_heads * cute_config.HEAD_DIM,
         ),
         dtype=torch.bfloat16,
@@ -185,43 +239,149 @@ def test_cute_candidate_uses_qualified_rows_for_interleaved_blh_cache_views(
     assert not value_view.is_contiguous()
     query = _CandidateTensor((rows, q_heads, cute_config.HEAD_DIM), torch.bfloat16)
     key_cache = _CandidateTensor(
-        (pages, cute_config.PAGE_SIZE, kv_heads, cute_config.HEAD_DIM),
+        (pages, page_size, kv_heads, cute_config.HEAD_DIM),
         torch.bfloat16,
         strides=key_view.stride(),
         contiguous=False,
     )
     value_cache = _CandidateTensor(
-        (pages, cute_config.PAGE_SIZE, kv_heads, cute_config.HEAD_DIM),
+        (pages, page_size, kv_heads, cute_config.HEAD_DIM),
         torch.bfloat16,
         strides=value_view.stride(),
         contiguous=False,
     )
 
-    assert cute_config.is_candidate(
-        query=query,
-        key_cache=key_cache,
-        value_cache=value_cache,
-        block_table=_CandidateTensor((4, 128), torch.int32),
-        request_ids=_CandidateTensor((rows,), torch.int64),
-        selected_positions=_CandidateTensor(
-            (rows, cute_config.SELECTION_WIDTH), torch.int32
-        ),
-        query_positions=_CandidateTensor((rows,), torch.int64),
-        partial_output=_CandidateTensor(
-            (
-                rows,
-                cute_config.NUM_SPLITS,
-                q_heads,
-                cute_config.HEAD_DIM,
+    assert (
+        cute_config.is_candidate(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=_CandidateTensor((4, 128), torch.int32),
+            request_ids=_CandidateTensor((rows,), torch.int64),
+            selected_positions=_CandidateTensor(
+                (rows, cute_config.SELECTION_WIDTH), torch.int32
             ),
-            torch.float32,
-        ),
-        partial_lse=_CandidateTensor(
-            (rows, cute_config.NUM_SPLITS, q_heads), torch.float32
-        ),
-        block_n=cute_config.BLOCK_N,
-        splits=cute_config.NUM_SPLITS,
-    ) is expected
+            query_positions=_CandidateTensor((rows,), torch.int64),
+            partial_output=_CandidateTensor(
+                (
+                    rows,
+                    cute_config.NUM_SPLITS,
+                    q_heads,
+                    cute_config.HEAD_DIM,
+                ),
+                torch.float32,
+            ),
+            partial_lse=_CandidateTensor(
+                (rows, cute_config.NUM_SPLITS, q_heads), torch.float32
+            ),
+            block_n=cute_config.BLOCK_N,
+            splits=cute_config.NUM_SPLITS,
+        )
+        is expected
+    )
+
+
+def test_qwen_split_policy_does_not_route_large_rows_to_triton() -> None:
+    caps = SimpleNamespace(
+        q_heads=12,
+        kv_heads=1,
+        head_dim=256,
+        main_page_size=16,
+        selection_width=2051,
+    )
+
+    assert _target_splits(caps, 1) == (16, 64)
+    assert _target_splits(caps, 32) == (16, 64)
+
+    with pytest.raises(NotImplementedError, match="requires the CuTe Qwen"):
+        _target_splits(
+            SimpleNamespace(
+                q_heads=8,
+                kv_heads=2,
+                head_dim=64,
+                main_page_size=4,
+                selection_width=67,
+            ),
+            3,
+        )
+
+
+def test_qwen_geometry_rejects_invalid_cute_contract_instead_of_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows, q_heads, kv_heads = 5, 12, 1
+    query = torch.empty((rows, q_heads, 256), device="meta")
+    key_cache = torch.empty((1, 16, kv_heads, 256), device="meta")
+    value_cache = torch.empty_like(key_cache)
+    block_table = torch.empty((1, 1), dtype=torch.int32, device="meta")
+    request_ids = torch.empty((rows,), dtype=torch.int64, device="meta")
+    selected_positions = torch.empty((rows, 2051), dtype=torch.int32, device="meta")
+    query_positions = torch.empty((rows,), dtype=torch.int64, device="meta")
+    output = torch.empty_like(query)
+    partial_output = torch.empty(
+        (rows, 64, q_heads, 256), dtype=torch.float32, device="meta"
+    )
+    partial_lse = torch.empty((rows, 64, q_heads), dtype=torch.float32, device="meta")
+    monkeypatch.setattr(
+        sparse_gqa, "_validate_launch", lambda **_kwargs: (rows, q_heads, 256)
+    )
+    monkeypatch.setattr(sparse_gqa, "_cute_is_candidate", lambda **_kwargs: False)
+
+    with pytest.raises(RuntimeError, match="requires its CuTe SM120"):
+        launch_sparse_paged_gqa(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            request_ids=request_ids,
+            selected_positions=selected_positions,
+            query_positions=query_positions,
+            output=output,
+            partial_output=partial_output,
+            partial_lse=partial_lse,
+            softmax_scale=1.0 / 16.0,
+            block_n=16,
+            splits=64,
+        )
+
+
+def test_non_qwen_geometry_has_no_sparse_gqa_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows, q_heads, kv_heads, head_dim = 3, 8, 2, 64
+    query = torch.empty((rows, q_heads, head_dim), device="meta")
+    key_cache = torch.empty((1, 4, kv_heads, head_dim), device="meta")
+    value_cache = torch.empty_like(key_cache)
+    selected_positions = torch.empty((rows, 67), dtype=torch.int32, device="meta")
+    monkeypatch.setattr(
+        sparse_gqa, "_validate_launch", lambda **_kwargs: (rows, q_heads, head_dim)
+    )
+    monkeypatch.setattr(
+        sparse_gqa,
+        "_cute_is_candidate",
+        lambda **_kwargs: pytest.fail("non-Qwen geometry reached CuTe candidate"),
+    )
+
+    with pytest.raises(NotImplementedError, match="no CuTe implementation"):
+        launch_sparse_paged_gqa(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=torch.empty((1, 1), dtype=torch.int32, device="meta"),
+            request_ids=torch.empty((rows,), dtype=torch.int64, device="meta"),
+            selected_positions=selected_positions,
+            query_positions=torch.empty((rows,), dtype=torch.int64, device="meta"),
+            output=torch.empty_like(query),
+            partial_output=torch.empty(
+                (rows, 4, q_heads, head_dim), dtype=torch.float32, device="meta"
+            ),
+            partial_lse=torch.empty(
+                (rows, 4, q_heads), dtype=torch.float32, device="meta"
+            ),
+            softmax_scale=1.0 / 8.0,
+            block_n=16,
+            splits=4,
+        )
 
 
 @pytest.mark.parametrize(
@@ -239,8 +399,7 @@ def test_cute_candidate_uses_qualified_rows_for_interleaved_blh_cache_views(
     [
         (1, 24, 2, 256, 16, 2051, 16, 64, "contiguous"),
         (1, 6, 1, 256, 16, 2051, 16, 64, "interleaved_page"),
-        (3, 8, 2, 64, 4, 67, 16, 4, "page_transposed"),
-        (2, 6, 3, 32, 8, 65, 64, 1, "padded_inner"),
+        (5, 12, 1, 256, 16, 2051, 16, 64, "interleaved_page"),
     ],
 )
 def test_sparse_gqa_matches_gathered_dense_reference(
@@ -354,24 +513,110 @@ def test_sparse_gqa_matches_gathered_dense_reference(
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=2e-2)
 
 
+def test_sparse_gqa_matches_reference_for_1504_token_pages() -> None:
+    device = require_sm120()
+    generator = torch.Generator(device="cpu").manual_seed(93504)
+    rows, q_heads, kv_heads, head_dim = 1, 12, 1, 256
+    page_size, selection_width, splits = 1504, 2051, 64
+    pages, table_width = 4, 3
+    key_cache, value_cache = _cache_layout(
+        pages=pages,
+        page_size=page_size,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        layout="contiguous",
+        device=device,
+        generator=generator,
+    )
+    block_table = torch.tensor([[2, 0, 3]], dtype=torch.int32, device=device)
+    query = torch.randn(
+        (rows, q_heads, head_dim),
+        generator=generator,
+        dtype=torch.float32,
+        device="cpu",
+    ).to(device=device, dtype=torch.bfloat16)
+    request_ids = torch.zeros((rows,), dtype=torch.int64, device=device)
+    query_positions = torch.tensor(
+        [table_width * page_size - 1], dtype=torch.int64, device=device
+    )
+    selected_positions = torch.full(
+        (rows, selection_width), -1, dtype=torch.int32, device=device
+    )
+    selected_positions[0, :6] = torch.tensor(
+        [
+            0,
+            page_size - 1,
+            page_size,
+            2 * page_size - 1,
+            2 * page_size,
+            3 * page_size - 1,
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    output = torch.empty_like(query)
+    partial_output = torch.empty(
+        (rows, splits, q_heads, head_dim), dtype=torch.float32, device=device
+    )
+    partial_lse = torch.empty(
+        (rows, splits, q_heads), dtype=torch.float32, device=device
+    )
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+    actual = launch_sparse_paged_gqa(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        request_ids=request_ids,
+        selected_positions=selected_positions,
+        query_positions=query_positions,
+        output=output,
+        partial_output=partial_output,
+        partial_lse=partial_lse,
+        softmax_scale=softmax_scale,
+        block_n=16,
+        splits=splits,
+    )
+    expected = _dense_gathered_reference(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        request_ids,
+        selected_positions,
+        query_positions,
+        softmax_scale,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=2e-2)
+
+
 def test_sparse_gqa_zeroes_padded_request_and_all_masked_rows() -> None:
     device = require_sm120()
     rows, q_heads, kv_heads, head_dim = 2, 24, 2, 256
+    page_size, selection_width, splits = 16, 2051, 64
     query = torch.randn((rows, q_heads, head_dim), dtype=torch.bfloat16, device=device)
     key_cache = torch.randn(
-        (2, 4, kv_heads, head_dim), dtype=torch.bfloat16, device=device
+        (2, page_size, kv_heads, head_dim), dtype=torch.bfloat16, device=device
     )
     value_cache = torch.randn_like(key_cache)
     block_table = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
     request_ids = torch.tensor([-1, 0], dtype=torch.int64, device=device)
     query_positions = torch.tensor([7, 0], dtype=torch.int64, device=device)
-    selected_positions = torch.full((rows, 17), -1, dtype=torch.int32, device=device)
+    selected_positions = torch.full(
+        (rows, selection_width), -1, dtype=torch.int32, device=device
+    )
     selected_positions[1, :2] = torch.tensor([2, 3], dtype=torch.int32, device=device)
     output = torch.full(
         (rows, q_heads, head_dim),
         17,
         dtype=torch.bfloat16,
         device=device,
+    )
+    partial_output = torch.empty(
+        (rows, splits, q_heads, head_dim), dtype=torch.float32, device=device
+    )
+    partial_lse = torch.empty(
+        (rows, splits, q_heads), dtype=torch.float32, device=device
     )
     actual = launch_sparse_paged_gqa(
         query=query,
@@ -382,11 +627,11 @@ def test_sparse_gqa_zeroes_padded_request_and_all_masked_rows() -> None:
         selected_positions=selected_positions,
         query_positions=query_positions,
         output=output,
-        partial_output=None,
-        partial_lse=None,
+        partial_output=partial_output,
+        partial_lse=partial_lse,
         softmax_scale=1.0 / math.sqrt(head_dim),
         block_n=16,
-        splits=1,
+        splits=splits,
     )
     assert torch.count_nonzero(actual).item() == 0
 
@@ -468,6 +713,77 @@ def test_sparse_gqa_split_path_is_cuda_graph_replay_safe() -> None:
     torch.cuda.synchronize(device)
     assert captured_output.data_ptr() == output.data_ptr()
     torch.testing.assert_close(captured_output, expected, rtol=0.0, atol=2e-2)
+
+
+def test_sparse_gqa_reuses_binaries_across_runtime_rows_and_page_sizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
+    from b12x.attention.qsa import _sparse_gqa_cute as cute_impl
+
+    device = require_sm120()
+    q_heads, kv_heads, head_dim = 6, 1, 256
+    compile_targets: list[str] = []
+    original_compile = cute_impl.b12x_compile
+
+    def traced_compile(target: object, *args: object, **kwargs: object) -> object:
+        compile_targets.append(type(target).__name__)
+        return original_compile(target, *args, **kwargs)
+
+    def launch(rows: int, page_size: int) -> torch.Tensor:
+        query = torch.randn(
+            (rows, q_heads, head_dim), dtype=torch.bfloat16, device=device
+        )
+        key_cache = torch.empty(
+            (1, page_size, kv_heads, head_dim), dtype=torch.bfloat16, device=device
+        )
+        value_cache = torch.empty_like(key_cache)
+        block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+        request_ids = torch.zeros((rows,), dtype=torch.int64, device=device)
+        selected_positions = torch.full(
+            (rows, 2051), -1, dtype=torch.int32, device=device
+        )
+        query_positions = torch.zeros((rows,), dtype=torch.int64, device=device)
+        output = torch.empty_like(query)
+        partial_output = torch.empty(
+            (rows, 64, q_heads, head_dim), dtype=torch.float32, device=device
+        )
+        partial_lse = torch.empty(
+            (rows, 64, q_heads), dtype=torch.float32, device=device
+        )
+        return launch_sparse_paged_gqa(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            request_ids=request_ids,
+            selected_positions=selected_positions,
+            query_positions=query_positions,
+            output=output,
+            partial_output=partial_output,
+            partial_lse=partial_lse,
+            softmax_scale=1.0 / math.sqrt(head_dim),
+            block_n=16,
+            splits=64,
+        )
+
+    cute_impl.clear_caches()
+    monkeypatch.setattr(cute_impl, "b12x_compile", traced_compile)
+    try:
+        assert torch.count_nonzero(launch(1, 16)).item() == 0
+        compiled_after_first_launch = tuple(compile_targets)
+        assert compiled_after_first_launch.count("_SparseGqaSplitKernel") == 1
+        assert compiled_after_first_launch.count("_SparseGqaMergeKernel") == 1
+
+        freeze_kernel_resolution("QSA runtime-row cache reuse test")
+        assert torch.count_nonzero(launch(17, 1504)).item() == 0
+        assert tuple(compile_targets) == compiled_after_first_launch
+    finally:
+        unfreeze_kernel_resolution()
+        cute_impl.clear_caches()
 
 
 def test_sparse_gqa_uses_int64_for_high_physical_page_offsets() -> None:

@@ -20,8 +20,12 @@ from b12x._lib.scratch_layout import (
     materialize_scratch_view,
 )
 
-
-_MAX_TRITON_REDUCTION_WIDTH = 65_536
+from ._cute_prefill_config import (
+    QWEN_COMPUTE_CAPABILITY,
+    QWEN_HIDDEN_SIZE,
+    QWEN_STREAMS,
+    projection_capacity_rows,
+)
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -57,26 +61,19 @@ class Caps:
         if device.type != "cuda":
             raise ValueError(f"MTP feedback requires a CUDA device, got {device}")
         capability = torch.cuda.get_device_capability(device)
-        if capability not in ((12, 0), (12, 1)):
+        if tuple(capability) != QWEN_COMPUTE_CAPABILITY:
             raise ValueError(
-                "MTP feedback in b12x requires SM120 or SM121, got "
+                "Qwen3.8 MTP feedback requires the CuTe SM120 kernels, got "
                 f"compute capability {capability[0]}.{capability[1]}"
             )
         max_tokens = _positive("max_tokens", self.max_tokens)
         hidden_size = _positive("hidden_size", self.hidden_size)
         streams = _positive("streams", self.streams)
-        if hidden_size > _MAX_TRITON_REDUCTION_WIDTH:
+        if hidden_size != QWEN_HIDDEN_SIZE or streams != QWEN_STREAMS:
             raise ValueError(
-                f"hidden_size must be at most {_MAX_TRITON_REDUCTION_WIDTH}, "
-                f"got {hidden_size}"
-            )
-        if hidden_size % 16:
-            raise ValueError(
-                f"hidden_size must be divisible by 16 for BF16 dot, got {hidden_size}"
-            )
-        if streams > _MAX_TRITON_REDUCTION_WIDTH:
-            raise ValueError(
-                f"streams must be at most {_MAX_TRITON_REDUCTION_WIDTH}, got {streams}"
+                "MTP feedback only implements the Qwen3.8 CuTe contract "
+                f"S={QWEN_STREAMS},H={QWEN_HIDDEN_SIZE}; got "
+                f"S={streams},H={hidden_size}"
             )
         if self.dtype != torch.bfloat16:
             raise TypeError(f"MTP feedback requires torch.bfloat16, got {self.dtype}")
@@ -96,13 +93,11 @@ class Plan:
     state_normalized_offset_bytes: int
     token_path_offset_bytes: int
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    token_projection_rows: int
+    state_projection_rows: int
     norm_block_h: int
     norm_block_s: int
     norm_num_warps: int
-    matmul_block_m: int = 16
-    matmul_block_n: int = 32
-    matmul_block_k: int = 32
-    matmul_num_warps: int = 4
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -113,6 +108,10 @@ class Plan:
     def output_shape(self, tokens: int | None = None) -> tuple[int, int, int]:
         live_tokens = self._live_tokens(tokens)
         return (live_tokens, self.caps.streams, self.caps.hidden_size)
+
+    def output_storage_shape(self) -> tuple[int, int, int]:
+        """Return the fixed caller-owned logical-capacity output shape."""
+        return self.output_shape()
 
     def _live_tokens(self, tokens: int | None) -> int:
         live_tokens = self.caps.max_tokens if tokens is None else int(tokens)
@@ -155,11 +154,17 @@ def plan(caps: Caps) -> Plan:
 
     if not isinstance(caps, Caps):
         raise TypeError(f"caps must be Caps, got {type(caps)!r}")
+    token_projection_rows, state_projection_rows = projection_capacity_rows(
+        max_tokens=caps.max_tokens,
+        streams=caps.streams,
+        hidden_size=caps.hidden_size,
+        device=caps.device,
+    )
     h = caps.hidden_size
     s = caps.streams
     token_normalized_offset_bytes = align_up(0, SCRATCH_ALIGN_BYTES)
     cursor = token_normalized_offset_bytes + (
-        caps.max_tokens * h * dtype_nbytes(caps.dtype)
+        token_projection_rows * h * dtype_nbytes(caps.dtype)
     )
     state_partial_sums_offset_bytes = align_up(cursor, SCRATCH_ALIGN_BYTES)
     cursor = state_partial_sums_offset_bytes + (
@@ -167,23 +172,37 @@ def plan(caps: Caps) -> Plan:
     )
     state_normalized_offset_bytes = align_up(cursor, SCRATCH_ALIGN_BYTES)
     cursor = state_normalized_offset_bytes + (
-        caps.max_tokens * s * h * dtype_nbytes(caps.dtype)
+        state_projection_rows * h * dtype_nbytes(caps.dtype)
     )
     token_path_offset_bytes = align_up(cursor, SCRATCH_ALIGN_BYTES)
-    cursor = token_path_offset_bytes + (caps.max_tokens * h * dtype_nbytes(caps.dtype))
+    cursor = token_path_offset_bytes + (
+        token_projection_rows * h * dtype_nbytes(caps.dtype)
+    )
     spec = scratch_buffer_spec("mtp_feedback", nbytes=cursor, device=caps.device)
     norm_block_h = _next_power_of_two(h)
-    return Plan(
+    result = Plan(
         caps=caps,
         token_normalized_offset_bytes=token_normalized_offset_bytes,
         state_partial_sums_offset_bytes=state_partial_sums_offset_bytes,
         state_normalized_offset_bytes=state_normalized_offset_bytes,
         token_path_offset_bytes=token_path_offset_bytes,
         _scratch_specs=(spec,),
+        token_projection_rows=token_projection_rows,
+        state_projection_rows=state_projection_rows,
         norm_block_h=norm_block_h,
         norm_block_s=_next_power_of_two(s),
         norm_num_warps=8 if norm_block_h >= 2048 else 4,
     )
+    from ._cute_prefill import precompile_mtp_prefill_capacity
+
+    precompile_mtp_prefill_capacity(
+        token_projection_rows,
+        state_projection_rows,
+        h,
+        device=caps.device,
+        streams=s,
+    )
+    return result
 
 
 def _require_tensor(
@@ -242,7 +261,7 @@ def bind(
     token_normalized, _ = materialize_scratch_view(
         scratch_storage,
         offset_bytes=plan.token_normalized_offset_bytes,
-        shape=(caps.max_tokens, caps.hidden_size),
+        shape=(plan.token_projection_rows, caps.hidden_size),
         dtype=caps.dtype,
     )
     state_partial_sums, _ = materialize_scratch_view(
@@ -254,13 +273,17 @@ def bind(
     state_normalized, _ = materialize_scratch_view(
         scratch_storage,
         offset_bytes=plan.state_normalized_offset_bytes,
-        shape=(caps.max_tokens, caps.streams, caps.hidden_size),
+        shape=(
+            plan.state_projection_rows // caps.streams,
+            caps.streams,
+            caps.hidden_size,
+        ),
         dtype=caps.dtype,
     )
     token_path, _ = materialize_scratch_view(
         scratch_storage,
         offset_bytes=plan.token_path_offset_bytes,
-        shape=(caps.max_tokens, caps.hidden_size),
+        shape=(plan.token_projection_rows, caps.hidden_size),
         dtype=caps.dtype,
     )
     capacity_shapes = {
@@ -270,7 +293,7 @@ def bind(
         "state_norm_weight": (caps.streams * caps.hidden_size,),
         "embedding_fc_weight": (caps.hidden_size, caps.hidden_size),
         "hidden_fc_weight": (caps.hidden_size, caps.hidden_size),
-        "output": (caps.max_tokens, caps.streams, caps.hidden_size),
+        "output": plan.output_storage_shape(),
     }
     tensors = {
         "token_embedding": token_embedding,
@@ -349,13 +372,11 @@ def run(binding: Binding, *, eps: float = 1e-6) -> torch.Tensor:
         state_partial_sums_offset_bytes=plan_value.state_partial_sums_offset_bytes,
         state_normalized_offset_bytes=plan_value.state_normalized_offset_bytes,
         token_path_offset_bytes=plan_value.token_path_offset_bytes,
+        token_projection_rows=plan_value.token_projection_rows,
+        state_projection_rows=plan_value.state_projection_rows,
         norm_block_h=plan_value.norm_block_h,
         norm_block_s=plan_value.norm_block_s,
         norm_num_warps=plan_value.norm_num_warps,
-        matmul_block_m=plan_value.matmul_block_m,
-        matmul_block_n=plan_value.matmul_block_n,
-        matmul_block_k=plan_value.matmul_block_k,
-        matmul_num_warps=plan_value.matmul_num_warps,
     )
     return binding.output
 

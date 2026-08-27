@@ -1,9 +1,9 @@
-"""Indexed sparse paged causal GQA for QSA.
+"""CuTeDSL indexed sparse paged causal GQA for Qwen3.8 Flash Next.
 
 This private stage reads exact BF16 main-cache K/V at caller-selected logical
-token positions. It never writes either cache. Split policy and all storage
-are caller-owned; launches perform no allocation and never dispatch a Torch
-reference fallback.
+token positions. It never writes either cache. The supported Qwen geometry
+always launches the CuTe split and merge kernels; every other geometry,
+layout, or device fails instead of selecting an alternate implementation.
 """
 
 from __future__ import annotations
@@ -11,515 +11,11 @@ from __future__ import annotations
 import math
 
 import torch
-import triton
-import triton.language as tl
 
-from ._sparse_gqa_cute_config import is_candidate as _cute_is_candidate
-
-
-_LOG2_E = tl.constexpr(1.4426950408889634)
-
-
-@triton.jit
-def _sparse_gqa_kernel(
-    query_ptr,
-    key_cache_ptr,
-    value_cache_ptr,
-    block_table_ptr,
-    request_ids_ptr,
-    selected_positions_ptr,
-    query_positions_ptr,
-    output_ptr,
-    partial_lse_ptr,
-    q_stride_r: tl.constexpr,
-    q_stride_h: tl.constexpr,
-    k_stride_p: tl.constexpr,
-    k_stride_t: tl.constexpr,
-    k_stride_h: tl.constexpr,
-    v_stride_p: tl.constexpr,
-    v_stride_t: tl.constexpr,
-    v_stride_h: tl.constexpr,
-    table_stride_b: tl.constexpr,
-    table_stride_p: tl.constexpr,
-    selected_stride_r: tl.constexpr,
-    selected_stride_k: tl.constexpr,
-    out_stride_r: tl.constexpr,
-    out_stride_s: tl.constexpr,
-    out_stride_h: tl.constexpr,
-    out_stride_d: tl.constexpr,
-    lse_stride_r: tl.constexpr,
-    lse_stride_s: tl.constexpr,
-    lse_stride_h: tl.constexpr,
-    softmax_scale,
-    ROWS: tl.constexpr,
-    Q_HEADS: tl.constexpr,
-    KV_HEADS: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    NUM_CACHE_PAGES: tl.constexpr,
-    TABLE_BATCH: tl.constexpr,
-    TABLE_WIDTH: tl.constexpr,
-    SELECTION_WIDTH: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
-    WRITE_PARTIAL: tl.constexpr,
-):
-    row = tl.program_id(0)
-    query_head = tl.program_id(1)
-    split = tl.program_id(2)
-    dims = tl.arange(0, BLOCK_D)
-    dim_mask = dims < HEAD_DIM
-
-    query_offsets = row * q_stride_r + query_head * q_stride_h + dims
-    query = tl.load(query_ptr + query_offsets, mask=dim_mask, other=0.0).to(tl.float32)
-    heads_per_kv = Q_HEADS // KV_HEADS
-    kv_head = query_head // heads_per_kv
-    request_id = tl.load(request_ids_ptr + row).to(tl.int64)
-    query_position = tl.load(query_positions_ptr + row).to(tl.int64)
-    request_valid = (request_id >= 0) & (request_id < TABLE_BATCH)
-
-    running_max = tl.full((), -float("inf"), tl.float32)
-    running_sum = tl.zeros((), tl.float32)
-    accumulator = tl.zeros((BLOCK_D,), tl.float32)
-    key_tiles = tl.cdiv(SELECTION_WIDTH, BLOCK_N)
-    tiles_per_split = tl.cdiv(key_tiles, NUM_SPLITS)
-
-    for local_tile in tl.range(0, tiles_per_split, num_stages=2):
-        tile = split + local_tile * NUM_SPLITS
-        columns = tile * BLOCK_N + tl.arange(0, BLOCK_N)
-        slot_valid = (tile < key_tiles) & (columns < SELECTION_WIDTH)
-        selected_offsets = row * selected_stride_r + columns * selected_stride_k
-        logical_position = tl.load(
-            selected_positions_ptr + selected_offsets,
-            mask=slot_valid,
-            other=-1,
-        ).to(tl.int64)
-        valid = (
-            slot_valid
-            & request_valid
-            & (logical_position >= 0)
-            & (logical_position <= query_position)
-        )
-
-        logical_page = logical_position // PAGE_SIZE
-        valid &= (logical_page >= 0) & (logical_page < TABLE_WIDTH)
-        safe_request = tl.where(request_valid, request_id, 0).to(tl.int64)
-        safe_logical_page = tl.where(valid, logical_page, 0).to(tl.int64)
-        table_offsets = safe_request * tl.full(
-            (), table_stride_b, tl.int64
-        ) + safe_logical_page * tl.full((), table_stride_p, tl.int64)
-        physical_page = tl.load(
-            block_table_ptr + table_offsets,
-            mask=valid,
-            other=-1,
-        ).to(tl.int64)
-        valid &= (physical_page >= 0) & (physical_page < NUM_CACHE_PAGES)
-
-        # Keep the page id in Int64 before every page-scaled product. This is
-        # required for serving pools whose live physical ids cross Int32.
-        safe_page = tl.where(valid, physical_page, 0).to(tl.int64)
-        page_offset = tl.where(valid, logical_position % PAGE_SIZE, 0).to(tl.int64)
-        key_offsets = (
-            safe_page[:, None] * tl.full((), k_stride_p, tl.int64)
-            + page_offset[:, None] * tl.full((), k_stride_t, tl.int64)
-            + tl.full((), kv_head * k_stride_h, tl.int64)
-            + dims[None, :].to(tl.int64)
-        )
-        value_offsets = (
-            safe_page[:, None] * tl.full((), v_stride_p, tl.int64)
-            + page_offset[:, None] * tl.full((), v_stride_t, tl.int64)
-            + tl.full((), kv_head * v_stride_h, tl.int64)
-            + dims[None, :].to(tl.int64)
-        )
-        cache_mask = valid[:, None] & dim_mask[None, :]
-        key = tl.load(key_cache_ptr + key_offsets, mask=cache_mask, other=0.0).to(
-            tl.float32
-        )
-        value = tl.load(value_cache_ptr + value_offsets, mask=cache_mask, other=0.0).to(
-            tl.float32
-        )
-
-        scores = tl.sum(key * query[None, :], axis=1) * softmax_scale
-        scores = tl.where(valid, scores, -float("inf"))
-        tile_has_value = tl.sum(valid.to(tl.int32), axis=0) > 0
-        tile_max = tl.max(scores, axis=0)
-        next_max = tl.maximum(running_max, tile_max)
-        prior_scale = tl.where(
-            tile_has_value,
-            tl.exp2((running_max - next_max) * _LOG2_E),
-            1.0,
-        )
-        probabilities = tl.where(
-            valid,
-            tl.exp2((scores - next_max) * _LOG2_E),
-            0.0,
-        )
-        accumulator = accumulator * prior_scale + tl.sum(
-            probabilities[:, None] * value, axis=0
-        )
-        running_sum = running_sum * prior_scale + tl.sum(probabilities, axis=0)
-        running_max = tl.where(tile_has_value, next_max, running_max)
-
-    denominator = tl.where(running_sum > 0.0, running_sum, 1.0)
-    normalized = tl.where(running_sum > 0.0, accumulator / denominator, 0.0)
-    if WRITE_PARTIAL:
-        output_offsets = (
-            row * out_stride_r
-            + split * out_stride_s
-            + query_head * out_stride_h
-            + dims * out_stride_d
-        )
-        lse_offset = (
-            row * lse_stride_r + split * lse_stride_s + query_head * lse_stride_h
-        )
-        lse = tl.where(
-            running_sum > 0.0,
-            running_max + tl.log2(running_sum) / _LOG2_E,
-            -float("inf"),
-        )
-        tl.store(output_ptr + output_offsets, normalized, mask=dim_mask)
-        tl.store(partial_lse_ptr + lse_offset, lse)
-    else:
-        output_offsets = (
-            row * out_stride_r + query_head * out_stride_h + dims * out_stride_d
-        )
-        tl.store(output_ptr + output_offsets, normalized, mask=dim_mask)
-
-
-@triton.jit
-def _merge_sparse_gqa_kernel(
-    partial_output_ptr,
-    partial_lse_ptr,
-    output_ptr,
-    partial_stride_r: tl.constexpr,
-    partial_stride_s: tl.constexpr,
-    partial_stride_h: tl.constexpr,
-    partial_stride_d: tl.constexpr,
-    lse_stride_r: tl.constexpr,
-    lse_stride_s: tl.constexpr,
-    lse_stride_h: tl.constexpr,
-    out_stride_r: tl.constexpr,
-    out_stride_h: tl.constexpr,
-    out_stride_d: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_SPLITS: tl.constexpr,
-):
-    row = tl.program_id(0)
-    query_head = tl.program_id(1)
-    splits = tl.arange(0, BLOCK_SPLITS)
-    split_mask = splits < NUM_SPLITS
-    lse_offsets = row * lse_stride_r + splits * lse_stride_s + query_head * lse_stride_h
-    lse = tl.load(
-        partial_lse_ptr + lse_offsets,
-        mask=split_mask,
-        other=-float("inf"),
-    ).to(tl.float32)
-    finite = split_mask & (lse != -float("inf"))
-    maximum = tl.max(lse, axis=0)
-    weights = tl.where(
-        finite,
-        tl.exp2((lse - maximum) * _LOG2_E),
-        0.0,
-    )
-    weight_sum = tl.sum(weights, axis=0)
-
-    dims = tl.arange(0, BLOCK_D)
-    dim_mask = dims < HEAD_DIM
-    partial_offsets = (
-        row * partial_stride_r
-        + splits[:, None] * partial_stride_s
-        + query_head * partial_stride_h
-        + dims[None, :] * partial_stride_d
-    )
-    partial = tl.load(
-        partial_output_ptr + partial_offsets,
-        mask=finite[:, None] & dim_mask[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    merged = tl.sum(weights[:, None] * partial, axis=0)
-    merged = tl.where(weight_sum > 0.0, merged / weight_sum, 0.0)
-    output_offsets = row * out_stride_r + query_head * out_stride_h + dims
-    tl.store(output_ptr + output_offsets, merged, mask=dim_mask)
-
-
-def _launch_direct(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    request_ids: torch.Tensor,
-    selected_positions: torch.Tensor,
-    query_positions: torch.Tensor,
-    output: torch.Tensor,
-    softmax_scale: float,
-    block_n: int,
-) -> None:
-    rows, q_heads, head_dim = map(int, query.shape)
-    kv_heads = int(key_cache.shape[2])
-    _sparse_gqa_kernel[(rows, q_heads, 1)](
-        query,
-        key_cache,
-        value_cache,
-        block_table,
-        request_ids,
-        selected_positions,
-        query_positions,
-        output,
-        output,
-        query.stride(0),
-        query.stride(1),
-        key_cache.stride(0),
-        key_cache.stride(1),
-        key_cache.stride(2),
-        value_cache.stride(0),
-        value_cache.stride(1),
-        value_cache.stride(2),
-        block_table.stride(0),
-        block_table.stride(1),
-        selected_positions.stride(0),
-        selected_positions.stride(1),
-        output.stride(0),
-        0,
-        output.stride(1),
-        output.stride(2),
-        0,
-        0,
-        0,
-        float(softmax_scale),
-        ROWS=rows,
-        Q_HEADS=q_heads,
-        KV_HEADS=kv_heads,
-        HEAD_DIM=head_dim,
-        PAGE_SIZE=int(key_cache.shape[1]),
-        NUM_CACHE_PAGES=int(key_cache.shape[0]),
-        TABLE_BATCH=int(block_table.shape[0]),
-        TABLE_WIDTH=int(block_table.shape[1]),
-        SELECTION_WIDTH=int(selected_positions.shape[1]),
-        BLOCK_N=int(block_n),
-        BLOCK_D=triton.next_power_of_2(head_dim),
-        NUM_SPLITS=1,
-        WRITE_PARTIAL=False,
-        num_warps=4 if int(block_n) == 16 else 2,
-        num_stages=2,
-    )
-
-
-def _launch_split(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    request_ids: torch.Tensor,
-    selected_positions: torch.Tensor,
-    query_positions: torch.Tensor,
-    partial_output: torch.Tensor,
-    partial_lse: torch.Tensor,
-    softmax_scale: float,
-    block_n: int,
-    splits: int,
-) -> None:
-    rows, q_heads, head_dim = map(int, query.shape)
-    kv_heads = int(key_cache.shape[2])
-    _sparse_gqa_kernel[(rows, q_heads, splits)](
-        query,
-        key_cache,
-        value_cache,
-        block_table,
-        request_ids,
-        selected_positions,
-        query_positions,
-        partial_output,
-        partial_lse,
-        query.stride(0),
-        query.stride(1),
-        key_cache.stride(0),
-        key_cache.stride(1),
-        key_cache.stride(2),
-        value_cache.stride(0),
-        value_cache.stride(1),
-        value_cache.stride(2),
-        block_table.stride(0),
-        block_table.stride(1),
-        selected_positions.stride(0),
-        selected_positions.stride(1),
-        partial_output.stride(0),
-        partial_output.stride(1),
-        partial_output.stride(2),
-        partial_output.stride(3),
-        partial_lse.stride(0),
-        partial_lse.stride(1),
-        partial_lse.stride(2),
-        float(softmax_scale),
-        ROWS=rows,
-        Q_HEADS=q_heads,
-        KV_HEADS=kv_heads,
-        HEAD_DIM=head_dim,
-        PAGE_SIZE=int(key_cache.shape[1]),
-        NUM_CACHE_PAGES=int(key_cache.shape[0]),
-        TABLE_BATCH=int(block_table.shape[0]),
-        TABLE_WIDTH=int(block_table.shape[1]),
-        SELECTION_WIDTH=int(selected_positions.shape[1]),
-        BLOCK_N=int(block_n),
-        BLOCK_D=triton.next_power_of_2(head_dim),
-        NUM_SPLITS=int(splits),
-        WRITE_PARTIAL=True,
-        num_warps=4 if int(block_n) == 16 else 2,
-        num_stages=2,
-    )
-
-
-def _launch_merge(
-    partial_output: torch.Tensor,
-    partial_lse: torch.Tensor,
-    output: torch.Tensor,
-    rows: int,
-    splits: int,
-) -> None:
-    q_heads = int(output.shape[1])
-    head_dim = int(output.shape[2])
-    _merge_sparse_gqa_kernel[(rows, q_heads)](
-        partial_output,
-        partial_lse,
-        output,
-        partial_output.stride(0),
-        partial_output.stride(1),
-        partial_output.stride(2),
-        partial_output.stride(3),
-        partial_lse.stride(0),
-        partial_lse.stride(1),
-        partial_lse.stride(2),
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        HEAD_DIM=head_dim,
-        NUM_SPLITS=int(splits),
-        BLOCK_D=triton.next_power_of_2(head_dim),
-        BLOCK_SPLITS=triton.next_power_of_2(splits),
-        num_warps=4,
-    )
-
-
-@torch.library.custom_op("b12x::qsa_sparse_paged_gqa_direct", mutates_args=("output",))
-def _direct_op(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    request_ids: torch.Tensor,
-    selected_positions: torch.Tensor,
-    query_positions: torch.Tensor,
-    output: torch.Tensor,
-    softmax_scale: float,
-    block_n: int,
-) -> None:
-    _launch_direct(
-        query,
-        key_cache,
-        value_cache,
-        block_table,
-        request_ids,
-        selected_positions,
-        query_positions,
-        output,
-        softmax_scale,
-        block_n,
-    )
-
-
-@_direct_op.register_fake
-def _direct_fake(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    request_ids: torch.Tensor,
-    selected_positions: torch.Tensor,
-    query_positions: torch.Tensor,
-    output: torch.Tensor,
-    softmax_scale: float,
-    block_n: int,
-) -> None:
-    del query, key_cache, value_cache, block_table, request_ids
-    del selected_positions, query_positions, output, softmax_scale, block_n
-
-
-@torch.library.custom_op(
-    "b12x::qsa_sparse_paged_gqa_split",
-    mutates_args=("partial_output", "partial_lse"),
+from ._sparse_gqa_cute_config import (
+    is_candidate as _cute_is_candidate,
+    is_qwen_geometry as _is_qwen_geometry,
 )
-def _split_op(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    request_ids: torch.Tensor,
-    selected_positions: torch.Tensor,
-    query_positions: torch.Tensor,
-    partial_output: torch.Tensor,
-    partial_lse: torch.Tensor,
-    softmax_scale: float,
-    block_n: int,
-    splits: int,
-) -> None:
-    _launch_split(
-        query,
-        key_cache,
-        value_cache,
-        block_table,
-        request_ids,
-        selected_positions,
-        query_positions,
-        partial_output,
-        partial_lse,
-        softmax_scale,
-        block_n,
-        splits,
-    )
-
-
-@_split_op.register_fake
-def _split_fake(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    request_ids: torch.Tensor,
-    selected_positions: torch.Tensor,
-    query_positions: torch.Tensor,
-    partial_output: torch.Tensor,
-    partial_lse: torch.Tensor,
-    softmax_scale: float,
-    block_n: int,
-    splits: int,
-) -> None:
-    del query, key_cache, value_cache, block_table, request_ids
-    del selected_positions, query_positions, partial_output, partial_lse
-    del softmax_scale, block_n, splits
-
-
-@torch.library.custom_op("b12x::qsa_sparse_paged_gqa_merge", mutates_args=("output",))
-def _merge_op(
-    partial_output: torch.Tensor,
-    partial_lse: torch.Tensor,
-    output: torch.Tensor,
-    rows: int,
-    splits: int,
-) -> None:
-    _launch_merge(partial_output, partial_lse, output, rows, splits)
-
-
-@_merge_op.register_fake
-def _merge_fake(
-    partial_output: torch.Tensor,
-    partial_lse: torch.Tensor,
-    output: torch.Tensor,
-    rows: int,
-    splits: int,
-) -> None:
-    del partial_output, partial_lse, output, rows, splits
 
 
 def _require_unit_inner_stride(tensor: torch.Tensor, name: str) -> None:
@@ -678,7 +174,7 @@ def launch_sparse_paged_gqa(
     block_n: int,
     splits: int,
 ) -> torch.Tensor:
-    """Launch allocation-free indexed sparse causal GQA into ``output``."""
+    """Launch the allocation-free CuTe Qwen sparse GQA into ``output``."""
     rows, _, _ = _validate_launch(
         query=query,
         key_cache=key_cache,
@@ -694,84 +190,63 @@ def launch_sparse_paged_gqa(
         block_n=block_n,
         splits=splits,
     )
-    if (
-        int(splits) > 1
-        and partial_output is not None
-        and partial_lse is not None
-        and _cute_is_candidate(
-            query=query,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            block_table=block_table,
-            request_ids=request_ids,
-            selected_positions=selected_positions,
-            query_positions=query_positions,
-            partial_output=partial_output,
-            partial_lse=partial_lse,
-            block_n=block_n,
-            splits=splits,
-        )
+    if not _is_qwen_geometry(
+        q_heads=int(query.shape[1]),
+        kv_heads=int(key_cache.shape[2]),
+        head_dim=int(query.shape[2]),
+        page_size=int(key_cache.shape[1]),
+        selection_width=int(selected_positions.shape[1]),
+        block_n=block_n,
+        splits=splits,
     ):
-        from ._sparse_gqa_cute import (
-            launch_sparse_gqa_merge,
-            launch_sparse_gqa_split,
+        raise NotImplementedError(
+            "QSA sparse GQA has no CuTe implementation for q_heads="
+            f"{int(query.shape[1])}, kv_heads={int(key_cache.shape[2])}, "
+            f"head_dim={int(query.shape[2])}, page_size={int(key_cache.shape[1])}, "
+            f"selection_width={int(selected_positions.shape[1])}, "
+            f"block_n={int(block_n)}, splits={int(splits)}"
+        )
+    assert partial_output is not None and partial_lse is not None
+    if not _cute_is_candidate(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        request_ids=request_ids,
+        selected_positions=selected_positions,
+        query_positions=query_positions,
+        partial_output=partial_output,
+        partial_lse=partial_lse,
+        block_n=block_n,
+        splits=splits,
+    ):
+        raise RuntimeError(
+            "Qwen sparse GQA requires its CuTe SM120 BF16 layout and capacity contract"
         )
 
-        launch_sparse_gqa_split(
-            query=query,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            block_table=block_table,
-            request_ids=request_ids,
-            selected_positions=selected_positions,
-            query_positions=query_positions,
-            partial_output=partial_output,
-            partial_lse=partial_lse,
-            softmax_scale=softmax_scale,
-        )
-        launch_sparse_gqa_merge(
-            partial_output=partial_output,
-            partial_lse=partial_lse,
-            output=output,
-            rows=rows,
-        )
-        return output[:rows]
-    if int(splits) == 1:
-        torch.ops.b12x.qsa_sparse_paged_gqa_direct(
-            query,
-            key_cache,
-            value_cache,
-            block_table,
-            request_ids,
-            selected_positions,
-            query_positions,
-            output,
-            float(softmax_scale),
-            int(block_n),
-        )
-    else:
-        assert partial_output is not None and partial_lse is not None
-        torch.ops.b12x.qsa_sparse_paged_gqa_split(
-            query,
-            key_cache,
-            value_cache,
-            block_table,
-            request_ids,
-            selected_positions,
-            query_positions,
-            partial_output,
-            partial_lse,
-            float(softmax_scale),
-            int(block_n),
-            int(splits),
-        )
-        torch.ops.b12x.qsa_sparse_paged_gqa_merge(
-            partial_output,
-            partial_lse,
-            output,
-            rows,
-            int(splits),
-        )
+    from ._sparse_gqa_cute import (
+        launch_sparse_gqa_merge,
+        launch_sparse_gqa_split,
+    )
+
+    launch_sparse_gqa_split(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        request_ids=request_ids,
+        selected_positions=selected_positions,
+        query_positions=query_positions,
+        partial_output=partial_output,
+        partial_lse=partial_lse,
+        softmax_scale=softmax_scale,
+    )
+    launch_sparse_gqa_merge(
+        partial_output=partial_output,
+        partial_lse=partial_lse,
+        output=output,
+        rows=rows,
+    )
     return output[:rows]
 
 

@@ -161,6 +161,30 @@ def test_production_entry_point_never_falls_back_to_torch_on_cpu() -> None:
         hc.run_grouped_rmsnorm(state, weight, eps=1e-6, binding=binding)
 
 
+def test_cute_combine_norm_dispatch_contract_is_explicit() -> None:
+    from b12x.norm.hyperconnection import _cute_config
+
+    assert _cute_config.is_qwen_combine_norm_contract(
+        streams=4,
+        hidden_size=2560,
+    )
+    assert _cute_config.supports_combine_norm(
+        streams=4,
+        hidden_size=2560,
+        compute_capability=(12, 0),
+    )
+    assert not _cute_config.supports_combine_norm(
+        streams=4,
+        hidden_size=2560,
+        compute_capability=(12, 1),
+    )
+    assert not _cute_config.supports_combine_norm(
+        streams=3,
+        hidden_size=2560,
+        compute_capability=(12, 0),
+    )
+
+
 def test_bind_rejects_overlapping_outputs() -> None:
     caps = hc.Caps(device="cpu", max_tokens=2, hidden_size=8, lowrank=8)
     plan = hc.plan(caps)
@@ -206,7 +230,7 @@ def test_bind_allows_outputs_with_disjoint_live_ranges_to_share_storage() -> Non
 
 def test_live_launches_preserve_capacity_tails_and_read_only_inputs() -> None:
     device = require_sm120()
-    tokens, capacity, streams, hidden_size, lowrank = 2, 5, 3, 64, 16
+    tokens, capacity, streams, hidden_size, lowrank = 2, 5, 4, 2560, 320
     width = streams * hidden_size
     plan = hc.plan(
         hc.Caps(
@@ -481,12 +505,8 @@ def test_cute_backend_is_callable_alongside_triton_and_graph_stable() -> None:
         eps=eps,
     )
     torch.testing.assert_close(triton_normalized, normalized_ref, rtol=0, atol=2e-2)
-    torch.testing.assert_close(
-        outputs["normalized"], normalized_ref, rtol=0, atol=2e-2
-    )
-    torch.testing.assert_close(
-        outputs["bottleneck"], bottleneck_ref, rtol=0, atol=8e-3
-    )
+    torch.testing.assert_close(outputs["normalized"], normalized_ref, rtol=0, atol=2e-2)
+    torch.testing.assert_close(outputs["bottleneck"], bottleneck_ref, rtol=0, atol=8e-3)
     torch.testing.assert_close(
         outputs["block_input"], block_input_ref, rtol=0, atol=8e-3
     )
@@ -511,12 +531,8 @@ def test_cute_backend_is_callable_alongside_triton_and_graph_stable() -> None:
 
     assert tuple(tensor.data_ptr() for tensor in outputs.values()) == addresses
     assert allocated_after == allocated_before
-    torch.testing.assert_close(
-        outputs["normalized"], normalized_ref, rtol=0, atol=2e-2
-    )
-    torch.testing.assert_close(
-        outputs["bottleneck"], bottleneck_ref, rtol=0, atol=8e-3
-    )
+    torch.testing.assert_close(outputs["normalized"], normalized_ref, rtol=0, atol=2e-2)
+    torch.testing.assert_close(outputs["bottleneck"], bottleneck_ref, rtol=0, atol=8e-3)
     torch.testing.assert_close(
         outputs["block_input"], block_input_ref, rtol=0, atol=8e-3
     )
@@ -529,24 +545,173 @@ def test_cute_backend_is_callable_alongside_triton_and_graph_stable() -> None:
     )
 
 
+def test_cute_reference_helpers_reuse_binaries_across_live_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.norm.hyperconnection import _cute
+
+    device = require_sm120()
+    streams, hidden_size, lowrank = 4, 63, 17
+    width = streams * hidden_size
+    eps = 1.0e-6
+    compile_keys: list[tuple[object, ...]] = []
+    original_compile = _cute._compile
+
+    def traced_compile(
+        key: tuple[object, ...], *args: object, **kwargs: object
+    ) -> object:
+        compile_keys.append(key)
+        return original_compile(key, *args, **kwargs)
+
+    def launch(tokens: int) -> None:
+        state = (
+            torch.randn((tokens, width), dtype=torch.float32, device=device)
+            .div_(4)
+            .to(torch.bfloat16)
+            .contiguous()
+        )
+        weight = (
+            torch.randn((width,), dtype=torch.float32, device=device)
+            .div_(32)
+            .to(torch.bfloat16)
+            .contiguous()
+        )
+        projected = torch.randn(
+            (tokens, lowrank), dtype=torch.bfloat16, device=device
+        ).contiguous()
+        gate_logits = torch.randn_like(state)
+        block_output = torch.randn(
+            (tokens, hidden_size), dtype=torch.bfloat16, device=device
+        ).contiguous()
+        injection_logits = torch.randn(
+            (tokens, streams), dtype=torch.bfloat16, device=device
+        ).contiguous()
+        normalized = torch.empty_like(state)
+        bottleneck = torch.empty_like(projected)
+        block_input = torch.empty_like(block_output)
+        combined = torch.empty_like(state)
+        fused_combined = torch.empty_like(state)
+        next_normalized = torch.empty_like(state)
+
+        _cute.grouped_rmsnorm(
+            state,
+            weight,
+            normalized,
+            eps=eps,
+            streams=streams,
+            hidden_size=hidden_size,
+        )
+        _cute.scaled_silu(projected, bottleneck, streams=streams)
+        _cute.gate_mean(
+            normalized,
+            gate_logits,
+            block_input,
+            streams=streams,
+            hidden_size=hidden_size,
+        )
+        _cute.combine(
+            state,
+            block_output,
+            injection_logits,
+            combined,
+            streams=streams,
+            hidden_size=hidden_size,
+        )
+        _cute.combine_norm(
+            state,
+            block_output,
+            injection_logits,
+            weight,
+            fused_combined,
+            next_normalized,
+            eps=eps,
+            streams=streams,
+            hidden_size=hidden_size,
+        )
+        torch.cuda.synchronize(device)
+
+        normalized_ref = hc.reference.grouped_rmsnorm(
+            state,
+            weight,
+            streams=streams,
+            eps=eps,
+        )
+        combined_ref, next_normalized_ref = hc.reference.combine_norm(
+            state,
+            block_output,
+            injection_logits,
+            weight,
+            streams=streams,
+            eps=eps,
+        )
+        torch.testing.assert_close(normalized, normalized_ref, rtol=0, atol=2e-2)
+        torch.testing.assert_close(
+            bottleneck,
+            hc.reference.scaled_silu(projected, streams=streams),
+            rtol=0,
+            atol=8e-3,
+        )
+        torch.testing.assert_close(
+            block_input,
+            hc.reference.gate_mean(
+                normalized_ref,
+                gate_logits,
+                streams=streams,
+            ),
+            rtol=0,
+            atol=8e-3,
+        )
+        torch.testing.assert_close(combined, combined_ref, rtol=0, atol=8e-3)
+        torch.testing.assert_close(fused_combined, combined_ref, rtol=0, atol=8e-3)
+        torch.testing.assert_close(
+            next_normalized,
+            next_normalized_ref,
+            rtol=0,
+            atol=2e-2,
+        )
+
+    _cute.clear_caches()
+    monkeypatch.setattr(_cute, "_compile", traced_compile)
+    try:
+        launch(1)
+        freeze_kernel_resolution(
+            "HyperConnection live counts must reuse warmed CuTe binaries"
+        )
+        try:
+            launch(17)
+        finally:
+            unfreeze_kernel_resolution()
+    finally:
+        _cute.clear_caches()
+
+    keys_by_name = {str(key[0]): key for key in compile_keys}
+    assert len(compile_keys) == 5
+    assert keys_by_name["norm"][2:] == (streams, hidden_size)
+    assert keys_by_name["silu"][2:] == (streams,)
+    assert keys_by_name["gate"][2:] == (streams, hidden_size)
+    assert keys_by_name["combine"][2:] == (streams, hidden_size)
+    assert keys_by_name["combine_norm"][2:] == (streams, hidden_size)
+
+
 @pytest.mark.filterwarnings("ignore:The CUDA Graph is empty.*:UserWarning")
 def test_cute_backend_rejects_cold_cuda_graph_capture() -> None:
     from b12x.norm.hyperconnection import _cute
 
     device = require_sm120()
-    projected = torch.randn(
-        (1, 320), dtype=torch.bfloat16, device=device
-    ).contiguous()
+    projected = torch.randn((1, 320), dtype=torch.bfloat16, device=device).contiguous()
     output = torch.empty_like(projected)
 
     _cute.clear_caches()
     graph = torch.cuda.CUDAGraph()
-    with pytest.raises(
-        RuntimeError,
-        match="compiled and warm-run before CUDA graph capture",
+    with (
+        pytest.raises(
+            RuntimeError,
+            match="compiled and warm-run before CUDA graph capture",
+        ),
+        torch.cuda.graph(graph),
     ):
-        with torch.cuda.graph(graph):
-            _cute.scaled_silu(projected, output, streams=4)
+        _cute.scaled_silu(projected, output, streams=4)
 
 
 def test_cute_backend_uses_tensor_device_for_resolution_and_launch(
@@ -565,9 +730,7 @@ def test_cute_backend_uses_tensor_device_for_resolution_and_launch(
     if torch.cuda.get_device_capability(target_index) != (12, 0):
         pytest.skip("requires an SM120 non-current CUDA device")
     target = torch.device("cuda", target_index)
-    projected = torch.randn(
-        (1, 320), dtype=torch.bfloat16, device=target
-    ).contiguous()
+    projected = torch.randn((1, 320), dtype=torch.bfloat16, device=target).contiguous()
     output = torch.empty_like(projected)
     compile_devices: list[int] = []
     launch_devices: list[int] = []
@@ -611,8 +774,11 @@ def test_combine_norm_cuda_graph_replay_uses_stable_outputs() -> None:
     injection_logits = torch.randn(
         (tokens, streams), dtype=torch.bfloat16, device=device
     ).contiguous()
-    weight = (
-        torch.randn((width,), dtype=torch.bfloat16, device=device).div_(32).contiguous()
+    weight = torch.nn.Parameter(
+        torch.randn((width,), dtype=torch.bfloat16, device=device)
+        .div_(32)
+        .contiguous(),
+        requires_grad=False,
     )
     plan = hc.plan(
         hc.Caps(
@@ -663,6 +829,219 @@ def test_combine_norm_cuda_graph_replay_uses_stable_outputs() -> None:
     assert allocated_after == allocated_before
     torch.testing.assert_close(combined, expected_combined, rtol=0, atol=8e-3)
     torch.testing.assert_close(normalized, expected_normalized, rtol=0, atol=2e-2)
+
+
+def test_combine_norm_reuses_one_cute_binary_across_token_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from b12x.norm.hyperconnection import _cute
+
+    device = require_sm120()
+    streams, hidden_size = 4, 2560
+    width = streams * hidden_size
+    compile_keys: list[tuple[object, ...]] = []
+    original_compile = _cute._compile
+
+    def traced_compile(
+        key: tuple[object, ...], *args: object, **kwargs: object
+    ) -> object:
+        compile_keys.append(key)
+        return original_compile(key, *args, **kwargs)
+
+    _cute.clear_caches()
+    monkeypatch.setattr(_cute, "_compile", traced_compile)
+    try:
+        for tokens in (1, 17):
+            state = torch.randn(
+                (tokens, width), dtype=torch.bfloat16, device=device
+            ).contiguous()
+            block_output = torch.randn(
+                (tokens, hidden_size), dtype=torch.bfloat16, device=device
+            ).contiguous()
+            injection_logits = torch.randn(
+                (tokens, streams), dtype=torch.bfloat16, device=device
+            ).contiguous()
+            weight = torch.zeros(
+                (width,), dtype=torch.bfloat16, device=device
+            ).contiguous()
+            plan = hc.plan(
+                hc.Caps(
+                    device=device,
+                    max_tokens=tokens,
+                    hidden_size=hidden_size,
+                    streams=streams,
+                )
+            )
+            combined, normalized = hc.run_combine_norm(
+                state,
+                block_output,
+                injection_logits,
+                weight,
+                eps=1.0e-6,
+                plan=plan,
+            )
+            expected = hc.reference.combine_norm(
+                state,
+                block_output,
+                injection_logits,
+                weight,
+                streams=streams,
+                eps=1.0e-6,
+            )
+            torch.testing.assert_close(combined, expected[0], rtol=0, atol=8e-3)
+            torch.testing.assert_close(normalized, expected[1], rtol=0, atol=2e-2)
+    finally:
+        _cute.clear_caches()
+
+    assert len(compile_keys) == 1
+    assert compile_keys[0][0] == "combine_norm_packed"
+    assert compile_keys[0][2:] == (streams, hidden_size)
+
+
+def test_combine_norm_uses_cute_and_rejects_non_qwen_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from b12x.norm.hyperconnection import _cute, _kernels
+
+    device = require_sm120()
+    cute_shapes: list[tuple[int, int]] = []
+
+    def fake_cute(
+        state: torch.Tensor,
+        block_output: torch.Tensor,
+        injection_logits: torch.Tensor,
+        next_norm_weight: torch.Tensor,
+        combined: torch.Tensor,
+        normalized: torch.Tensor,
+        **kwargs: object,
+    ) -> None:
+        del block_output, injection_logits, next_norm_weight, kwargs
+        cute_shapes.append((int(state.shape[0]), int(state.shape[1])))
+        combined.copy_(state)
+        normalized.copy_(state)
+
+    monkeypatch.setattr(_cute, "combine_norm", fake_cute)
+    for tokens in (4, 64):
+        streams, hidden_size = 4, 2560
+        width = streams * hidden_size
+        plan = hc.plan(
+            hc.Caps(
+                device=device,
+                max_tokens=tokens,
+                hidden_size=hidden_size,
+                streams=streams,
+            )
+        )
+        hc.run_combine_norm(
+            torch.zeros((tokens, width), dtype=torch.bfloat16, device=device),
+            torch.zeros((tokens, hidden_size), dtype=torch.bfloat16, device=device),
+            torch.zeros((tokens, streams), dtype=torch.bfloat16, device=device),
+            torch.nn.Parameter(
+                torch.zeros((width,), dtype=torch.bfloat16, device=device),
+                requires_grad=False,
+            ),
+            eps=1.0e-6,
+            plan=plan,
+        )
+    tokens, streams, hidden_size = 3, 4, 64
+    width = streams * hidden_size
+    plan = hc.plan(
+        hc.Caps(
+            device=device,
+            max_tokens=tokens,
+            hidden_size=hidden_size,
+            streams=streams,
+        )
+    )
+    with pytest.raises(ValueError, match="requires streams=4 and hidden_size=2560"):
+        hc.run_combine_norm(
+            torch.zeros((tokens, width), dtype=torch.bfloat16, device=device),
+            torch.zeros((tokens, hidden_size), dtype=torch.bfloat16, device=device),
+            torch.zeros((tokens, streams), dtype=torch.bfloat16, device=device),
+            torch.zeros((width,), dtype=torch.bfloat16, device=device),
+            eps=1.0e-6,
+            plan=plan,
+        )
+    torch.cuda.synchronize(device)
+
+    assert cute_shapes == [(4, 10240), (64, 10240)]
+    assert not hasattr(_kernels, "_combine_norm_kernel")
+
+
+def test_qwen_combine_norm_rejects_unsupported_cute_arch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from b12x.norm.hyperconnection import _cute_config
+
+    device = require_sm120()
+    tokens, streams, hidden_size = 1, 4, 2560
+    width = streams * hidden_size
+    plan = hc.plan(
+        hc.Caps(
+            device=device,
+            max_tokens=tokens,
+            hidden_size=hidden_size,
+            streams=streams,
+        )
+    )
+    monkeypatch.setattr(
+        _cute_config,
+        "_compute_capability",
+        lambda _: (12, 1),
+    )
+
+    with pytest.raises(RuntimeError, match="requires the CuTe SM120 kernel"):
+        hc.run_combine_norm(
+            torch.zeros((tokens, width), dtype=torch.bfloat16, device=device),
+            torch.zeros((tokens, hidden_size), dtype=torch.bfloat16, device=device),
+            torch.zeros((tokens, streams), dtype=torch.bfloat16, device=device),
+            torch.zeros((width,), dtype=torch.bfloat16, device=device),
+            eps=1.0e-6,
+            plan=plan,
+        )
+
+
+@pytest.mark.filterwarnings("ignore:The CUDA Graph is empty.*:UserWarning")
+def test_public_cute_combine_norm_rejects_cold_cuda_graph_capture() -> None:
+    from b12x.norm.hyperconnection import _cute
+
+    device = require_sm120()
+    tokens, streams, hidden_size = 1, 4, 2560
+    width = streams * hidden_size
+    state = torch.zeros((tokens, width), dtype=torch.bfloat16, device=device)
+    block_output = torch.zeros(
+        (tokens, hidden_size), dtype=torch.bfloat16, device=device
+    )
+    injection_logits = torch.zeros(
+        (tokens, streams), dtype=torch.bfloat16, device=device
+    )
+    weight = torch.zeros((width,), dtype=torch.bfloat16, device=device)
+    plan = hc.plan(
+        hc.Caps(
+            device=device,
+            max_tokens=tokens,
+            hidden_size=hidden_size,
+            streams=streams,
+        )
+    )
+
+    _cute.clear_caches()
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(
+            RuntimeError,
+            match="compiled and warm-run before CUDA graph capture",
+        ),
+        torch.cuda.graph(graph),
+    ):
+        hc.run_combine_norm(
+            state,
+            block_output,
+            injection_logits,
+            weight,
+            eps=1.0e-6,
+            plan=plan,
+        )
 
 
 def test_target_full_chain_cuda_graph_replay_uses_stable_outputs() -> None:
@@ -783,7 +1162,7 @@ def test_combine_norm_torch_compile_fullgraph_returns_live_outputs() -> None:
             plan=plan,
         )
 
-    # Warm the Triton specialization before compiling, matching serving setup.
+    # Warm the selected kernel specialization before compiling.
     run(state)
     compiled = torch.compile(run, fullgraph=True)
 
@@ -862,7 +1241,8 @@ def test_combine_norm_compile_avoids_recurrent_capacity_writebacks() -> None:
         torch.cuda.synchronize(device)
 
     event_names = {event.name for event in profiler.events()}
-    assert "_combine_norm_kernel" in event_names
+    assert any("PackedCombineNorm" in name for name in event_names)
+    assert "_combine_norm_kernel" not in event_names
     assert not {name for name in event_names if name.startswith("triton_poi_fused")}
     torch.testing.assert_close(state, state_before, rtol=0, atol=0)
 

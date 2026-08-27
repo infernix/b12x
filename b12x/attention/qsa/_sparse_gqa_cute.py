@@ -29,7 +29,6 @@ from b12x._lib.utils import current_cuda_stream, make_ptr
 from ._sparse_gqa_cute_config import BLOCK_N as _BLOCK_N
 from ._sparse_gqa_cute_config import HEAD_DIM as _HEAD_DIM
 from ._sparse_gqa_cute_config import NUM_SPLITS as _NUM_SPLITS
-from ._sparse_gqa_cute_config import PAGE_SIZE as _PAGE_SIZE
 from ._sparse_gqa_cute_config import SELECTION_WIDTH as _SELECTION_WIDTH
 from ._sparse_gqa_cute_config import clear_device_cache
 from ._sparse_gqa_cute_config import is_candidate
@@ -41,10 +40,10 @@ _DIMS_PER_LANE = _HEAD_DIM // 32
 _TILES_PER_SPLIT = 3
 _LOG2_E = 1.4426950408889634
 _LOCK = RLock()
-_KERNEL_CACHE: dict[tuple[int, int, int, int, int], Callable[..., None]] = {}
-_WARMED: dict[tuple[int, int, int, int, int], Callable[..., None]] = {}
-_MERGE_CACHE: dict[tuple[int, int, int, int], Callable[..., None]] = {}
-_MERGE_WARMED: dict[tuple[int, int, int, int], Callable[..., None]] = {}
+_KERNEL_CACHE: dict[tuple[int, int, int, int], Callable[..., None]] = {}
+_WARMED: dict[tuple[int, int, int, int], Callable[..., None]] = {}
+_MERGE_CACHE: dict[tuple[int, int, int], Callable[..., None]] = {}
+_MERGE_WARMED: dict[tuple[int, int, int], Callable[..., None]] = {}
 
 
 def _add(left: Float32, right: Float32) -> Float32:
@@ -94,8 +93,7 @@ class _SparseGqaSplitKernel:
     shared memory before writing the caller-owned FP32 split partial.
     """
 
-    def __init__(self, *, rows: int, q_heads: int, kv_heads: int) -> None:
-        self.rows = int(rows)
+    def __init__(self, *, q_heads: int, kv_heads: int) -> None:
         self.q_heads = int(q_heads)
         self.kv_heads = int(kv_heads)
         self.heads_per_kv = self.q_heads // self.kv_heads
@@ -115,6 +113,7 @@ class _SparseGqaSplitKernel:
         num_cache_pages: Int64,
         table_batch: Int64,
         table_width: Int64,
+        page_size: Int64,
         key_page_stride: Int64,
         key_token_stride: Int64,
         key_head_stride: Int64,
@@ -122,6 +121,7 @@ class _SparseGqaSplitKernel:
         value_token_stride: Int64,
         value_head_stride: Int64,
         softmax_scale: Float32,
+        rows: Int32,
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(
@@ -137,6 +137,7 @@ class _SparseGqaSplitKernel:
             num_cache_pages,
             table_batch,
             table_width,
+            page_size,
             key_page_stride,
             key_token_stride,
             key_head_stride,
@@ -145,7 +146,7 @@ class _SparseGqaSplitKernel:
             value_head_stride,
             softmax_scale,
         ).launch(
-            grid=(_NUM_SPLITS, self.q_heads, self.rows),
+            grid=(_NUM_SPLITS, self.q_heads, rows),
             block=(_THREADS, 1, 1),
             cluster=(1, 1, 1),
             stream=stream,
@@ -166,6 +167,7 @@ class _SparseGqaSplitKernel:
         num_cache_pages: Int64,
         table_batch: Int64,
         table_width: Int64,
+        page_size: Int64,
         key_page_stride: Int64,
         key_token_stride: Int64,
         key_head_stride: Int64,
@@ -226,7 +228,7 @@ class _SparseGqaSplitKernel:
                 physical_page = Int64(-1)
                 page_offset = Int64(0)
                 if valid:
-                    logical_page = logical_position // Int64(_PAGE_SIZE)
+                    logical_page = logical_position // page_size
                     valid = logical_page < table_width
                     if valid:
                         table_offset = request_id * table_width + logical_page
@@ -234,7 +236,7 @@ class _SparseGqaSplitKernel:
                         valid = (physical_page >= Int64(0)) & (
                             physical_page < num_cache_pages
                         )
-                        page_offset = logical_position % Int64(_PAGE_SIZE)
+                        page_offset = logical_position % page_size
 
                 if valid:
                     key_cache_base = (
@@ -361,8 +363,7 @@ class _SparseGqaSplitKernel:
 class _SparseGqaMergeKernel:
     """Merge 64 FP32 split-softmax partials into caller-owned BF16 output."""
 
-    def __init__(self, *, rows: int, q_heads: int) -> None:
-        self.rows = int(rows)
+    def __init__(self, *, q_heads: int) -> None:
         self.q_heads = int(q_heads)
 
     @cute.jit
@@ -371,10 +372,11 @@ class _SparseGqaMergeKernel:
         partial_output: cute.Pointer,
         partial_lse: cute.Pointer,
         output: cute.Pointer,
+        rows: Int32,
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(partial_output, partial_lse, output).launch(
-            grid=(self.q_heads, self.rows, 1),
+            grid=(self.q_heads, rows, 1),
             block=(_THREADS, 1, 1),
             stream=stream,
         )
@@ -487,13 +489,12 @@ def _cache_key(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     request_ids: torch.Tensor,
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, int, int, int]:
     device_index = query.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
     return (
         int(device_index),
-        int(query.shape[0]),
         int(query.shape[1]),
         int(key_cache.shape[2]),
         int(request_ids.element_size() * 8),
@@ -526,16 +527,15 @@ def _compile(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     request_ids: torch.Tensor,
-) -> tuple[tuple[int, int, int, int, int], Callable[..., None]]:
+) -> tuple[tuple[int, int, int, int], Callable[..., None]]:
     key = _cache_key(query, key_cache, request_ids)
     with _LOCK:
         cached = _KERNEL_CACHE.get(key)
         if cached is not None:
             return key, cached
-        _, rows, q_heads, kv_heads, request_id_bits = key
+        _, q_heads, kv_heads, request_id_bits = key
         request_id_type = Int32 if request_id_bits == 32 else Int64
         kernel = _SparseGqaSplitKernel(
-            rows=rows,
             q_heads=q_heads,
             kv_heads=kv_heads,
         )
@@ -565,13 +565,15 @@ def _compile(
                 Int64(1),
                 Int64(1),
                 Int64(1),
+                Int64(1),
                 Float32(1.0),
+                Int32(1),
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
                     "attention.qsa.sparse_gqa_split",
-                    2,
-                    (rows, q_heads, kv_heads, request_id_bits),
-                    labels=("rows", "q_heads", "kv_heads", "request_id_bits"),
+                    3,
+                    (q_heads, kv_heads, request_id_bits),
+                    labels=("q_heads", "kv_heads", "request_id_bits"),
                 ),
             )
         _KERNEL_CACHE[key] = raw
@@ -640,6 +642,7 @@ def launch_sparse_gqa_split(
                 int(key_cache.shape[0]),
                 int(block_table.shape[0]),
                 int(block_table.shape[1]),
+                int(key_cache.shape[1]),
                 int(key_cache.stride(0)),
                 int(key_cache.stride(1)),
                 int(key_cache.stride(2)),
@@ -647,6 +650,7 @@ def launch_sparse_gqa_split(
                 int(value_cache.stride(1)),
                 int(value_cache.stride(2)),
                 float(softmax_scale),
+                int(query.shape[0]),
                 current_cuda_stream(),
             ),
         )
@@ -668,7 +672,7 @@ def launch_sparse_gqa_merge(
     if device_index is None:
         device_index = torch.cuda.current_device()
     q_heads = int(partial_output.shape[2])
-    key = (int(device_index), int(rows), q_heads, _HEAD_DIM)
+    key = (int(device_index), q_heads, _HEAD_DIM)
     with torch.cuda.device(partial_output.device):
         capturing = torch.cuda.is_current_stream_capturing()
         with _LOCK:
@@ -680,7 +684,7 @@ def launch_sparse_gqa_merge(
                 "CUDA graph capture"
             )
         if raw is None:
-            kernel = _SparseGqaMergeKernel(rows=rows, q_heads=q_heads)
+            kernel = _SparseGqaMergeKernel(q_heads=q_heads)
             raise_if_kernel_resolution_frozen(
                 "cute.compile",
                 target=kernel,
@@ -691,10 +695,11 @@ def launch_sparse_gqa_merge(
                 _fake_pointer(Float32),
                 _fake_pointer(Float32),
                 _fake_pointer(BFloat16),
+                Int32(1),
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
                     "attention.qsa.sparse_gqa_merge",
-                    1,
+                    2,
                     key[1:],
                 ),
             )
@@ -706,6 +711,7 @@ def launch_sparse_gqa_merge(
                 _pointer(partial_output, Float32),
                 _pointer(partial_lse, Float32),
                 _pointer(output, BFloat16),
+                int(rows),
                 current_cuda_stream(),
             ),
         )

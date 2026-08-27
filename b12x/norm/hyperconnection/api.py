@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..._lib.gating import default_is_supported
+from ..._lib.gating import default_is_supported, get_compute_capability
 from . import META
 from . import reference
 from ._impl import HyperConnectionBinding as Binding
@@ -22,8 +22,10 @@ def bind(plan: Plan, **kwargs) -> Binding:
 
 
 def is_supported(device=None) -> bool:
-    """True when Triton-backed b12x kernels can run on the selected device."""
-    return default_is_supported(device, requires=META.requires)
+    """True when the mandatory CuTe main path and Triton auxiliaries can run."""
+    return default_is_supported(
+        device, requires=META.requires
+    ) and get_compute_capability(device) == (12, 0)
 
 
 __all__ = [

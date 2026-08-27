@@ -74,14 +74,14 @@ META = OpMeta(
     test_path="tests/sequence/test_gdn_decode.py",
     since="1.3.0",
     notes=(
-        "Qualified for 128-wide K/V heads, value/key ratios 1,2,3,4,8, "
-        "BF16 model tensors, BF16 or FP32 norm weights, and BF16 or FP32 "
-        "recurrent state. Production Qwen GDN and lower-bounded KDA use "
-        "Triton. Experimental CuTeDSL Qwen validation, recurrence, and gated "
-        "normalization stages are retained for direct qualification. "
-        "Lower-bounded KDA is qualified for equal 128-wide "
-        "Q/K/V head counts, per-key decay gates, scalar update gates, and a "
-        "sigmoid output gate."
+        "Qwen3.8 Flash Next GDN is qualified only for the SM120 TP2 capacity "
+        "max_tokens=16,max_seqs=4,state_index_columns=4 with 8 Q/K heads, 24 "
+        "value heads, BF16 or FP32 recurrent state, and int32 state indices. "
+        "Its "
+        "recurrence is mandatory CuTeDSL; Triton is used only for metadata "
+        "validation and gated RMSNorm auxiliaries. Other Qwen contracts are "
+        "unsupported. The separately named GLM/KDA API retains its dedicated "
+        "Triton recurrence for equal 128-wide Q/K/V head counts."
     ),
 )
 

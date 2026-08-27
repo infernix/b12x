@@ -260,7 +260,7 @@ def test_benchmark_calls_only_the_public_qsa_lifecycle() -> None:
     )
 
 
-def test_unqualified_sparse_gqa_retains_triton_without_importing_cute() -> None:
+def test_sparse_gqa_has_no_triton_alternate() -> None:
     repository = Path(benchmark_qsa.__file__).resolve().parents[1]
     source = textwrap.dedent(
         """
@@ -272,9 +272,9 @@ def test_unqualified_sparse_gqa_retains_triton_without_importing_cute() -> None:
         cute_module = "b12x.attention.qsa._sparse_gqa_cute"
         assert cute_module not in sys.modules
         source = inspect.getsource(_sparse_gqa).lower()
-        assert "@triton.jit" in source
+        assert "triton" not in source
         assert "_cute_is_candidate" in source
-        assert "_launch_cuda_library_fallback" not in source
+        assert "notimplementederror" in source
         assert cute_module not in sys.modules
         """
     )

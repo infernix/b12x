@@ -57,12 +57,10 @@ class BenchmarkCase:
 QWEN38_GDN_CASES = (
     BenchmarkCase("tp2-decode-bs1", (1,), 8, 24),
     BenchmarkCase("tp2-decode-bs4", (1, 1, 1, 1), 8, 24),
-    BenchmarkCase("tp2-decode-bs16", (1,) * 16, 8, 24),
+    BenchmarkCase("tp2-spec2-bs4", (2, 2, 2, 2), 8, 24),
     BenchmarkCase("tp2-spec4-bs1", (4,), 8, 24),
     BenchmarkCase("tp2-spec4-uneven", (4, 2, 1, 3), 8, 24),
-    BenchmarkCase("tp1-decode-bs1", (1,), 16, 48),
-    BenchmarkCase("tp4-decode-bs4", (1, 1, 1, 1), 4, 12),
-    BenchmarkCase("tp2-decode-bs4-bf16-state", (1, 1, 1, 1), 8, 24, torch.bfloat16),
+    BenchmarkCase("tp2-spec4-bs4", (4, 4, 4, 4), 8, 24),
 )
 
 
@@ -78,17 +76,16 @@ def resolve_capacity(
     capacity_seqs: int | None,
     capacity_columns: int | None,
 ) -> tuple[int, int, int]:
-    max_seqs = case.sequences if capacity_seqs is None else int(capacity_seqs)
-    columns = case.columns if capacity_columns is None else int(capacity_columns)
-    if max_seqs < case.sequences:
+    max_seqs = 4 if capacity_seqs is None else int(capacity_seqs)
+    columns = 4 if capacity_columns is None else int(capacity_columns)
+    if (max_seqs, columns) != (4, 4):
         raise ValueError(
-            f"capacity_seqs={max_seqs} is smaller than "
-            f"{case.sequences} live sequences"
+            "Qwen3.8 GDN benchmark requires the qualified fixed capacity "
+            f"capacity_seqs=4,capacity_columns=4; got {max_seqs}/{columns}"
         )
-    if columns < case.columns:
+    if case.sequences > max_seqs or case.columns > columns or case.tokens > 16:
         raise ValueError(
-            f"capacity_columns={columns} is smaller than the live width "
-            f"{case.columns}"
+            f"case {case.name} exceeds the qualified 4x4 serving capacity"
         )
     return max_seqs, columns, max_seqs * columns
 
@@ -560,12 +557,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--capacity-seqs",
         type=int,
-        help="fixed serving max_num_seqs; defaults to each case's live batch",
+        help="qualified fixed serving max_num_seqs; only 4 is accepted",
     )
     parser.add_argument(
         "--capacity-columns",
         type=int,
-        help="fixed state-index columns; defaults to each case's live width",
+        help="qualified fixed state-index columns; only 4 is accepted",
     )
     parser.add_argument("--json", type=pathlib.Path)
     args = parser.parse_args(argv)
@@ -585,6 +582,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(error))
 
     device = require_sm120()
+    if tuple(torch.cuda.get_device_capability(device)) != (12, 0):
+        raise SystemExit("Qwen3.8 GDN CuTe benchmark requires SM120")
     l2_flush = make_l2_flush_fn(args.l2_flush, args.l2_flush_bytes)
     command_argv = list(sys.argv[1:] if argv is None else argv)
     gpu_mode_before = nvidia_smi_gpu_mode_snapshot()
@@ -601,6 +600,8 @@ def main(argv: list[str] | None = None) -> int:
         "torch_version": str(torch.__version__),
         "torch_cuda_version": torch.version.cuda,
         "timed_path": "b12x.sequence.gdn_decode public Qwen decode transaction",
+        "recurrence_backend": "cutedsl",
+        "triton_role": "metadata_validation_and_gated_rmsnorm_auxiliaries",
         "reference_timed": False,
         "metric_direction": "lower_is_better",
         "mode": args.mode,
@@ -608,13 +609,9 @@ def main(argv: list[str] | None = None) -> int:
         "iterations": args.iterations,
         "l2_flush": bool(args.l2_flush),
         "fixed_capacity": {
-            "max_seqs": args.capacity_seqs,
-            "state_index_columns": args.capacity_columns,
-            "max_tokens": (
-                None
-                if args.capacity_seqs is None or args.capacity_columns is None
-                else args.capacity_seqs * args.capacity_columns
-            ),
+            "max_seqs": 4,
+            "state_index_columns": 4,
+            "max_tokens": 16,
         },
     }
     print(json.dumps(_jsonable(provenance), sort_keys=True))

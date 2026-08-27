@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ._cute_config import require_cute_combine_norm
+
 
 def _byte_interval(tensor: torch.Tensor) -> tuple[int, int]:
     start = int(tensor.untyped_storage().data_ptr()) + int(
@@ -119,51 +121,6 @@ def _combine_kernel(
     )
 
 
-@triton.jit
-def _combine_norm_kernel(
-    state_ptr,
-    block_output_ptr,
-    injection_logits_ptr,
-    next_norm_weight_ptr,
-    combined_ptr,
-    normalized_ptr,
-    eps,
-    HIDDEN_SIZE: tl.constexpr,
-    STREAMS: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    token = tl.program_id(0).to(tl.int64)
-    stream = tl.program_id(1).to(tl.int64)
-    cols = tl.arange(0, BLOCK_H).to(tl.int64)
-    mask = cols < HIDDEN_SIZE
-    state_offsets = (token * STREAMS + stream) * HIDDEN_SIZE + cols
-    output_offsets = token * HIDDEN_SIZE + cols
-    state = tl.load(state_ptr + state_offsets, mask=mask, other=0.0).to(tl.float32)
-    block_output = tl.load(block_output_ptr + output_offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    logit = tl.load(injection_logits_ptr + token * STREAMS + stream).to(tl.float32)
-    scale = 2.0 * tl.sigmoid(logit / STREAMS)
-
-    # The BF16 conversion is load-bearing: the next norm must consume the
-    # rounded state that the unfused graph would materialize.
-    combined = (state + scale * block_output).to(tl.bfloat16)
-    tl.store(combined_ptr + state_offsets, combined, mask=mask)
-    combined_fp32 = combined.to(tl.float32)
-    variance = tl.sum(combined_fp32 * combined_fp32, axis=0) / HIDDEN_SIZE
-    inv_rms = tl.rsqrt(variance + eps)
-    weight = tl.load(
-        next_norm_weight_ptr + stream * HIDDEN_SIZE + cols,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    tl.store(
-        normalized_ptr + state_offsets,
-        combined_fp32 * inv_rms * (1.0 + weight),
-        mask=mask,
-    )
-
-
 def _norm_launch(
     state: torch.Tensor,
     weight: torch.Tensor,
@@ -237,34 +194,6 @@ def _combine_launch(
         block_output,
         injection_logits,
         combined,
-        HIDDEN_SIZE=hidden_size,
-        STREAMS=streams,
-        BLOCK_H=block_h,
-        num_warps=num_warps,
-    )
-
-
-def _combine_norm_launch(
-    state: torch.Tensor,
-    block_output: torch.Tensor,
-    injection_logits: torch.Tensor,
-    next_norm_weight: torch.Tensor,
-    combined: torch.Tensor,
-    normalized: torch.Tensor,
-    eps: float,
-    streams: int,
-    hidden_size: int,
-    block_h: int,
-    num_warps: int,
-) -> None:
-    _combine_norm_kernel[(int(state.shape[0]), streams)](
-        state,
-        block_output,
-        injection_logits,
-        next_norm_weight,
-        combined,
-        normalized,
-        float(eps),
         HIDDEN_SIZE=hidden_size,
         STREAMS=streams,
         BLOCK_H=block_h,
@@ -419,19 +348,29 @@ def _combine_norm_op(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     combined = torch.empty_like(state)
     normalized = torch.empty_like(state)
+    require_cute_combine_norm(
+        state=state,
+        block_output=block_output,
+        injection_logits=injection_logits,
+        next_norm_weight=next_norm_weight,
+        combined=combined,
+        normalized=normalized,
+        streams=streams,
+        hidden_size=hidden_size,
+    )
     if int(state.shape[0]) != 0:
-        _combine_norm_launch(
+        from ._cute import combine_norm as combine_norm_cute
+
+        combine_norm_cute(
             state,
             block_output,
             injection_logits,
             next_norm_weight,
             combined,
             normalized,
-            eps,
-            streams,
-            hidden_size,
-            block_h,
-            num_warps,
+            eps=eps,
+            streams=streams,
+            hidden_size=hidden_size,
         )
     return combined, normalized
 

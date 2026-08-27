@@ -197,9 +197,9 @@ class Caps:
         if self.device.type != "cuda":
             raise ValueError(f"QSA decode requires a CUDA device, got {self.device}")
         capability = torch.cuda.get_device_capability(self.device)
-        if capability not in ((12, 0), (12, 1)):
+        if capability != (12, 0):
             raise ValueError(
-                "QSA decode in b12x requires SM120 or SM121, got "
+                "QSA decode in b12x requires the CuTe SM120 path, got "
                 f"compute capability {capability[0]}.{capability[1]}"
             )
         positive = {
@@ -249,6 +249,28 @@ class Caps:
             raise ValueError("QSA requires exactly one index KV head")
         if int(self.q_heads) % int(self.kv_heads):
             raise ValueError("q_heads must be divisible by kv_heads")
+        from ._sparse_gqa_cute_config import (
+            BLOCK_N as QWEN_CUTE_BLOCK_N,
+            NUM_SPLITS as QWEN_CUTE_NUM_SPLITS,
+            SUPPORTED_PAGE_SIZES as QWEN_CUTE_PAGE_SIZES,
+            is_qwen_geometry,
+        )
+
+        if not is_qwen_geometry(
+            q_heads=int(self.q_heads),
+            kv_heads=int(self.kv_heads),
+            head_dim=int(self.head_dim),
+            page_size=int(self.main_page_size),
+            selection_width=int(self.selection_width),
+            block_n=QWEN_CUTE_BLOCK_N,
+            splits=QWEN_CUTE_NUM_SPLITS,
+        ):
+            raise NotImplementedError(
+                "QSA requires the CuTe Qwen sparse-GQA geometry "
+                "(q_heads, kv_heads) in {(6, 1), (12, 1), (24, 2)}, "
+                "head_dim=256, main_page_size in "
+                f"{sorted(QWEN_CUTE_PAGE_SIZES)}, and selection_width=2051"
+            )
         if not _is_power_of_two(self.head_dim) or int(self.head_dim) < 16:
             raise ValueError("head_dim must be a power of two at least 16")
         if not _is_power_of_two(self.index_head_dim):
@@ -485,21 +507,35 @@ class _KernelCaps:
 
 
 def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
-    block_m = 1 << (int(caps.q_heads) // int(caps.kv_heads) - 1).bit_length()
-    base_rows = int(rows) * int(caps.kv_heads)
-    if base_rows <= (8 if block_m <= 8 else 4):
-        block_n, target = 16, 64
-    elif base_rows < 32:
-        block_n, target = 16, 32
-    elif base_rows <= 256:
-        block_n, target = 64, 8
-    elif base_rows <= 512:
-        block_n, target = 64, 4
-    else:
-        block_n, target = 64, 1
-    key_tiles = math.ceil(int(caps.selection_width) / block_n)
-    available = 1 << (key_tiles.bit_length() - 1)
-    return block_n, min(target, available)
+    from ._sparse_gqa_cute_config import (
+        BLOCK_N as QWEN_CUTE_BLOCK_N,
+        NUM_SPLITS as QWEN_CUTE_NUM_SPLITS,
+        SUPPORTED_HEAD_LAYOUTS,
+        SUPPORTED_PAGE_SIZES,
+        is_qwen_geometry,
+    )
+
+    del rows
+
+    if is_qwen_geometry(
+        q_heads=int(caps.q_heads),
+        kv_heads=int(caps.kv_heads),
+        head_dim=int(caps.head_dim),
+        page_size=int(caps.main_page_size),
+        selection_width=int(caps.selection_width),
+        block_n=QWEN_CUTE_BLOCK_N,
+        splits=QWEN_CUTE_NUM_SPLITS,
+    ):
+        return QWEN_CUTE_BLOCK_N, QWEN_CUTE_NUM_SPLITS
+    raise NotImplementedError(
+        "QSA requires the CuTe Qwen sparse-GQA geometry: q_heads/kv_heads in "
+        f"{sorted(SUPPORTED_HEAD_LAYOUTS)}, head_dim=256, main_page_size in "
+        f"{sorted(SUPPORTED_PAGE_SIZES)}, "
+        f"selection_width=2051; got q_heads={caps.q_heads}, "
+        f"kv_heads={caps.kv_heads}, head_dim={caps.head_dim}, "
+        f"main_page_size={caps.main_page_size}, "
+        f"selection_width={caps.selection_width}"
+    )
 
 
 def _scratch_layout(caps: Caps) -> tuple[_ScratchLayout, int, int, int, int]:
@@ -2456,11 +2492,13 @@ def run(
 
 
 def is_supported(device: torch.device | str | None = None) -> bool:
-    """Return whether the SM120/SM121 QSA decode kernel set is available."""
-    from ..._lib.gating import default_is_supported
+    """Return whether the mandatory SM120 CuTe QSA path is available."""
+    from ..._lib.gating import default_is_supported, get_compute_capability
     from . import META
 
-    return default_is_supported(device, requires=META.requires)
+    return default_is_supported(
+        device, requires=META.requires
+    ) and get_compute_capability(device) == (12, 0)
 
 
 __all__ = [

@@ -87,11 +87,12 @@ META = OpMeta(
     test_path="tests/attention/test_qsa_contract.py",
     since="1.3.0",
     notes=(
-        "The qualified SM120 Qwen sparse-GQA layout uses CuTeDSL. Grouped "
-        "selection, compressed-cache maintenance, packed speculative "
-        "persistence, and unqualified sparse-GQA layouts retain Triton. Main "
-        "K/V cache writes are unsupported. Page- and state-slot-scaled "
-        "addressing uses signed 64-bit arithmetic."
+        "The SM120 Qwen sparse-GQA layout uses CuTeDSL for every row count "
+        "and fails closed when its CuTe contract is not satisfied. No "
+        "alternate sparse-GQA implementation is dispatched. Triton is used "
+        "only for auxiliary selection and cache-maintenance stages in the "
+        "Qwen pipeline. Main K/V cache writes are unsupported. Page- and "
+        "state-slot-scaled addressing uses signed 64-bit arithmetic."
     ),
 )
 

@@ -12,7 +12,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as cutlass_utils
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 import torch
-from cutlass import Float32, Int32, const_expr
+from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.utils import LayoutEnum
 
@@ -31,6 +31,19 @@ _BUFFER_ALIGN_BYTES = 1_024
 _CACHE_LOCK = RLock()
 _KERNEL_CACHE: Dict[Tuple[int, int, int, int, int, bool], object] = {}
 _WARMED: Dict[Tuple[int, int, int, int, int, bool], object] = {}
+
+
+def _cutlass_runtime_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Return the exact Tensor type required by the CUTLASS runtime adapter."""
+    if type(tensor) is torch.Tensor:
+        return tensor
+    result = tensor.detach()
+    if type(result) is not torch.Tensor:
+        raise TypeError(
+            "MTP CuTe arguments must be torch.Tensor or detach to torch.Tensor, "
+            f"got {type(tensor)!r}"
+        )
+    return result
 
 
 def _convert_layout_acc_mn(acc_layout: cute.Layout) -> cute.Layout:
@@ -236,7 +249,11 @@ class MTPPrefillBf16GemmKernel:
             tiled_mma,
             SharedStorage,
         ).launch(
-            grid=(self.rows // self.tile_m, self.output_columns // _TILE_N, 1),
+            grid=(
+                (live_rows + Int32(self.tile_m - 1)) // Int32(self.tile_m),
+                self.output_columns // _TILE_N,
+                1,
+            ),
             block=[self.threads, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
@@ -374,14 +391,18 @@ class MTPPrefillBf16GemmKernel:
                     value = accumulator_mn[accumulator_m, accumulator_n]
                     if cutlass.const_expr(self.add_token_path):
                         token = row // Int32(self.streams)
-                        token_value = token_path[
-                            token * Int32(self.output_columns) + column
-                        ]
+                        token_offset = (
+                            token.to(Int64) * Int64(self.output_columns)
+                            + column.to(Int64)
+                        )
+                        token_value = token_path[token_offset]
                         value = Float32(cutlass.BFloat16(value)) + Float32(token_value)
                     if row < live_rows:
-                        output[row * Int32(self.output_columns) + column] = (
-                            cutlass.BFloat16(value)
+                        output_offset = (
+                            row.to(Int64) * Int64(self.output_columns)
+                            + column.to(Int64)
                         )
+                        output[output_offset] = cutlass.BFloat16(value)
 
         elif warp_index == Int32(self.producer_warp):
             producer_state = pipeline.make_pipeline_state(
@@ -438,7 +459,7 @@ def compile_mtp_prefill_bf16_gemm(
     streams: int,
     add_token_path: bool,
 ):
-    """Compile one exact-shape prefill projection into caller-owned output."""
+    """Compile one capacity-shaped projection into caller-owned output."""
     cache_key = _cache_key(
         rows,
         output_columns,
@@ -528,7 +549,13 @@ def compile_mtp_prefill_bf16_gemm(
             live = rows if live_rows is None else int(live_rows)
             if live < 0 or live > rows:
                 raise ValueError(f"live_rows must be in [0, {rows}], got {live}")
-            with torch.cuda.device(inputs.device):
+            if live == 0:
+                return
+            runtime_inputs = _cutlass_runtime_tensor(inputs)
+            runtime_weight = _cutlass_runtime_tensor(weight)
+            runtime_token = _cutlass_runtime_tensor(token_argument)
+            runtime_output = _cutlass_runtime_tensor(output)
+            with torch.cuda.device(runtime_inputs.device):
                 capturing = torch.cuda.is_current_stream_capturing()
                 with _CACHE_LOCK:
                     warmed = _WARMED.get(cache_key) is launch
@@ -538,10 +565,10 @@ def compile_mtp_prefill_bf16_gemm(
                         "capture"
                     )
                 raw(
-                    inputs,
-                    weight,
-                    token_argument.view(-1),
-                    output.view(-1),
+                    runtime_inputs,
+                    runtime_weight,
+                    runtime_token.view(-1),
+                    runtime_output.view(-1),
                     Int32(live),
                     current_cuda_stream(),
                 )
@@ -552,6 +579,33 @@ def compile_mtp_prefill_bf16_gemm(
 
         _KERNEL_CACHE[cache_key] = launch
         return launch
+
+
+def precompile_mtp_prefill_capacity(
+    token_rows: int,
+    state_rows: int,
+    hidden_size: int,
+    *,
+    device: torch.device,
+    streams: int,
+) -> None:
+    """Compile both capacity-specialized Qwen projection entry points."""
+    compile_mtp_prefill_bf16_gemm(
+        token_rows,
+        hidden_size,
+        hidden_size,
+        device=device,
+        streams=streams,
+        add_token_path=False,
+    )
+    compile_mtp_prefill_bf16_gemm(
+        state_rows,
+        hidden_size,
+        hidden_size,
+        device=device,
+        streams=streams,
+        add_token_path=True,
+    )
 
 
 def get_cached_mtp_prefill_bf16_gemm(
@@ -603,6 +657,7 @@ __all__ = [
     "compile_mtp_prefill_bf16_gemm",
     "get_cached_mtp_prefill_bf16_gemm",
     "is_mtp_prefill_bf16_gemm_warmed",
+    "precompile_mtp_prefill_capacity",
     "supports_prefill",
     "tensors_support_prefill",
 ]

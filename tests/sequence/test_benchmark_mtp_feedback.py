@@ -21,7 +21,11 @@ from benchmarks.benchmark_mtp_feedback import (
     _select_profiles,
     _summary,
 )
-from b12x.sequence.mtp_feedback._cute_prefill_config import supports_prefill
+from b12x.sequence.mtp_feedback._cute_prefill_config import (
+    projection_capacity_rows,
+    require_qwen_cute_tensors,
+    supports_prefill,
+)
 
 
 def test_qwen38_flash_next_profiles_cover_decode_spec_and_prefill() -> None:
@@ -31,6 +35,7 @@ def test_qwen38_flash_next_profiles_cover_decode_spec_and_prefill() -> None:
     assert [(profile.name, profile.phase, profile.tokens) for profile in PROFILES] == [
         ("decode-t1", "decode", 1),
         ("spec-t4", "spec", 4),
+        ("prefill-t17", "prefill", 17),
         ("prefill-t128", "prefill", 128),
         ("prefill-t512", "prefill", 512),
         ("prefill-t4096", "prefill", 4096),
@@ -48,6 +53,7 @@ def test_profile_and_phase_filters_intersect_in_corpus_order() -> None:
         "prefill-t512",
     ]
     assert [profile.name for profile in _select_profiles(None, ("prefill",))] == [
+        "prefill-t17",
         "prefill-t128",
         "prefill-t512",
         "prefill-t4096",
@@ -84,7 +90,7 @@ def test_cli_filters_profiles_without_requiring_cuda() -> None:
     assert _profile_listing(args.selected_profiles) == [
         {"name": "prefill-t512", "phase": "prefill", "tokens": 512}
     ]
-    assert _profile_seed(17, args.selected_profiles[0]) == 17 + 3 * 10_007
+    assert _profile_seed(17, args.selected_profiles[0]) == 17 + 4 * 10_007
 
 
 def test_default_cli_selects_full_corpus_and_both_timing_modes() -> None:
@@ -111,27 +117,89 @@ def test_capacity_override_covers_selected_live_token_profiles() -> None:
         _parse_args(["--profiles", "prefill-t128", "--capacity-tokens", "64"])
 
 
-@pytest.mark.parametrize("tokens", [1, 2, 4, 8, 16, 64, 96, 128, 512, 4096])
-def test_cute_projection_dispatch_accepts_qualified_token_counts(tokens: int) -> None:
-    assert supports_prefill(
-        tokens=tokens,
+def test_cute_projection_contract_accepts_every_positive_live_count() -> None:
+    for tokens in range(1, 4097):
+        assert supports_prefill(
+            tokens=tokens,
+            streams=4,
+            hidden_size=2560,
+            compute_capability=(12, 0),
+        )
+    assert projection_capacity_rows(
+        max_tokens=4096,
         streams=4,
         hidden_size=2560,
         compute_capability=(12, 0),
-    )
+    ) == (4096, 16384)
 
 
 @pytest.mark.parametrize(
-    "tokens",
-    [3, 12, 17, 24, 32, 40, 48, 80, 112, 144, 256, 1024, 2048],
+    ("capacity", "expected_rows"),
+    [
+        (1, (16, 16)),
+        (3, (16, 16)),
+        (4, (16, 16)),
+        (17, (32, 80)),
+        (4095, (4096, 16384)),
+        (4096, (4096, 16384)),
+    ],
 )
-def test_cute_projection_dispatch_rejects_unqualified_token_counts(tokens: int) -> None:
-    assert not supports_prefill(
-        tokens=tokens,
+def test_qwen_projection_pads_each_planner_capacity(
+    capacity: int, expected_rows: tuple[int, int]
+) -> None:
+    assert projection_capacity_rows(
+        max_tokens=capacity,
         streams=4,
         hidden_size=2560,
         compute_capability=(12, 0),
+    ) == expected_rows
+
+
+@pytest.mark.parametrize(
+    ("streams", "hidden_size"),
+    [
+        (3, 2560),
+        (4, 2048),
+    ],
+)
+def test_unqualified_projection_geometries_are_rejected(
+    streams: int,
+    hidden_size: int,
+) -> None:
+    with pytest.raises(ValueError, match="only implements the Qwen3.8 CuTe"):
+        projection_capacity_rows(
+            max_tokens=17,
+            streams=streams,
+            hidden_size=hidden_size,
+            compute_capability=(12, 0),
+        )
+
+
+def test_qwen_projection_rejects_unsupported_compute_capability() -> None:
+    assert not supports_prefill(
+        tokens=17,
+        streams=4,
+        hidden_size=2560,
+        compute_capability=(12, 1),
     )
+    with pytest.raises(
+        RuntimeError,
+        match=r"require the CuTe SM120 kernels.*12\.1",
+    ):
+        projection_capacity_rows(
+            max_tokens=32,
+            streams=4,
+            hidden_size=2560,
+            compute_capability=(12, 1),
+        )
+
+
+def test_qwen_dispatch_rejects_tensors_outside_tma_contract() -> None:
+    with pytest.raises(
+        ValueError,
+        match="Qwen MTP CuTe projection contract violation.*TMA",
+    ):
+        require_qwen_cute_tensors(token_path=torch.empty(1))
 
 
 def test_graph_contract_poisons_output_and_scratch_before_replay() -> None:

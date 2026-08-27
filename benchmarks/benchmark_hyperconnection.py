@@ -659,10 +659,10 @@ class _Emitter:
 
 def _validate_device(device: torch.device) -> None:
     capability = torch.cuda.get_device_capability(device)
-    if capability not in ((12, 0), (12, 1)):
+    if capability != (12, 0):
         raise SystemExit(
             "Qwen3.8 Flash Next HyperConnection benchmarking requires "
-            f"SM120/SM121, got SM{capability[0]}{capability[1]}"
+            f"SM120, got SM{capability[0]}{capability[1]}"
         )
     if not hc.is_supported(device):
         raise SystemExit(
