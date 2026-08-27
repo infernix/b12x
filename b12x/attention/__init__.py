@@ -10,6 +10,8 @@
 - ``dsa_indexer``: the DSA index stage — quantize -> score -> select.
 - ``qsa``: grouped-selector sparse GQA over caller-populated, read-only main
   BF16 paged K/V.
+- ``glm_pooled_indexer``: learned four-token pooling and selector-only sparse
+  MLA index output for GLM-5.3-Flash.
 - ``varlen``: contiguous batched/varlen attention (reduced-assurance tier).
 """
 
@@ -25,6 +27,7 @@ _OP_MODULES = (
     "compressed_sparse_mla",
     "dsa_indexer",
     "qsa",
+    "glm_pooled_indexer",
     "varlen",
 )
 
