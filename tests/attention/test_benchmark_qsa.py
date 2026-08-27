@@ -39,6 +39,7 @@ def test_default_corpus_is_tp2_and_bounds_synthetic_cache_capacity() -> None:
 
     assert args.profiles == ("tp2",)
     assert args.main_cache_layout == "interleaved"
+    assert args.kv_cache_dtype == "bf16"
     assert args.rows == (1, 4, 16, 64)
     assert args.contexts == (2048, 8192)
     assert len(cases) == 8
@@ -98,10 +99,17 @@ def test_cache_estimate_uses_disjoint_main_kv_and_scales_state_by_request() -> N
     many = benchmark_qsa.BenchmarkCase(benchmark_qsa.PROFILES["tp2"], 64, 8192)
     one_bytes = benchmark_qsa._cache_capacity_bytes(one)
     many_bytes = benchmark_qsa._cache_capacity_bytes(many)
+    fp8_bytes = benchmark_qsa._cache_capacity_bytes(
+        one,
+        kv_cache_dtype="fp8_e4m3",
+    )
 
     assert many_bytes["main_kv"] == 64 * one_bytes["main_kv"]
     assert many_bytes["compressed"] == 64 * one_bytes["compressed"]
     assert many_bytes["raw_state"] == 64 * one_bytes["raw_state"]
+    assert fp8_bytes["main_kv"] * 2 == one_bytes["main_kv"]
+    assert fp8_bytes["compressed"] == one_bytes["compressed"]
+    assert fp8_bytes["raw_state"] == one_bytes["raw_state"]
     assert many.compressed_page_size == 4
     assert many.compressed_pages_per_request == 512
 

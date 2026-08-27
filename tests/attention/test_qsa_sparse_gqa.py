@@ -590,6 +590,93 @@ def test_sparse_gqa_matches_reference_for_1504_token_pages() -> None:
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=2e-2)
 
 
+def test_sparse_gqa_fp8_cache_matches_dequantized_reference_and_graph_replay() -> None:
+    device = require_sm120()
+    generator = torch.Generator(device="cpu").manual_seed(93803)
+    rows, q_heads, kv_heads, head_dim = 1, 12, 1, 256
+    page_size, selection_width, splits = 16, 2051, 64
+    pages = 6
+    key_source, value_source = _cache_layout(
+        pages=pages,
+        page_size=page_size,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        layout="interleaved_page",
+        device=device,
+        generator=generator,
+    )
+    k_descale = torch.tensor([0.0125], dtype=torch.float32, device=device)
+    v_descale = torch.tensor([0.01], dtype=torch.float32, device=device)
+    key_cache = (key_source.float() / k_descale).to(torch.float8_e4m3fn)
+    value_cache = (value_source.float() / v_descale).to(torch.float8_e4m3fn)
+    block_table = torch.tensor([[4, 1, 5, 2]], dtype=torch.int32, device=device)
+    query = torch.randn(
+        (rows, q_heads, head_dim),
+        generator=generator,
+        dtype=torch.float32,
+        device="cpu",
+    ).to(device=device, dtype=torch.bfloat16)
+    request_ids = torch.zeros((rows,), dtype=torch.int64, device=device)
+    query_positions = torch.tensor([63], dtype=torch.int64, device=device)
+    selected_positions = torch.full(
+        (rows, selection_width), -1, dtype=torch.int32, device=device
+    )
+    selected_positions[0, :64] = torch.randperm(
+        64, generator=generator, dtype=torch.int64
+    ).to(device=device, dtype=torch.int32)
+    output = torch.empty_like(query)
+    partial_output = torch.empty(
+        (rows, splits, q_heads, head_dim), dtype=torch.float32, device=device
+    )
+    partial_lse = torch.empty(
+        (rows, splits, q_heads), dtype=torch.float32, device=device
+    )
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    def launch() -> torch.Tensor:
+        return launch_sparse_paged_gqa(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            block_table=block_table,
+            request_ids=request_ids,
+            selected_positions=selected_positions,
+            query_positions=query_positions,
+            output=output,
+            partial_output=partial_output,
+            partial_lse=partial_lse,
+            softmax_scale=softmax_scale,
+            block_n=16,
+            splits=splits,
+        )
+
+    launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output = launch()
+    query.copy_(torch.randn_like(query))
+    k_descale.fill_(0.015625)
+    v_descale.fill_(0.0078125)
+    expected = _dense_gathered_reference(
+        query,
+        key_cache.float() * k_descale,
+        value_cache.float() * v_descale,
+        block_table,
+        request_ids,
+        selected_positions,
+        query_positions,
+        softmax_scale,
+    )
+    allocated_before = torch.cuda.memory_allocated(device)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.cuda.memory_allocated(device) == allocated_before
+    assert captured_output.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(captured_output, expected, rtol=0.0, atol=3e-2)
+
+
 def test_sparse_gqa_zeroes_padded_request_and_all_masked_rows() -> None:
     device = require_sm120()
     rows, q_heads, kv_heads, head_dim = 2, 24, 2, 256
@@ -786,14 +873,21 @@ def test_sparse_gqa_reuses_binaries_across_runtime_rows_and_page_sizes(
         cute_impl.clear_caches()
 
 
-def test_sparse_gqa_uses_int64_for_high_physical_page_offsets() -> None:
+@pytest.mark.parametrize(
+    "kv_dtype",
+    [torch.bfloat16, torch.float8_e4m3fn],
+    ids=["bf16", "fp8_e4m3"],
+)
+def test_sparse_gqa_uses_int64_for_high_physical_page_offsets(
+    kv_dtype: torch.dtype,
+) -> None:
     device = require_sm120()
     rows, q_heads, kv_heads, head_dim = 1, 24, 2, 256
     page_size = 16
     page_stride_elements = page_size * kv_heads * head_dim
     tail_page = math.ceil((1 << 31) / page_stride_elements)
     num_pages = tail_page + 1
-    required_bytes = num_pages * page_stride_elements * torch.bfloat16.itemsize
+    required_bytes = num_pages * page_stride_elements * kv_dtype.itemsize
     free_bytes, _ = torch.cuda.mem_get_info(device)
     reserve_bytes = 2 * 1024**3
     if free_bytes < required_bytes + reserve_bytes:
@@ -804,7 +898,7 @@ def test_sparse_gqa_uses_int64_for_high_physical_page_offsets() -> None:
     try:
         cache = torch.empty(
             (num_pages, page_size, kv_heads, head_dim),
-            dtype=torch.bfloat16,
+            dtype=kv_dtype,
             device=device,
         )
     except torch.OutOfMemoryError:
@@ -813,7 +907,7 @@ def test_sparse_gqa_uses_int64_for_high_physical_page_offsets() -> None:
             f"{required_bytes}-byte high-page-id cache"
         )
 
-    live_value = (
+    source_value = (
         torch.linspace(
             -1.0,
             1.0,
@@ -824,6 +918,16 @@ def test_sparse_gqa_uses_int64_for_high_physical_page_offsets() -> None:
         .view(kv_heads, head_dim)
         .to(torch.bfloat16)
     )
+    k_descale = None
+    v_descale = None
+    if kv_dtype == torch.float8_e4m3fn:
+        k_descale = torch.tensor([0.01], dtype=torch.float32, device=device)
+        v_descale = torch.tensor([0.01], dtype=torch.float32, device=device)
+        live_value = (source_value.float() / v_descale).to(kv_dtype)
+        expected_value = (live_value.float() * v_descale).to(torch.bfloat16)
+    else:
+        live_value = source_value
+        expected_value = live_value
     cache[tail_page, 0].copy_(live_value)
     query = torch.randn((rows, q_heads, head_dim), dtype=torch.bfloat16, device=device)
     block_table = torch.tensor([[tail_page]], dtype=torch.int32, device=device)
@@ -843,6 +947,8 @@ def test_sparse_gqa_uses_int64_for_high_physical_page_offsets() -> None:
         query=query,
         key_cache=cache,
         value_cache=cache,
+        k_descale=k_descale,
+        v_descale=v_descale,
         block_table=block_table,
         request_ids=request_ids,
         selected_positions=selected_positions,
@@ -855,6 +961,6 @@ def test_sparse_gqa_uses_int64_for_high_physical_page_offsets() -> None:
         splits=splits,
     )
     expected = torch.stack(
-        [live_value[head // (q_heads // kv_heads)] for head in range(q_heads)]
+        [expected_value[head // (q_heads // kv_heads)] for head in range(q_heads)]
     ).unsqueeze(0)
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)

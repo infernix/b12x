@@ -112,8 +112,8 @@ def is_candidate(
         return False
     if (
         query.dtype != torch.bfloat16
-        or key_cache.dtype != torch.bfloat16
-        or value_cache.dtype != torch.bfloat16
+        or key_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+        or value_cache.dtype != key_cache.dtype
         or block_table.dtype != torch.int32
         or request_ids.dtype not in (torch.int32, torch.int64)
         or selected_positions.dtype != torch.int32

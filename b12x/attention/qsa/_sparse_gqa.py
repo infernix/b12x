@@ -1,7 +1,7 @@
 """CuTeDSL indexed sparse paged causal GQA for Qwen3.8 Flash Next.
 
-This private stage reads exact BF16 main-cache K/V at caller-selected logical
-token positions. It never writes either cache. The supported Qwen geometry
+This private stage reads BF16 or globally scaled FP8 E4M3 main-cache K/V at
+caller-selected logical token positions. It never writes either cache. The supported Qwen geometry
 always launches the CuTe split and merge kernels; every other geometry,
 layout, or device fails instead of selecting an alternate implementation.
 """
@@ -28,6 +28,8 @@ def _validate_launch(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
     block_table: torch.Tensor,
     request_ids: torch.Tensor,
     selected_positions: torch.Tensor,
@@ -62,12 +64,23 @@ def _validate_launch(
         raise ValueError("key_cache head dimension must match query")
     if q_heads % kv_heads:
         raise ValueError("q_heads must be divisible by kv_heads")
-    if key_cache.dtype != torch.bfloat16:
-        raise TypeError("key_cache must be torch.bfloat16")
-    if value_cache.shape != key_cache.shape or value_cache.dtype != torch.bfloat16:
-        raise ValueError("value_cache must match the BF16 key_cache shape")
+    if key_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise TypeError("key_cache must be BF16 or FP8 E4M3FN")
+    if value_cache.shape != key_cache.shape or value_cache.dtype != key_cache.dtype:
+        raise ValueError("value_cache must match the key_cache shape and dtype")
     _require_unit_inner_stride(key_cache, "key_cache")
     _require_unit_inner_stride(value_cache, "value_cache")
+    if key_cache.dtype == torch.float8_e4m3fn:
+        if k_descale is None or v_descale is None:
+            raise ValueError("FP8 QSA caches require k_descale and v_descale")
+        for descale, name in ((k_descale, "k_descale"), (v_descale, "v_descale")):
+            if (
+                descale.device != device
+                or descale.dtype != torch.float32
+                or descale.numel() != 1
+                or not descale.is_contiguous()
+            ):
+                raise ValueError(f"{name} must be one contiguous CUDA float32 value")
 
     tensors = (
         block_table,
@@ -163,6 +176,8 @@ def launch_sparse_paged_gqa(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
     block_table: torch.Tensor,
     request_ids: torch.Tensor,
     selected_positions: torch.Tensor,
@@ -179,6 +194,8 @@ def launch_sparse_paged_gqa(
         query=query,
         key_cache=key_cache,
         value_cache=value_cache,
+        k_descale=k_descale,
+        v_descale=v_descale,
         block_table=block_table,
         request_ids=request_ids,
         selected_positions=selected_positions,
@@ -221,7 +238,7 @@ def launch_sparse_paged_gqa(
         splits=splits,
     ):
         raise RuntimeError(
-            "Qwen sparse GQA requires its CuTe SM120 BF16 layout and capacity contract"
+            "Qwen sparse GQA requires its CuTe SM120 layout and capacity contract"
         )
 
     from ._sparse_gqa_cute import (
@@ -233,6 +250,8 @@ def launch_sparse_paged_gqa(
         query=query,
         key_cache=key_cache,
         value_cache=value_cache,
+        k_descale=k_descale,
+        v_descale=v_descale,
         block_table=block_table,
         request_ids=request_ids,
         selected_positions=selected_positions,

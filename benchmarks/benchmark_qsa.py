@@ -383,6 +383,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "BLHNC per-layer cache view (default: interleaved)"
         ),
     )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        choices=("bf16", "fp8_e4m3"),
+        default="bf16",
+        help="main K/V cache storage dtype (default: bf16)",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--eager-replays", type=int, default=20)
     parser.add_argument("--graph-replays", type=int, default=100)
@@ -450,15 +456,24 @@ def _resolve_cases(args: argparse.Namespace) -> tuple[BenchmarkCase, ...]:
     return tuple(cases)
 
 
-def _cache_capacity_bytes(case: BenchmarkCase) -> dict[str, int]:
+def _cache_capacity_bytes(
+    case: BenchmarkCase,
+    *,
+    kv_cache_dtype: str = "bf16",
+) -> dict[str, int]:
     element_bytes = torch.bfloat16.itemsize
+    kv_element_bytes = (
+        torch.float8_e4m3fn.itemsize
+        if kv_cache_dtype == "fp8_e4m3"
+        else torch.bfloat16.itemsize
+    )
     main_kv = (
         2
         * case.main_pages_total
         * MAIN_PAGE_SIZE
         * case.profile.kv_heads
         * HEAD_DIM
-        * element_bytes
+        * kv_element_bytes
     )
     compressed = (
         case.request_count
@@ -711,7 +726,12 @@ def _initialize_selector_corpus(
     )
 
 
-def _make_caps(case: BenchmarkCase, device: torch.device) -> qsa.Caps:
+def _make_caps(
+    case: BenchmarkCase,
+    device: torch.device,
+    *,
+    kv_dtype: torch.dtype,
+) -> qsa.Caps:
     return qsa.Caps(
         device=device,
         max_batch=case.request_count,
@@ -737,6 +757,7 @@ def _make_caps(case: BenchmarkCase, device: torch.device) -> qsa.Caps:
         position_axes=POSITION_AXES,
         mrope_sections=MROPE_SECTIONS,
         mrope_interleaved=True,
+        kv_dtype=kv_dtype,
     )
 
 
@@ -746,8 +767,10 @@ def _prepare_case(
     device: torch.device,
     seed: int,
     main_cache_layout: str,
+    kv_cache_dtype: str,
 ) -> PreparedCase:
-    caps = _make_caps(case, device)
+    kv_dtype = torch.float8_e4m3fn if kv_cache_dtype == "fp8_e4m3" else torch.bfloat16
+    caps = _make_caps(case, device, kv_dtype=kv_dtype)
     plan = qsa.plan(caps)
     (scratch_spec,) = plan.scratch_specs()
     scratch = torch.empty(
@@ -764,25 +787,39 @@ def _prepare_case(
         HEAD_DIM,
     )
     if main_cache_layout == "interleaved":
-        main_kv = _random_bf16(
+        main_kv_source = _random_bf16(
             (case.main_pages_total, 2, *main_cache_shape[1:]),
             generator=generator,
             device=device,
         )
+        main_kv = torch.empty_like(main_kv_source, dtype=kv_dtype)
         main_k, main_v = main_kv.unbind(1)
+        source_k, source_v = main_kv_source.unbind(1)
     elif main_cache_layout == "separate":
-        main_k = _random_bf16(
+        source_k = _random_bf16(
             main_cache_shape,
             generator=generator,
             device=device,
         )
-        main_v = _random_bf16(
+        source_v = _random_bf16(
             main_cache_shape,
             generator=generator,
             device=device,
         )
+        main_k = torch.empty_like(source_k, dtype=kv_dtype)
+        main_v = torch.empty_like(source_v, dtype=kv_dtype)
     else:
         raise BenchmarkFailure(f"unknown main-cache layout {main_cache_layout!r}")
+    k_descale = None
+    v_descale = None
+    if kv_dtype == torch.float8_e4m3fn:
+        k_descale = torch.tensor([0.0125], dtype=torch.float32, device=device)
+        v_descale = torch.tensor([0.01], dtype=torch.float32, device=device)
+        main_k.copy_((source_k.float() / k_descale).clamp(-448.0, 448.0))
+        main_v.copy_((source_v.float() / v_descale).clamp(-448.0, 448.0))
+    else:
+        main_k.copy_(source_k)
+        main_v.copy_(source_v)
     main_table = _disjoint_page_table(
         case.request_count,
         case.main_pages_per_request,
@@ -864,6 +901,8 @@ def _prepare_case(
         scratch=scratch,
         main_k_cache=main_k,
         main_v_cache=main_v,
+        k_descale=k_descale,
+        v_descale=v_descale,
         main_block_table=main_table,
         compressed_k_cache=compressed,
         compressed_block_table=compressed_table,
@@ -1219,6 +1258,14 @@ def _validate_correctness(
         case.compressed_page_size,
         INDEX_HEAD_DIM,
     ).reshape(case.request_count, -1, INDEX_HEAD_DIM)[:, : case.groups]
+    reference_k_cache = binding.main_k_cache.float()
+    reference_v_cache = binding.main_v_cache.float()
+    sparse_gqa_atol = 2e-2
+    if binding.k_descale is not None:
+        assert binding.v_descale is not None
+        reference_k_cache *= binding.k_descale
+        reference_v_cache *= binding.v_descale
+        sparse_gqa_atol = 4e-2
     max_abs = 0.0
     tail_lengths: list[int] = []
     for row in range(case.rows):
@@ -1236,8 +1283,8 @@ def _validate_correctness(
             raise BenchmarkFailure(f"{case.name}: selector mismatch at row {row}")
         expected_output = sparse_paged_gqa_reference(
             prepared.dynamic["query"][row : row + 1],
-            binding.main_k_cache,
-            binding.main_v_cache,
+            reference_k_cache,
+            reference_v_cache,
             binding.main_block_table,
             prepared.dynamic["request_ids"][row : row + 1],
             expected_selected,
@@ -1245,7 +1292,10 @@ def _validate_correctness(
         )
         try:
             torch.testing.assert_close(
-                actual[row : row + 1], expected_output, rtol=0.0, atol=2e-2
+                actual[row : row + 1],
+                expected_output,
+                rtol=0.0,
+                atol=sparse_gqa_atol,
             )
         except AssertionError as error:
             raise BenchmarkFailure(
@@ -1302,7 +1352,7 @@ def _validate_correctness(
             "reference_rows": case.rows,
             "selector_exact": True,
             "sparse_gqa_rtol": 0.0,
-            "sparse_gqa_atol": 2e-2,
+            "sparse_gqa_atol": sparse_gqa_atol,
             "sparse_gqa_max_abs": max_abs,
             "finite": True,
             "nonzero_elements": nonzero,
@@ -1400,6 +1450,7 @@ def _run_case(
         device=device,
         seed=args.seed + 1009 * case_index,
         main_cache_layout=args.main_cache_layout,
+        kv_cache_dtype=args.kv_cache_dtype,
     )
     eager_output, correctness, eager_persistent_state = _validate_correctness(prepared)
     eager_selected = prepared.binding.selected_positions[: case.rows].clone()
@@ -1496,6 +1547,7 @@ def _run_case(
         "setup": prepared.setup_metadata,
         "geometry": {
             "main_cache_layout": args.main_cache_layout,
+            "kv_cache_dtype": args.kv_cache_dtype,
             "head_dim": HEAD_DIM,
             "main_page_size": MAIN_PAGE_SIZE,
             "compressed_page_size": case.compressed_page_size,
@@ -1517,7 +1569,10 @@ def _run_case(
             "compressed_pages": (
                 case.request_count * case.compressed_pages_per_request
             ),
-            "cache_bytes": _cache_capacity_bytes(case),
+            "cache_bytes": _cache_capacity_bytes(
+                case,
+                kv_cache_dtype=args.kv_cache_dtype,
+            ),
             "allocated_binding_and_dynamic_storage_bytes": _binding_storage_bytes(
                 prepared
             ),
@@ -1663,6 +1718,7 @@ def main(argv: list[str] | None = None) -> int:
                 "rows": list(args.rows),
                 "contexts": list(args.contexts),
                 "main_cache_layout": args.main_cache_layout,
+                "kv_cache_dtype": args.kv_cache_dtype,
                 "contract_cases": args.contract_cases,
                 "warmup": args.warmup,
                 "eager_replays": args.eager_replays,

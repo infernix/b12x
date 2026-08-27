@@ -38,6 +38,7 @@ class CacheRequirements:
     """Pure per-page shapes and byte layout required by QSA cache storage."""
 
     dtype: torch.dtype
+    kv_dtype: torch.dtype
     main_k_page_shape: tuple[int, int, int]
     main_v_page_shape: tuple[int, int, int]
     compressed_page_shape: tuple[int, int]
@@ -71,6 +72,7 @@ def cache_requirements(
     position_axes: int = 1,
     max_speculative_tokens: int = 0,
     dtype: torch.dtype = torch.bfloat16,
+    kv_dtype: torch.dtype = torch.bfloat16,
 ) -> CacheRequirements:
     """Describe QSA cache storage without requiring a device or pool capacity.
 
@@ -93,7 +95,9 @@ def cache_requirements(
         if int(value) <= 0:
             raise ValueError(f"{name} must be positive")
     if dtype != torch.bfloat16:
-        raise TypeError("QSA query and cache dtype must be torch.bfloat16")
+        raise TypeError("QSA query and selector-cache dtype must be torch.bfloat16")
+    if kv_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise TypeError("QSA main KV cache dtype must be BF16 or FP8 E4M3FN")
     if not _is_power_of_two(head_dim) or int(head_dim) < 16:
         raise ValueError("head_dim must be a power of two at least 16")
     if not _is_power_of_two(index_head_dim):
@@ -115,10 +119,11 @@ def cache_requirements(
         raise ValueError("raw_ring_capacity must divide main_page_size")
 
     element_nbytes = dtype.itemsize
+    kv_element_nbytes = kv_dtype.itemsize
     int64_nbytes = torch.int64.itemsize
     compressed_page_size = int(main_page_size) // ratio
     main_page_shape = (int(main_page_size), int(kv_heads), int(head_dim))
-    main_page_nbytes = math.prod(main_page_shape) * element_nbytes
+    main_page_nbytes = math.prod(main_page_shape) * kv_element_nbytes
     compressed_page_shape = (compressed_page_size, int(index_head_dim))
     compressed_page_nbytes = math.prod(compressed_page_shape) * element_nbytes
     raw_k_ring_shape = (raw_ring_capacity, int(index_head_dim))
@@ -138,6 +143,7 @@ def cache_requirements(
 
     return CacheRequirements(
         dtype=dtype,
+        kv_dtype=kv_dtype,
         main_k_page_shape=main_page_shape,
         main_v_page_shape=main_page_shape,
         compressed_page_shape=compressed_page_shape,
@@ -191,6 +197,7 @@ class Caps:
     mrope_interleaved: bool = False
     rms_norm_eps: float = 1e-6
     dtype: torch.dtype = torch.bfloat16
+    kv_dtype: torch.dtype = torch.bfloat16
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "device", _canonical_device(self.device))
@@ -244,7 +251,9 @@ class Caps:
                 "num_compressed_cache_pages must fit in nonnegative int32 IDs"
             )
         if self.dtype != torch.bfloat16:
-            raise TypeError("QSA query and cache dtype must be torch.bfloat16")
+            raise TypeError("QSA query and selector-cache dtype must be torch.bfloat16")
+        if self.kv_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise TypeError("QSA main KV cache dtype must be BF16 or FP8 E4M3FN")
         if int(self.index_kv_heads) != 1:
             raise ValueError("QSA requires exactly one index KV head")
         if int(self.q_heads) % int(self.kv_heads):
@@ -341,6 +350,7 @@ class Caps:
             position_axes=int(self.position_axes),
             max_speculative_tokens=int(self.max_speculative_tokens),
             dtype=self.dtype,
+            kv_dtype=self.kv_dtype,
         )
 
     @property
@@ -441,6 +451,8 @@ class Binding:
     scratch: torch.Tensor
     main_k_cache: torch.Tensor
     main_v_cache: torch.Tensor
+    k_descale: torch.Tensor | None
+    v_descale: torch.Tensor | None
     main_block_table: torch.Tensor
     compressed_k_cache: torch.Tensor
     compressed_block_table: torch.Tensor
@@ -965,6 +977,8 @@ def bind(
     scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
     main_k_cache: torch.Tensor,
     main_v_cache: torch.Tensor,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
     main_block_table: torch.Tensor,
     compressed_k_cache: torch.Tensor,
     compressed_block_table: torch.Tensor,
@@ -1010,7 +1024,7 @@ def bind(
         main_k_cache,
         name="main_k_cache",
         device=caps.device,
-        dtype=caps.dtype,
+        dtype=caps.kv_dtype,
         unit_inner_stride=True,
     )
     _check_tensor(
@@ -1018,9 +1032,24 @@ def bind(
         name="main_v_cache",
         device=caps.device,
         shape=tuple(main_k_cache.shape),
-        dtype=caps.dtype,
+        dtype=caps.kv_dtype,
         unit_inner_stride=True,
     )
+    fp8_kv = caps.kv_dtype == torch.float8_e4m3fn
+    if fp8_kv and (k_descale is None or v_descale is None):
+        raise ValueError("FP8 QSA main caches require k_descale and v_descale")
+    for descale, name in ((k_descale, "k_descale"), (v_descale, "v_descale")):
+        if descale is None:
+            continue
+        _check_tensor(
+            descale,
+            name=name,
+            device=caps.device,
+            dtype=torch.float32,
+            contiguous=True,
+        )
+        if descale.numel() != 1:
+            raise ValueError(f"{name} must contain exactly one per-layer scale")
     if main_block_table.ndim != 2 or tuple(main_block_table.shape) != (
         int(caps.max_batch),
         int(caps.main_table_width),
@@ -1186,16 +1215,22 @@ def bind(
             ("output", output),
             ("selected_positions", selected_positions),
         ),
-        read_only=(
-            ("main_k_cache", main_k_cache),
-            ("main_v_cache", main_v_cache),
-            ("main_block_table", main_block_table),
-            ("compressed_block_table", compressed_block_table),
-            ("raw_state_slot_ids", raw_state_slot_ids),
-            ("index_q_norm_weight", index_q_norm_weight),
-            ("index_k_norm_weight", index_k_norm_weight),
-            ("rope_cos", rope_cos),
-            ("rope_sin", rope_sin),
+        read_only=tuple(
+            (name, tensor)
+            for name, tensor in (
+                ("main_k_cache", main_k_cache),
+                ("main_v_cache", main_v_cache),
+                ("k_descale", k_descale),
+                ("v_descale", v_descale),
+                ("main_block_table", main_block_table),
+                ("compressed_block_table", compressed_block_table),
+                ("raw_state_slot_ids", raw_state_slot_ids),
+                ("index_q_norm_weight", index_q_norm_weight),
+                ("index_k_norm_weight", index_k_norm_weight),
+                ("rope_cos", rope_cos),
+                ("rope_sin", rope_sin),
+            )
+            if tensor is not None
         ),
     )
     layout = plan._layout
@@ -1279,6 +1314,8 @@ def bind(
         scratch=scratch_storage,
         main_k_cache=main_k_cache,
         main_v_cache=main_v_cache,
+        k_descale=k_descale,
+        v_descale=v_descale,
         main_block_table=main_block_table,
         compressed_k_cache=compressed_k_cache,
         compressed_block_table=compressed_block_table,
@@ -1326,6 +1363,8 @@ def _qsa_decode_impl(
     scratch: torch.Tensor,
     main_k_cache: torch.Tensor,
     main_v_cache: torch.Tensor,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
     main_block_table: torch.Tensor,
     compressed_k_cache: torch.Tensor,
     compressed_block_table: torch.Tensor,
@@ -1745,6 +1784,8 @@ def _qsa_decode_impl(
         query=query,
         key_cache=main_k_cache,
         value_cache=main_v_cache,
+        k_descale=k_descale,
+        v_descale=v_descale,
         block_table=main_block_table,
         request_ids=request_ids,
         selected_positions=selected,
@@ -1788,6 +1829,8 @@ def _qsa_decode_op(
     scratch: torch.Tensor,
     main_k_cache: torch.Tensor,
     main_v_cache: torch.Tensor,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
     main_block_table: torch.Tensor,
     compressed_k_cache: torch.Tensor,
     compressed_block_table: torch.Tensor,
@@ -1867,6 +1910,8 @@ def _qsa_decode_op(
         scratch,
         main_k_cache,
         main_v_cache,
+        k_descale,
+        v_descale,
         main_block_table,
         compressed_k_cache,
         compressed_block_table,
@@ -1926,6 +1971,8 @@ def _qsa_decode_fake(
     scratch: torch.Tensor,
     main_k_cache: torch.Tensor,
     main_v_cache: torch.Tensor,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
     main_block_table: torch.Tensor,
     compressed_k_cache: torch.Tensor,
     compressed_block_table: torch.Tensor,
@@ -2053,6 +2100,8 @@ def _qsa_decode_shared_op(
     scratch: torch.Tensor,
     main_k_cache: torch.Tensor,
     main_v_cache: torch.Tensor,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
     main_block_table: torch.Tensor,
     compressed_raw_pool: torch.Tensor,
     compressed_block_table: torch.Tensor,
@@ -2138,6 +2187,8 @@ def _qsa_decode_shared_op(
         scratch,
         main_k_cache,
         main_v_cache,
+        k_descale,
+        v_descale,
         main_block_table,
         compressed_raw_pool,
         compressed_block_table,
@@ -2197,6 +2248,8 @@ def _qsa_decode_shared_fake(
     scratch: torch.Tensor,
     main_k_cache: torch.Tensor,
     main_v_cache: torch.Tensor,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
     main_block_table: torch.Tensor,
     compressed_raw_pool: torch.Tensor,
     compressed_block_table: torch.Tensor,
@@ -2390,6 +2443,8 @@ def run(
             binding.scratch,
             binding.main_k_cache,
             binding.main_v_cache,
+            binding.k_descale,
+            binding.v_descale,
             binding.main_block_table,
             binding.compressed_k_cache,
             binding.compressed_block_table,
@@ -2445,6 +2500,8 @@ def run(
         binding.scratch,
         binding.main_k_cache,
         binding.main_v_cache,
+        binding.k_descale,
+        binding.v_descale,
         binding.main_block_table,
         binding.compressed_k_cache,
         binding.compressed_block_table,

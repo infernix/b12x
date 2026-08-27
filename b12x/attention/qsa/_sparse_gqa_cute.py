@@ -16,7 +16,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Int32, Int64
+from cutlass import BFloat16, Float32, Float8E4M3FN, Int32, Int64, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -40,8 +40,8 @@ _DIMS_PER_LANE = _HEAD_DIM // 32
 _TILES_PER_SPLIT = 3
 _LOG2_E = 1.4426950408889634
 _LOCK = RLock()
-_KERNEL_CACHE: dict[tuple[int, int, int, int], Callable[..., None]] = {}
-_WARMED: dict[tuple[int, int, int, int], Callable[..., None]] = {}
+_KERNEL_CACHE: dict[tuple[int, int, int, int, torch.dtype], Callable[..., None]] = {}
+_WARMED: dict[tuple[int, int, int, int, torch.dtype], Callable[..., None]] = {}
 _MERGE_CACHE: dict[tuple[int, int, int], Callable[..., None]] = {}
 _MERGE_WARMED: dict[tuple[int, int, int], Callable[..., None]] = {}
 
@@ -93,10 +93,11 @@ class _SparseGqaSplitKernel:
     shared memory before writing the caller-owned FP32 split partial.
     """
 
-    def __init__(self, *, q_heads: int, kv_heads: int) -> None:
+    def __init__(self, *, q_heads: int, kv_heads: int, kv_is_fp8: bool) -> None:
         self.q_heads = int(q_heads)
         self.kv_heads = int(kv_heads)
         self.heads_per_kv = self.q_heads // self.kv_heads
+        self.kv_is_fp8 = bool(kv_is_fp8)
 
     @cute.jit
     def __call__(
@@ -104,6 +105,8 @@ class _SparseGqaSplitKernel:
         query: cute.Pointer,
         key_cache: cute.Pointer,
         value_cache: cute.Pointer,
+        k_descale: cute.Pointer,
+        v_descale: cute.Pointer,
         block_table: cute.Pointer,
         request_ids: cute.Pointer,
         selected_positions: cute.Pointer,
@@ -128,6 +131,8 @@ class _SparseGqaSplitKernel:
             query,
             key_cache,
             value_cache,
+            k_descale,
+            v_descale,
             block_table,
             request_ids,
             selected_positions,
@@ -158,6 +163,8 @@ class _SparseGqaSplitKernel:
         query: cute.Pointer,
         key_cache: cute.Pointer,
         value_cache: cute.Pointer,
+        k_descale: cute.Pointer,
+        v_descale: cute.Pointer,
         block_table: cute.Pointer,
         request_ids: cute.Pointer,
         selected_positions: cute.Pointer,
@@ -203,6 +210,11 @@ class _SparseGqaSplitKernel:
 
         running_max = Float32(-Float32.inf)
         running_sum = Float32(0.0)
+        k_scale = Float32(1.0)
+        v_scale = Float32(1.0)
+        if const_expr(self.kv_is_fp8):
+            k_scale = Float32(k_descale[0])
+            v_scale = Float32(v_descale[0])
 
         # 2051 positions form 129 BLOCK_N tiles.  Split zero sees tile 128's
         # three-position tail; every other split sees two complete tiles.
@@ -255,8 +267,10 @@ class _SparseGqaSplitKernel:
                         dimension = lane + Int32(item * 32)
                         key_offset = key_cache_base + dimension.to(Int64)
                         value_offset = value_cache_base + dimension.to(Int64)
-                        key_value = Float32(key_cache[key_offset])
-                        value_values[item] = Float32(value_cache[value_offset])
+                        key_value = Float32(key_cache[key_offset]) * k_scale
+                        value_values[item] = (
+                            Float32(value_cache[value_offset]) * v_scale
+                        )
                         score += query_values[item] * key_value
                     score = warp_reduce(score, _add) * softmax_scale
 
@@ -407,21 +421,17 @@ class _SparseGqaMergeKernel:
         if thread_i == Int32(0):
             maximum = Float32(-Float32.inf)
             for split in cutlass.range_constexpr(_NUM_SPLITS):
-                offset = (
-                    (row_i * Int64(_NUM_SPLITS) + Int64(split))
-                    * Int64(self.q_heads)
-                    + head_i
-                )
+                offset = (row_i * Int64(_NUM_SPLITS) + Int64(split)) * Int64(
+                    self.q_heads
+                ) + head_i
                 value = Float32(partial_lse[offset])
                 if value > maximum:
                     maximum = value
             denominator = Float32(0.0)
             for split in cutlass.range_constexpr(_NUM_SPLITS):
-                offset = (
-                    (row_i * Int64(_NUM_SPLITS) + Int64(split))
-                    * Int64(self.q_heads)
-                    + head_i
-                )
+                offset = (row_i * Int64(_NUM_SPLITS) + Int64(split)) * Int64(
+                    self.q_heads
+                ) + head_i
                 value = Float32(partial_lse[offset])
                 weight = Float32(0.0)
                 if value > Float32(-Float32.inf):
@@ -438,19 +448,13 @@ class _SparseGqaMergeKernel:
             total = Float32(0.0)
             for split in cutlass.range_constexpr(_NUM_SPLITS):
                 offset = (
-                    (
-                        (row_i * Int64(_NUM_SPLITS) + Int64(split))
-                        * Int64(self.q_heads)
-                        + head_i
-                    )
-                    * Int64(_HEAD_DIM)
-                    + dimension.to(Int64)
-                )
+                    (row_i * Int64(_NUM_SPLITS) + Int64(split)) * Int64(self.q_heads)
+                    + head_i
+                ) * Int64(_HEAD_DIM) + dimension.to(Int64)
                 total += Float32(partial_output[offset]) * Float32(weights[split])
-            output_offset = (
-                (row_i * Int64(self.q_heads) + head_i) * Int64(_HEAD_DIM)
-                + dimension.to(Int64)
-            )
+            output_offset = (row_i * Int64(self.q_heads) + head_i) * Int64(
+                _HEAD_DIM
+            ) + dimension.to(Int64)
             output[output_offset] = BFloat16(total * Float32(inverse[0]))
             dimension += Int32(_THREADS)
 
@@ -489,7 +493,7 @@ def _cache_key(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     request_ids: torch.Tensor,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, torch.dtype]:
     device_index = query.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
@@ -498,6 +502,7 @@ def _cache_key(
         int(query.shape[1]),
         int(key_cache.shape[2]),
         int(request_ids.element_size() * 8),
+        key_cache.dtype,
     )
 
 
@@ -527,17 +532,19 @@ def _compile(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     request_ids: torch.Tensor,
-) -> tuple[tuple[int, int, int, int], Callable[..., None]]:
+) -> tuple[tuple[int, int, int, int, torch.dtype], Callable[..., None]]:
     key = _cache_key(query, key_cache, request_ids)
     with _LOCK:
         cached = _KERNEL_CACHE.get(key)
         if cached is not None:
             return key, cached
-        _, q_heads, kv_heads, request_id_bits = key
+        _, q_heads, kv_heads, request_id_bits, kv_dtype = key
         request_id_type = Int32 if request_id_bits == 32 else Int64
+        kv_type = Float8E4M3FN if kv_dtype == torch.float8_e4m3fn else BFloat16
         kernel = _SparseGqaSplitKernel(
             q_heads=q_heads,
             kv_heads=kv_heads,
+            kv_is_fp8=kv_dtype == torch.float8_e4m3fn,
         )
         with torch.cuda.device(query.device):
             raise_if_kernel_resolution_frozen(
@@ -548,8 +555,10 @@ def _compile(
             raw = b12x_compile(
                 kernel,
                 _fake_pointer(BFloat16),
-                _fake_pointer(BFloat16),
-                _fake_pointer(BFloat16),
+                _fake_pointer(kv_type),
+                _fake_pointer(kv_type),
+                _fake_pointer(Float32),
+                _fake_pointer(Float32),
                 _fake_pointer(Int32),
                 _fake_pointer(request_id_type),
                 _fake_pointer(Int32),
@@ -571,9 +580,9 @@ def _compile(
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
                     "attention.qsa.sparse_gqa_split",
-                    3,
-                    (q_heads, kv_heads, request_id_bits),
-                    labels=("q_heads", "kv_heads", "request_id_bits"),
+                    4,
+                    (q_heads, kv_heads, request_id_bits, str(kv_dtype)),
+                    labels=("q_heads", "kv_heads", "request_id_bits", "kv_dtype"),
                 ),
             )
         _KERNEL_CACHE[key] = raw
@@ -600,6 +609,8 @@ def launch_sparse_gqa_split(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
     block_table: torch.Tensor,
     request_ids: torch.Tensor,
     selected_positions: torch.Tensor,
@@ -627,12 +638,19 @@ def launch_sparse_gqa_split(
                 request_ids=request_ids,
             )
         request_id_type = Int32 if request_ids.dtype == torch.int32 else Int64
+        kv_type = Float8E4M3FN if key_cache.dtype == torch.float8_e4m3fn else BFloat16
         run_compiled(
             raw,
             (
                 _pointer(query, BFloat16),
-                _pointer(key_cache, BFloat16),
-                _pointer(value_cache, BFloat16),
+                _pointer(key_cache, kv_type),
+                _pointer(value_cache, kv_type),
+                _pointer(k_descale, Float32)
+                if k_descale is not None
+                else _fake_pointer(Float32),
+                _pointer(v_descale, Float32)
+                if v_descale is not None
+                else _fake_pointer(Float32),
                 _pointer(block_table, Int32),
                 _pointer(request_ids, request_id_type),
                 _pointer(selected_positions, Int32),

@@ -549,6 +549,20 @@ def test_qsa_cache_requirements_are_pure_and_describe_shared_page_layout() -> No
     assert requirements.alignment_bytes == 256
     assert requirements.shared_compressed_raw_storage_legal
 
+    fp8_requirements = qsa.cache_requirements(
+        main_page_size=64,
+        kv_heads=2,
+        head_dim=256,
+        index_head_dim=128,
+        compress_ratio=4,
+        kv_dtype=torch.float8_e4m3fn,
+    )
+    assert fp8_requirements.main_k_page_nbytes == 64 * 2 * 256
+    assert fp8_requirements.main_kv_page_nbytes == 2 * 64 * 2 * 256
+    assert (
+        fp8_requirements.compressed_page_nbytes == requirements.compressed_page_nbytes
+    )
+
     too_small = qsa.cache_requirements(
         main_page_size=32,
         kv_heads=2,
@@ -1544,9 +1558,7 @@ def test_qsa_packed_speculative_rejection_replaces_stale_groups_before_use() -> 
     assert torch.equal(binding.main_v_cache, main_v_before)
 
 
-def test_qsa_production_page_boundary_after_speculative_rollback_graph_replay() -> (
-    None
-):
+def test_qsa_production_page_boundary_after_speculative_rollback_graph_replay() -> None:
     device = require_sm120()
     caps = _caps(
         device,
