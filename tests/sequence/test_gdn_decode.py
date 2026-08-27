@@ -500,6 +500,40 @@ def test_accepted_column_selects_rollback_checkpoint() -> None:
     )
 
 
+def test_rejected_draft_restarts_next_iteration_from_accepted_checkpoint() -> None:
+    device = require_sm120()
+    binding, _ = _make_case(
+        device=device,
+        query_lengths=(3,),
+        columns=3,
+        accepted=(1,),
+        key_heads=1,
+        value_heads=1,
+    )
+    gdn.run(binding)
+    torch.cuda.synchronize(device)
+    accepted_checkpoint = binding.recurrent_state[1].clone()
+
+    binding.num_accepted_tokens.fill_(2)
+    binding.recurrent_state[2].fill_(73.0)
+    binding.mixed_qkv.copy_(torch.randn_like(binding.mixed_qkv).mul_(0.2))
+    binding.a.copy_(torch.randn_like(binding.a).mul_(0.2))
+    binding.b.copy_(torch.randn_like(binding.b).mul_(0.2))
+    binding.z.copy_(torch.randn_like(binding.z).mul_(0.2))
+    state_reference = binding.recurrent_state.clone()
+    torch.testing.assert_close(
+        state_reference[1], accepted_checkpoint, rtol=0, atol=0
+    )
+    expected = _reference(binding, state_reference)
+    actual = gdn.run(binding)
+    torch.cuda.synchronize(device)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(
+        binding.recurrent_state, state_reference, rtol=1e-5, atol=2e-5
+    )
+
+
 def test_qwen3_8_flash_next_ratio3_sigmoid_fp32_state_shape() -> None:
     device = require_sm120()
     binding, _ = _make_case(

@@ -1544,6 +1544,96 @@ def test_qsa_packed_speculative_rejection_replaces_stale_groups_before_use() -> 
     assert torch.equal(binding.main_v_cache, main_v_before)
 
 
+def test_qsa_production_page_boundary_after_speculative_rollback_graph_replay() -> (
+    None
+):
+    device = require_sm120()
+    caps = _caps(
+        device,
+        max_batch=4,
+        max_raw_state_slots=4,
+        max_q_rows=16,
+        max_seq_len=2048,
+        num_main_cache_pages=146,
+        num_compressed_cache_pages=146,
+        main_page_size=1504,
+        compressed_page_size=376,
+        max_speculative_tokens=3,
+        q_heads=12,
+        kv_heads=1,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
+        index_rotary_dim=64,
+        position_axes=3,
+        mrope_sections=(11, 11, 10),
+        mrope_interleaved=True,
+    )
+    binding = _allocate_binding(caps)
+    binding.main_block_table[0, :2].copy_(
+        torch.tensor([14, 145], dtype=torch.int32, device=device)
+    )
+    binding.compressed_block_table[0, :2].copy_(
+        torch.tensor([14, 145], dtype=torch.int32, device=device)
+    )
+    binding.main_k_cache[14].normal_()
+    binding.main_v_cache[14].normal_()
+    binding.main_k_cache[145].normal_()
+    binding.main_v_cache[145].normal_()
+    binding.compressed_k_cache[14].normal_()
+    binding.compressed_k_cache[145].zero_()
+    binding.raw_interval_start_positions[0] = 1503
+
+    crossing = _dynamic_inputs(
+        binding,
+        positions=(1504, 1505, 1506, 1507),
+        request_ids=(0, 0, 0, 0),
+        accepted_tokens=(1,),
+    )
+    qsa.run(binding, **crossing)
+    assert torch.all(binding.state_errors[:4] == 0)
+    assert int(binding.raw_interval_start_positions[0]) == 1504
+
+    replay = _dynamic_inputs(
+        binding,
+        positions=(1506, 1507, 1508, 1509),
+        request_ids=(0, 0, 0, 0),
+        accepted_tokens=(2,),
+    )
+    raw_before = binding.raw_k_ring.clone()
+    tags_before = binding.raw_logical_positions.clone()
+    rope_before = binding.raw_rope_positions.clone()
+    anchor_before = binding.raw_interval_start_positions.clone()
+    compressed_before = binding.compressed_k_cache[145, 0].clone()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = qsa.run(binding, **replay)
+    binding.raw_k_ring.copy_(raw_before)
+    binding.raw_logical_positions.copy_(tags_before)
+    binding.raw_rope_positions.copy_(rope_before)
+    binding.raw_interval_start_positions.copy_(anchor_before)
+    binding.compressed_k_cache[145, 0].copy_(compressed_before)
+    binding.output.zero_()
+    binding.selected_positions.fill_(-1)
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    expected = sparse_paged_gqa_reference(
+        replay["query"],
+        binding.main_k_cache,
+        binding.main_v_cache,
+        binding.main_block_table,
+        replay["request_ids"],
+        binding.selected_positions[:4],
+        replay["query_positions"],
+    )
+    assert torch.all(binding.state_errors[:4] == 0)
+    assert torch.all(binding.selected_positions[:4, 0] >= 0)
+    assert torch.count_nonzero(result) > 0
+    torch.testing.assert_close(result, expected, rtol=0.0, atol=2e-2)
+
+
 @pytest.mark.parametrize("accepted", [0, 4])
 def test_qsa_invalid_speculative_acceptance_fails_closed(accepted: int) -> None:
     device = require_sm120()
