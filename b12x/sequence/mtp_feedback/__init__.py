@@ -40,8 +40,9 @@ META = OpMeta(
     test_path="tests/sequence/test_mtp_feedback.py",
     since="1.3.0",
     notes=(
-        "Triton correctness reference for the one-layer MTP feedback "
-        "fusion at S=4, H=2560, BF16; not throughput-qualified."
+        "Qualified SM120 Qwen token counts use Triton normalization and "
+        "CuTeDSL projection GEMMs. Unqualified counts and layouts retain the "
+        "Triton projection implementation."
     ),
 )
 

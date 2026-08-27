@@ -14,6 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ._sparse_gqa_cute_config import is_candidate as _cute_is_candidate
+
 
 _LOG2_E = tl.constexpr(1.4426950408889634)
 
@@ -692,6 +694,48 @@ def launch_sparse_paged_gqa(
         block_n=block_n,
         splits=splits,
     )
+    if (
+        int(splits) > 1
+        and partial_output is not None
+        and partial_lse is not None
+        and _cute_is_candidate(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            request_ids=request_ids,
+            selected_positions=selected_positions,
+            query_positions=query_positions,
+            partial_output=partial_output,
+            partial_lse=partial_lse,
+            block_n=block_n,
+            splits=splits,
+        )
+    ):
+        from ._sparse_gqa_cute import (
+            launch_sparse_gqa_merge,
+            launch_sparse_gqa_split,
+        )
+
+        launch_sparse_gqa_split(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            request_ids=request_ids,
+            selected_positions=selected_positions,
+            query_positions=query_positions,
+            partial_output=partial_output,
+            partial_lse=partial_lse,
+            softmax_scale=softmax_scale,
+        )
+        launch_sparse_gqa_merge(
+            partial_output=partial_output,
+            partial_lse=partial_lse,
+            output=output,
+            rows=rows,
+        )
+        return output[:rows]
     if int(splits) == 1:
         torch.ops.b12x.qsa_sparse_paged_gqa_direct(
             query,

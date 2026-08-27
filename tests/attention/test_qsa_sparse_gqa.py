@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from b12x.attention.qsa._sparse_gqa import launch_sparse_paged_gqa
+from b12x.attention.qsa import _sparse_gqa_cute_config as cute_config
 
 from ..conftest import require_b12x as require_sm120
 
@@ -94,9 +95,133 @@ def _cache_layout(
                 device="cpu",
             ).to(device=device, dtype=torch.bfloat16)
             return storage[..., :head_dim]
+        if layout == "interleaved_page":
+            storage = torch.randn(
+                (pages, 3, page_size, kv_heads, head_dim),
+                generator=generator,
+                dtype=torch.float32,
+                device="cpu",
+            ).to(device=device, dtype=torch.bfloat16)
+            return storage[:, 1]
         raise AssertionError(f"unknown cache layout {layout}")
 
     return make(), make()
+
+
+class _CandidateTensor:
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        *,
+        strides: tuple[int, ...] | None = None,
+        contiguous: bool = True,
+    ) -> None:
+        self.shape = torch.Size(shape)
+        self.dtype = dtype
+        self.device = torch.device("cuda", 0)
+        self.is_cuda = True
+        self._contiguous = contiguous
+        if strides is None:
+            running = 1
+            reversed_strides = []
+            for extent in reversed(shape):
+                reversed_strides.append(running)
+                running *= extent
+            strides = tuple(reversed(reversed_strides))
+        self._strides = strides
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    def is_contiguous(self) -> bool:
+        return self._contiguous
+
+    def stride(self, dim: int | None = None) -> tuple[int, ...] | int:
+        if dim is None:
+            return self._strides
+        return self._strides[dim]
+
+
+@pytest.mark.parametrize(
+    ("rows", "q_heads", "kv_heads", "expected"),
+    [
+        (2, 6, 1, True),
+        (8, 6, 1, True),
+        (9, 6, 1, False),
+        (4, 12, 1, True),
+        (5, 12, 1, False),
+        (2, 24, 2, True),
+        (4, 24, 2, False),
+    ],
+)
+def test_cute_candidate_uses_qualified_rows_for_interleaved_blh_cache_views(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: int,
+    q_heads: int,
+    kv_heads: int,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(cute_config, "_is_sm120", lambda _device: True)
+    pages, layers = 128, 64
+    allocation = torch.empty(
+        (
+            pages,
+            layers,
+            2,
+            cute_config.PAGE_SIZE,
+            kv_heads * cute_config.HEAD_DIM,
+        ),
+        dtype=torch.bfloat16,
+        device="meta",
+    )
+    layer_cache = allocation[:, layers // 2]
+    key_view, value_view = (
+        side.unflatten(-1, (kv_heads, cute_config.HEAD_DIM))
+        for side in layer_cache.unbind(1)
+    )
+    assert not key_view.is_contiguous()
+    assert not value_view.is_contiguous()
+    query = _CandidateTensor((rows, q_heads, cute_config.HEAD_DIM), torch.bfloat16)
+    key_cache = _CandidateTensor(
+        (pages, cute_config.PAGE_SIZE, kv_heads, cute_config.HEAD_DIM),
+        torch.bfloat16,
+        strides=key_view.stride(),
+        contiguous=False,
+    )
+    value_cache = _CandidateTensor(
+        (pages, cute_config.PAGE_SIZE, kv_heads, cute_config.HEAD_DIM),
+        torch.bfloat16,
+        strides=value_view.stride(),
+        contiguous=False,
+    )
+
+    assert cute_config.is_candidate(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=_CandidateTensor((4, 128), torch.int32),
+        request_ids=_CandidateTensor((rows,), torch.int64),
+        selected_positions=_CandidateTensor(
+            (rows, cute_config.SELECTION_WIDTH), torch.int32
+        ),
+        query_positions=_CandidateTensor((rows,), torch.int64),
+        partial_output=_CandidateTensor(
+            (
+                rows,
+                cute_config.NUM_SPLITS,
+                q_heads,
+                cute_config.HEAD_DIM,
+            ),
+            torch.float32,
+        ),
+        partial_lse=_CandidateTensor(
+            (rows, cute_config.NUM_SPLITS, q_heads), torch.float32
+        ),
+        block_n=cute_config.BLOCK_N,
+        splits=cute_config.NUM_SPLITS,
+    ) is expected
 
 
 @pytest.mark.parametrize(
@@ -113,6 +238,7 @@ def _cache_layout(
     ),
     [
         (1, 24, 2, 256, 16, 2051, 16, 64, "contiguous"),
+        (1, 6, 1, 256, 16, 2051, 16, 64, "interleaved_page"),
         (3, 8, 2, 64, 4, 67, 16, 4, "page_transposed"),
         (2, 6, 3, 32, 8, 65, 64, 1, "padded_inner"),
     ],
@@ -347,7 +473,7 @@ def test_sparse_gqa_split_path_is_cuda_graph_replay_safe() -> None:
 def test_sparse_gqa_uses_int64_for_high_physical_page_offsets() -> None:
     device = require_sm120()
     rows, q_heads, kv_heads, head_dim = 1, 24, 2, 256
-    page_size = 4
+    page_size = 16
     page_stride_elements = page_size * kv_heads * head_dim
     tail_page = math.ceil((1 << 31) / page_stride_elements)
     num_pages = tail_page + 1

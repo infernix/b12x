@@ -87,10 +87,10 @@ META = OpMeta(
     test_path="tests/attention/test_qsa_contract.py",
     since="1.3.0",
     notes=(
-        "The implemented Triton decode path is a correctness reference and is "
-        "not throughput-qualified. It includes grouped selection, compressed-"
-        "cache maintenance, packed speculative persistence, and exact sparse "
-        "paged GQA. Main K/V cache writes are unsupported. Page- and state-slot-scaled "
+        "The qualified SM120 Qwen sparse-GQA layout uses CuTeDSL. Grouped "
+        "selection, compressed-cache maintenance, packed speculative "
+        "persistence, and unqualified sparse-GQA layouts retain Triton. Main "
+        "K/V cache writes are unsupported. Page- and state-slot-scaled "
         "addressing uses signed 64-bit arithmetic."
     ),
 )

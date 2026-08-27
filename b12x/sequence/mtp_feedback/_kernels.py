@@ -6,6 +6,13 @@ import torch
 import triton
 import triton.language as tl
 
+from ._cute_prefill import (
+    compile_mtp_prefill_bf16_gemm,
+    get_cached_mtp_prefill_bf16_gemm,
+    is_mtp_prefill_bf16_gemm_warmed,
+)
+from ._cute_prefill_config import supports_prefill, tensors_support_prefill
+
 
 @triton.jit
 def _token_norm_kernel(
@@ -190,6 +197,131 @@ def _scratch_view(
     return scratch.narrow(0, int(offset_bytes), nbytes).view(dtype).view(shape)
 
 
+def _padded_rows(rows: int) -> int:
+    return ((int(rows) + 15) // 16) * 16
+
+
+def _capacity_matrix(tensor: torch.Tensor, rows: int, columns: int) -> torch.Tensor:
+    flat = tensor.reshape(-1)
+    required = int(rows) * int(columns)
+    available = (
+        int(flat.untyped_storage().nbytes())
+        - int(flat.storage_offset()) * int(flat.element_size())
+    ) // int(flat.element_size())
+    if required > available:
+        raise ValueError(
+            f"padded CuTe view needs {required} elements, storage has {available}"
+        )
+    return flat.as_strided((int(rows), int(columns)), (int(columns), 1))
+
+
+def _has_capacity(tensor: torch.Tensor, rows: int, columns: int) -> bool:
+    required = int(rows) * int(columns)
+    available = (
+        int(tensor.untyped_storage().nbytes())
+        - int(tensor.storage_offset()) * int(tensor.element_size())
+    ) // int(tensor.element_size())
+    return required <= available
+
+
+def _qwen_cute_projections(
+    token_normalized: torch.Tensor,
+    state_normalized: torch.Tensor,
+    embedding_fc_weight: torch.Tensor,
+    hidden_fc_weight: torch.Tensor,
+    token_path: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    tokens: int,
+    streams: int,
+    hidden_size: int,
+) -> None:
+    token_rows = _padded_rows(tokens)
+    state_live_rows = tokens * streams
+    state_rows = _padded_rows(state_live_rows)
+    token_input = _capacity_matrix(token_normalized, token_rows, hidden_size)
+    token_output = _capacity_matrix(token_path, token_rows, hidden_size)
+    state_input = _capacity_matrix(state_normalized, state_rows, hidden_size)
+    state_output = _capacity_matrix(output, state_rows, hidden_size)
+
+    with torch.cuda.device(token_normalized.device):
+        token_projection = get_cached_mtp_prefill_bf16_gemm(
+            token_rows,
+            hidden_size,
+            hidden_size,
+            device=token_normalized.device,
+            streams=streams,
+            add_token_path=False,
+        )
+        state_projection = get_cached_mtp_prefill_bf16_gemm(
+            state_rows,
+            hidden_size,
+            hidden_size,
+            device=token_normalized.device,
+            streams=streams,
+            add_token_path=True,
+        )
+        if torch.cuda.is_current_stream_capturing():
+            token_warmed = token_projection is not None and (
+                is_mtp_prefill_bf16_gemm_warmed(
+                    token_rows,
+                    hidden_size,
+                    hidden_size,
+                    device=token_normalized.device,
+                    streams=streams,
+                    add_token_path=False,
+                )
+            )
+            state_warmed = state_projection is not None and (
+                is_mtp_prefill_bf16_gemm_warmed(
+                    state_rows,
+                    hidden_size,
+                    hidden_size,
+                    device=token_normalized.device,
+                    streams=streams,
+                    add_token_path=True,
+                )
+            )
+            if not token_warmed or not state_warmed:
+                raise RuntimeError(
+                    "MTP CuTe kernels must be warm-run before CUDA graph capture"
+                )
+        else:
+            if token_projection is None:
+                token_projection = compile_mtp_prefill_bf16_gemm(
+                    token_rows,
+                    hidden_size,
+                    hidden_size,
+                    device=token_normalized.device,
+                    streams=streams,
+                    add_token_path=False,
+                )
+            if state_projection is None:
+                state_projection = compile_mtp_prefill_bf16_gemm(
+                    state_rows,
+                    hidden_size,
+                    hidden_size,
+                    device=token_normalized.device,
+                    streams=streams,
+                    add_token_path=True,
+                )
+        assert token_projection is not None
+        assert state_projection is not None
+        token_projection(
+            token_input,
+            embedding_fc_weight,
+            token_output,
+            live_rows=tokens,
+        )
+        state_projection(
+            state_input,
+            hidden_fc_weight,
+            state_output,
+            token_path=token_output,
+            live_rows=state_live_rows,
+        )
+
+
 def _launch_mtp_feedback(
     token_embedding: torch.Tensor,
     multi_state: torch.Tensor,
@@ -241,6 +373,28 @@ def _launch_mtp_feedback(
         dtype=torch.bfloat16,
     )[:tokens]
 
+    padded_token_rows = _padded_rows(tokens)
+    padded_state_rows = _padded_rows(tokens * streams)
+    use_cute = (
+        supports_prefill(
+            tokens=tokens,
+            streams=streams,
+            hidden_size=hidden_size,
+            device=token_embedding.device,
+        )
+        and tensors_support_prefill(
+            token_normalized,
+            state_normalized,
+            embedding_fc_weight,
+            hidden_fc_weight,
+            token_path,
+            output,
+        )
+        and _has_capacity(token_normalized, padded_token_rows, hidden_size)
+        and _has_capacity(token_path, padded_token_rows, hidden_size)
+        and _has_capacity(state_normalized, padded_state_rows, hidden_size)
+        and _has_capacity(output, padded_state_rows, hidden_size)
+    )
     _token_norm_kernel[(tokens,)](
         token_embedding,
         token_norm_weight,
@@ -272,6 +426,20 @@ def _launch_mtp_feedback(
         num_warps=int(norm_num_warps),
         num_stages=1,
     )
+    if use_cute:
+        _qwen_cute_projections(
+            token_normalized,
+            state_normalized,
+            embedding_fc_weight,
+            hidden_fc_weight,
+            token_path,
+            output,
+            tokens=tokens,
+            streams=streams,
+            hidden_size=hidden_size,
+        )
+        return
+
     linear_grid = (
         triton.cdiv(tokens, matmul_block_m),
         triton.cdiv(hidden_size, matmul_block_n),
