@@ -76,10 +76,12 @@ META = OpMeta(
     notes=(
         "Qualified for 128-wide K/V heads, value/key ratios 1,2,3,4,8, "
         "BF16 model tensors, BF16 or FP32 norm weights, and BF16 or FP32 "
-        "recurrent state. Lower-bounded KDA is qualified for equal 128-wide "
+        "recurrent state. Production Qwen GDN and lower-bounded KDA use "
+        "Triton. Experimental CuTeDSL Qwen validation, recurrence, and gated "
+        "normalization stages are retained for direct qualification. "
+        "Lower-bounded KDA is qualified for equal 128-wide "
         "Q/K/V head counts, per-key decay gates, scalar update gates, and a "
-        "sigmoid output gate. The Triton implementation is a correctness "
-        "reference and is not throughput-qualified."
+        "sigmoid output gate."
     ),
 )
 

@@ -38,6 +38,23 @@ def test_speculative_cases_preserve_sequential_request_geometry() -> None:
     assert case.columns == 4
 
 
+def test_fixed_serving_capacity_is_independent_of_live_metadata() -> None:
+    by_name = {case.name: case for case in benchmark.QWEN38_GDN_CASES}
+    for name in ("tp2-decode-bs1", "tp2-decode-bs4", "tp2-spec4-bs1"):
+        assert benchmark.resolve_capacity(
+            by_name[name], capacity_seqs=32, capacity_columns=4
+        ) == (32, 4, 128)
+
+    with pytest.raises(ValueError, match="live sequences"):
+        benchmark.resolve_capacity(
+            by_name["tp2-decode-bs4"], capacity_seqs=3, capacity_columns=4
+        )
+    with pytest.raises(ValueError, match="live width"):
+        benchmark.resolve_capacity(
+            by_name["tp2-spec4-bs1"], capacity_seqs=32, capacity_columns=3
+        )
+
+
 def test_case_selection_is_ordered_and_rejects_unknown_names() -> None:
     selected = benchmark.select_cases("tp4-decode-bs4,tp2-decode-bs1")
     assert [case.name for case in selected] == [

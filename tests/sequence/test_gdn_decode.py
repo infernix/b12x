@@ -142,6 +142,78 @@ def _reference(binding: gdn.Binding, state: torch.Tensor) -> torch.Tensor:
     )
 
 
+def test_research_qwen_cute_stages_are_graph_safe_and_correct() -> None:
+    from b12x.sequence.gdn_decode._cute_kernels import (
+        run_gated_rmsnorm,
+        run_packed_recurrent_qwen,
+        run_qwen_validation,
+    )
+
+    device = require_sm120()
+    binding, _ = _make_case(
+        device=device,
+        query_lengths=(1, 1, 1, 1),
+        key_heads=8,
+        value_heads=24,
+        activation="sigmoid",
+        state_dtype=torch.float32,
+    )
+    initial_state = binding.recurrent_state.clone()
+    expected_state = initial_state.clone()
+    expected = _reference(binding, expected_state)
+
+    def launch() -> None:
+        run_qwen_validation(binding)
+        run_packed_recurrent_qwen(binding)
+        run_gated_rmsnorm(binding, eps=1.0e-6)
+
+    launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+
+    binding.recurrent_state.copy_(initial_state)
+    binding.output.fill_(float("nan"))
+    binding.scratch.fill_(0xFF)
+    addresses = (
+        binding.recurrent_state.data_ptr(),
+        binding.output.data_ptr(),
+        binding.scratch.data_ptr(),
+    )
+    allocated_before = torch.cuda.memory_allocated(device)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    allocated_after = torch.cuda.memory_allocated(device)
+
+    assert allocated_after == allocated_before
+    assert addresses == (
+        binding.recurrent_state.data_ptr(),
+        binding.output.data_ptr(),
+        binding.scratch.data_ptr(),
+    )
+    assert binding.error_code.item() == 0
+    torch.testing.assert_close(binding.output, expected, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(
+        binding.recurrent_state, expected_state, rtol=1e-5, atol=2e-5
+    )
+
+
+def test_research_qwen_cute_launcher_caches_are_device_scoped() -> None:
+    from b12x.sequence.gdn_decode._cute_kernels import (
+        _binding_key,
+        _norm_key,
+        _validation_key,
+    )
+
+    device = require_sm120()
+    binding, _ = _make_case(device=device)
+    expected_device = binding.output.device.index
+
+    assert _binding_key(binding)[0] == expected_device
+    assert _validation_key(binding)[0] == expected_device
+    assert _norm_key(binding, norm_fp32=False)[0] == expected_device
+
+
 def _transformers_kv_state_reference(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -979,6 +1051,132 @@ def test_padded_state_slot_offset_past_int32_element_boundary() -> None:
         compact_reference_state[0],
         rtol=1e-2,
         atol=8e-3,
+    )
+
+    del binding, recurrent_state, state_storage
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def test_cute_fp32_state_slot_offset_past_int32_element_boundary() -> None:
+    from b12x.sequence.gdn_decode._cute_kernels import (
+        run_gated_rmsnorm,
+        run_packed_recurrent_qwen,
+        run_qwen_validation,
+    )
+
+    device = require_sm120()
+    key_heads, value_heads = 1, 3
+    slot_elements = value_heads * 128 * 128
+    slot_stride = slot_elements + 2_048
+    tail_slot = (1 << 31) // slot_stride + 1
+    assert tail_slot * slot_stride > 1 << 31
+    caps = gdn.Caps(
+        device=device,
+        max_tokens=1,
+        max_seqs=1,
+        max_state_slots=tail_slot + 1,
+        key_heads=key_heads,
+        value_heads=value_heads,
+        state_dtype=torch.float32,
+        gate_activation="sigmoid",
+    )
+    mixed_qkv = _randn((1, caps.packed_qkv_width), device=device)
+    a = _randn((1, value_heads), device=device)
+    b = _randn((1, value_heads), device=device)
+    z = _randn((1, value_heads, 128), device=device)
+    A_log = _randn((value_heads,), device=device, dtype=torch.float32, scale=0.1)
+    dt_bias = _randn((value_heads,), device=device, dtype=torch.float32, scale=0.1)
+    norm_weight = (1.0 + _randn((128,), device=device, scale=0.05)).contiguous()
+    state_storage = torch.empty(
+        tail_slot * slot_stride + slot_elements,
+        dtype=torch.float32,
+        device=device,
+    )
+    recurrent_state = torch.as_strided(
+        state_storage,
+        size=(tail_slot + 1, value_heads, 128, 128),
+        stride=(slot_stride, 128 * 128, 128, 1),
+    )
+    recurrent_state[tail_slot].copy_(
+        _randn(
+            (value_heads, 128, 128),
+            device=device,
+            dtype=torch.float32,
+            scale=0.1,
+        )
+    )
+    initial_state = recurrent_state[tail_slot : tail_slot + 1].clone()
+    expected_state = initial_state.clone()
+    indices = torch.tensor([[tail_slot]], dtype=torch.int32, device=device)
+    compact_indices = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    accepted = torch.ones(1, dtype=torch.int32, device=device)
+    num_seqs = torch.ones(1, dtype=torch.int32, device=device)
+    num_tokens = torch.ones(1, dtype=torch.int32, device=device)
+    output = torch.empty((1, value_heads, 128), dtype=torch.bfloat16, device=device)
+    planned = gdn.plan(caps)
+    (scratch_spec,) = planned.scratch_specs()
+    scratch = torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=device)
+    binding = gdn.bind(
+        planned,
+        scratch=scratch,
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        z=z,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        norm_weight=norm_weight,
+        recurrent_state=recurrent_state,
+        query_start_loc=query_start_loc,
+        num_accepted_tokens=accepted,
+        state_indices=indices,
+        num_seqs=num_seqs,
+        num_tokens=num_tokens,
+        output=output,
+    )
+    expected = gdn.reference.decode(
+        mixed_qkv,
+        a,
+        b,
+        z,
+        A_log,
+        dt_bias,
+        norm_weight,
+        expected_state,
+        query_start_loc,
+        accepted,
+        compact_indices,
+        num_seqs,
+        num_tokens,
+        key_heads=key_heads,
+        value_heads=value_heads,
+        gate_activation="sigmoid",
+    )
+
+    def launch_cute() -> None:
+        run_qwen_validation(binding)
+        run_packed_recurrent_qwen(binding)
+        run_gated_rmsnorm(binding, eps=1.0e-6)
+
+    launch_cute()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch_cute()
+
+    recurrent_state[tail_slot].copy_(initial_state[0])
+    output.fill_(float("nan"))
+    allocated_before = torch.cuda.memory_allocated(device)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    allocated_after = torch.cuda.memory_allocated(device)
+
+    assert allocated_after == allocated_before
+    assert binding.error_code.item() == 0
+    torch.testing.assert_close(output, expected, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(
+        recurrent_state[tail_slot], expected_state[0], rtol=1e-5, atol=2e-5
     )
 
     del binding, recurrent_state, state_storage

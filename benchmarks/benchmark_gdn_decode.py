@@ -72,6 +72,27 @@ class CaseBuffers:
     initial_state: torch.Tensor
 
 
+def resolve_capacity(
+    case: BenchmarkCase,
+    *,
+    capacity_seqs: int | None,
+    capacity_columns: int | None,
+) -> tuple[int, int, int]:
+    max_seqs = case.sequences if capacity_seqs is None else int(capacity_seqs)
+    columns = case.columns if capacity_columns is None else int(capacity_columns)
+    if max_seqs < case.sequences:
+        raise ValueError(
+            f"capacity_seqs={max_seqs} is smaller than "
+            f"{case.sequences} live sequences"
+        )
+    if columns < case.columns:
+        raise ValueError(
+            f"capacity_columns={columns} is smaller than the live width "
+            f"{case.columns}"
+        )
+    return max_seqs, columns, max_seqs * columns
+
+
 @dataclass(frozen=True)
 class Correctness:
     output_max_abs: float
@@ -122,18 +143,24 @@ def build_case(
     *,
     device: torch.device,
     seed: int,
+    capacity_seqs: int | None = None,
+    capacity_columns: int | None = None,
 ) -> CaseBuffers:
     if case.value_heads != 3 * case.key_heads:
         raise ValueError(f"Qwen GDN requires value_heads=3*key_heads: {case}")
     generator = torch.Generator(device="cpu").manual_seed(seed)
-    tokens = case.tokens
-    sequences = case.sequences
-    columns = case.columns
-    state_slots = sequences * columns + 1
+    live_tokens = case.tokens
+    live_seqs = case.sequences
+    max_seqs, columns, max_tokens = resolve_capacity(
+        case,
+        capacity_seqs=capacity_seqs,
+        capacity_columns=capacity_columns,
+    )
+    state_slots = max_tokens + 1
     caps = gdn.Caps(
         device=device,
-        max_tokens=tokens,
-        max_seqs=sequences,
+        max_tokens=max_tokens,
+        max_seqs=max_seqs,
         max_state_slots=state_slots,
         key_heads=case.key_heads,
         value_heads=case.value_heads,
@@ -144,27 +171,33 @@ def build_case(
     )
     planned = gdn.plan(caps)
     (scratch_spec,) = planned.scratch_specs()
-    query_start_loc = torch.tensor(
-        (0, *torch.tensor(case.query_lengths).cumsum(0).tolist()),
-        dtype=torch.int32,
-        device=device,
+    query_start_loc = torch.full(
+        (max_seqs + 1,), live_tokens, dtype=torch.int32, device=device
+    )
+    query_start_loc[0] = 0
+    query_start_loc[1 : live_seqs + 1].copy_(
+        torch.tensor(case.query_lengths, dtype=torch.int32, device=device).cumsum(0)
     )
     state_indices = torch.arange(
-        sequences * columns, dtype=torch.int32, device=device
-    ).view(sequences, columns)
+        max_seqs * columns, dtype=torch.int32, device=device
+    ).view(max_seqs, columns)
     tensors = {
         "scratch": torch.empty(
             scratch_spec.shape, dtype=scratch_spec.dtype, device=device
         ),
         "mixed_qkv": _randn(
-            (tokens, caps.packed_qkv_width),
+            (max_tokens, caps.packed_qkv_width),
             device=device,
             generator=generator,
         ),
-        "a": _randn((tokens, case.value_heads), device=device, generator=generator),
-        "b": _randn((tokens, case.value_heads), device=device, generator=generator),
+        "a": _randn(
+            (max_tokens, case.value_heads), device=device, generator=generator
+        ),
+        "b": _randn(
+            (max_tokens, case.value_heads), device=device, generator=generator
+        ),
         "z": _randn(
-            (tokens, case.value_heads, 128), device=device, generator=generator
+            (max_tokens, case.value_heads, 128), device=device, generator=generator
         ),
         "A_log": _randn(
             (case.value_heads,),
@@ -197,12 +230,14 @@ def build_case(
             scale=0.1,
         ),
         "query_start_loc": query_start_loc,
-        "num_accepted_tokens": torch.ones(sequences, dtype=torch.int32, device=device),
+        "num_accepted_tokens": torch.ones(
+            max_seqs, dtype=torch.int32, device=device
+        ),
         "state_indices": state_indices,
-        "num_seqs": torch.tensor([sequences], dtype=torch.int32, device=device),
-        "num_tokens": torch.tensor([tokens], dtype=torch.int32, device=device),
+        "num_seqs": torch.tensor([live_seqs], dtype=torch.int32, device=device),
+        "num_tokens": torch.tensor([live_tokens], dtype=torch.int32, device=device),
         "output": torch.empty(
-            (tokens, case.value_heads, 128),
+            (max_tokens, case.value_heads, 128),
             dtype=torch.bfloat16,
             device=device,
         ),
@@ -396,8 +431,16 @@ def benchmark_case(
     iterations: int,
     mode: str,
     l2_flush,
+    capacity_seqs: int | None = None,
+    capacity_columns: int | None = None,
 ) -> CaseReport:
-    buffers = build_case(case, device=device, seed=seed)
+    buffers = build_case(
+        case,
+        device=device,
+        seed=seed,
+        capacity_seqs=capacity_seqs,
+        capacity_columns=capacity_columns,
+    )
     correctness = check_correctness(buffers)
     eager = (
         _bench_eager(buffers, warmup=warmup, iterations=iterations, l2_flush=l2_flush)
@@ -514,10 +557,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--l2-flush", action="store_true")
     parser.add_argument("--l2-flush-bytes", type=int, default=0)
+    parser.add_argument(
+        "--capacity-seqs",
+        type=int,
+        help="fixed serving max_num_seqs; defaults to each case's live batch",
+    )
+    parser.add_argument(
+        "--capacity-columns",
+        type=int,
+        help="fixed state-index columns; defaults to each case's live width",
+    )
     parser.add_argument("--json", type=pathlib.Path)
     args = parser.parse_args(argv)
     if args.warmup < 1 or args.iterations < 1:
         parser.error("--warmup and --iterations must be positive")
+    if args.capacity_seqs is not None and args.capacity_seqs < 1:
+        parser.error("--capacity-seqs must be positive")
+    if args.capacity_columns is not None and not 1 <= args.capacity_columns <= 8:
+        parser.error("--capacity-columns must be in [1, 8]")
     if args.json is not None:
         args.json = args.json.expanduser().resolve()
         if args.json.exists():
@@ -550,6 +607,15 @@ def main(argv: list[str] | None = None) -> int:
         "warmup": args.warmup,
         "iterations": args.iterations,
         "l2_flush": bool(args.l2_flush),
+        "fixed_capacity": {
+            "max_seqs": args.capacity_seqs,
+            "state_index_columns": args.capacity_columns,
+            "max_tokens": (
+                None
+                if args.capacity_seqs is None or args.capacity_columns is None
+                else args.capacity_seqs * args.capacity_columns
+            ),
+        },
     }
     print(json.dumps(_jsonable(provenance), sort_keys=True))
     reports: list[CaseReport] = []
@@ -562,6 +628,8 @@ def main(argv: list[str] | None = None) -> int:
             iterations=args.iterations,
             mode=args.mode,
             l2_flush=l2_flush,
+            capacity_seqs=args.capacity_seqs,
+            capacity_columns=args.capacity_columns,
         )
         reports.append(report)
         print(

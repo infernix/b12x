@@ -46,8 +46,9 @@ META = OpMeta(
     test_path="tests/norm/test_hyperconnection.py",
     since="1.3.0",
     notes=(
-        "Triton correctness reference for S=4, H=2560, R=320, BF16; not "
-        "throughput-qualified."
+        "Triton production kernels for the Qwen3.8 Flash Next S=4, H=2560, "
+        "R=320 BF16 contract. Research-only CuTeDSL kernels are available in "
+        "the private _cute module; they do not match Triton throughput."
     ),
 )
 

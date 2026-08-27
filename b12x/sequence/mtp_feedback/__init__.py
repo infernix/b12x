@@ -41,8 +41,9 @@ META = OpMeta(
     since="1.3.0",
     notes=(
         "Qualified SM120 Qwen token counts use Triton normalization and "
-        "CuTeDSL projection GEMMs. Unqualified counts and layouts retain the "
-        "Triton projection implementation."
+        "CuTeDSL projection GEMMs. Research-only CuTeDSL normalization stages "
+        "are retained for direct qualification. Unqualified counts and layouts "
+        "retain the Triton projection implementation."
     ),
 )
 

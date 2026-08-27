@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from b12x.sequence import mtp_feedback as mtp
+from b12x.sequence.mtp_feedback import _cute_norm
 
 from ..conftest import require_b12x as require_sm120
 
@@ -364,6 +365,139 @@ def test_target_geometry_cuda_graph_replay_uses_bound_storage() -> None:
     assert binding.scratch.data_ptr() == scratch_address
     assert allocated_after_replay == allocated_before_replay
     torch.testing.assert_close(captured, expected, rtol=2e-2, atol=4e-2)
+
+
+@pytest.mark.filterwarnings("ignore:The CUDA Graph is empty.*:UserWarning")
+def test_standalone_cute_norm_rejects_cold_cuda_graph_capture() -> None:
+    device = require_sm120()
+    hidden_size = 2560
+    source = _randn((1, hidden_size), device=device, scale=0.4)
+    weight = _randn((hidden_size,), device=device, scale=0.05)
+    output = torch.empty_like(source)
+    _cute_norm.clear_caches()
+
+    graph = torch.cuda.CUDAGraph()
+    with pytest.raises(RuntimeError, match="compiled and warm-run"):
+        with torch.cuda.graph(graph):
+            _cute_norm.token_norm(
+                source,
+                weight,
+                output,
+                eps=1.0e-6,
+                hidden_size=hidden_size,
+            )
+
+
+def test_standalone_cute_norm_uses_source_device_when_non_current() -> None:
+    if torch.cuda.device_count() < 2:
+        pytest.skip("two visible SM120 GPUs are required")
+    original_device = torch.cuda.current_device()
+    target_index = next(
+        index for index in range(torch.cuda.device_count()) if index != original_device
+    )
+    target = torch.device("cuda", target_index)
+    if torch.cuda.get_device_capability(target) not in ((12, 0), (12, 1)):
+        pytest.skip("the non-current visible GPU must be SM120 or SM121")
+
+    tokens, streams, hidden_size = 2, 4, 2560
+    token_source = _randn((tokens, hidden_size), device=target, scale=0.4)
+    state_source = _randn(
+        (tokens, streams, hidden_size), device=target, scale=0.4
+    )
+    token_weight = _randn((hidden_size,), device=target, scale=0.05)
+    state_weight = _randn((streams * hidden_size,), device=target, scale=0.05)
+    token_output = torch.empty_like(token_source)
+    state_output = torch.empty_like(state_source)
+    _cute_norm.clear_caches()
+
+    _cute_norm.token_norm(
+        token_source,
+        token_weight,
+        token_output,
+        eps=1.0e-6,
+        hidden_size=hidden_size,
+    )
+    _cute_norm.state_norm(
+        state_source,
+        state_weight,
+        state_output,
+        eps=1.0e-6,
+        streams=streams,
+        hidden_size=hidden_size,
+    )
+    torch.cuda.synchronize(target)
+
+    assert torch.cuda.current_device() == original_device
+    expected_token = mtp.reference.gemma_rmsnorm(token_source, token_weight)
+    expected_state = mtp.reference.gemma_rmsnorm(
+        state_source.flatten(-2), state_weight
+    ).view_as(state_source)
+    torch.testing.assert_close(token_output, expected_token, rtol=2e-2, atol=4e-2)
+    torch.testing.assert_close(state_output, expected_state, rtol=2e-2, atol=4e-2)
+
+
+def test_standalone_cute_norm_correctness_and_graph_stability() -> None:
+    device = require_sm120()
+    tokens, streams, hidden_size = 4, 4, 2560
+    token_source = _randn((tokens, hidden_size), device=device, scale=0.4)
+    state_source = _randn(
+        (tokens, streams, hidden_size), device=device, scale=0.4
+    )
+    token_weight = _randn((hidden_size,), device=device, scale=0.05)
+    state_weight = _randn((streams * hidden_size,), device=device, scale=0.05)
+    token_output = torch.empty_like(token_source)
+    state_output = torch.empty_like(state_source)
+
+    def launch() -> None:
+        _cute_norm.token_norm(
+            token_source,
+            token_weight,
+            token_output,
+            eps=1.0e-6,
+            hidden_size=hidden_size,
+        )
+        _cute_norm.state_norm(
+            state_source,
+            state_weight,
+            state_output,
+            eps=1.0e-6,
+            streams=streams,
+            hidden_size=hidden_size,
+        )
+
+    launch()
+    torch.cuda.synchronize(device)
+    expected_token = mtp.reference.gemma_rmsnorm(token_source, token_weight)
+    expected_state = mtp.reference.gemma_rmsnorm(
+        state_source.flatten(-2), state_weight
+    ).view_as(state_source)
+    torch.testing.assert_close(token_output, expected_token, rtol=2e-2, atol=4e-2)
+    torch.testing.assert_close(state_output, expected_state, rtol=2e-2, atol=4e-2)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    token_address = token_output.data_ptr()
+    state_address = state_output.data_ptr()
+
+    token_source.copy_(torch.randn_like(token_source).mul_(0.3))
+    state_source.copy_(torch.randn_like(state_source).mul_(0.3))
+    token_output.fill_(float("nan"))
+    state_output.fill_(float("nan"))
+    expected_token = mtp.reference.gemma_rmsnorm(token_source, token_weight)
+    expected_state = mtp.reference.gemma_rmsnorm(
+        state_source.flatten(-2), state_weight
+    ).view_as(state_source)
+    allocated_before = torch.cuda.memory_allocated(device)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    allocated_after = torch.cuda.memory_allocated(device)
+
+    assert token_output.data_ptr() == token_address
+    assert state_output.data_ptr() == state_address
+    assert allocated_after == allocated_before
+    torch.testing.assert_close(token_output, expected_token, rtol=2e-2, atol=4e-2)
+    torch.testing.assert_close(state_output, expected_state, rtol=2e-2, atol=4e-2)
 
 
 def test_torch_compile_fullgraph_keeps_feedback_op_opaque() -> None:
