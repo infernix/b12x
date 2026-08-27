@@ -1,8 +1,8 @@
 """CuTeDSL launches for Qwen GDN decode stages.
 
-The fixed-capacity Qwen3.8 TP2 public transaction uses the CuTe recurrent
-stage. CuTe validation and gated RMSNorm variants remain available for direct
-qualification while the corresponding minor public stages use Triton.
+The public Qwen transaction uses the CuTe recurrent stage. CuTe validation and
+gated RMSNorm variants remain available for direct testing while the
+corresponding minor public stages use Triton.
 """
 
 from __future__ import annotations

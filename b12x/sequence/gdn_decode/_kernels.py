@@ -8,12 +8,6 @@ import triton.language as tl
 
 
 _VALIDATION_BLOCK = 256
-_QWEN38_CUTE_MAX_TOKENS = 16
-_QWEN38_CUTE_MAX_SEQS = 4
-_QWEN38_CUTE_STATE_INDEX_COLUMNS = 4
-_QWEN38_CUTE_KEY_HEADS = 8
-_QWEN38_CUTE_VALUE_HEADS = 24
-_QWEN38_CUTE_HEAD_DIM = 128
 
 
 @triton.jit
@@ -388,54 +382,6 @@ def _gated_rmsnorm_kernel(
     tl.store(output + output_offsets, weighted * gate, mask=mask)
 
 
-def _is_qualified_qwen38_cute_recurrence(
-    mixed_qkv: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    recurrent_state: torch.Tensor,
-    state_indices: torch.Tensor,
-    output: torch.Tensor,
-    *,
-    max_tokens: int,
-    max_seqs: int,
-    state_index_columns: int,
-    key_heads: int,
-    value_heads: int,
-    key_head_dim: int,
-    value_head_dim: int,
-    sigmoid_gate: bool,
-    qk_l2norm: bool,
-    lower_bounded_kda: bool,
-    has_null_state_index: bool,
-    compute_capability: tuple[int, int] | None = None,
-) -> bool:
-    """Return whether this binding is the qualified Qwen3.8 TP2 contract."""
-    del compute_capability
-    return (
-        int(max_tokens) == _QWEN38_CUTE_MAX_TOKENS
-        and int(max_seqs) == _QWEN38_CUTE_MAX_SEQS
-        and int(state_index_columns) == _QWEN38_CUTE_STATE_INDEX_COLUMNS
-        and int(key_heads) == _QWEN38_CUTE_KEY_HEADS
-        and int(value_heads) == _QWEN38_CUTE_VALUE_HEADS
-        and int(key_head_dim) == _QWEN38_CUTE_HEAD_DIM
-        and int(value_head_dim) == _QWEN38_CUTE_HEAD_DIM
-        and bool(sigmoid_gate)
-        and bool(qk_l2norm)
-        and not bool(lower_bounded_kda)
-        and not bool(has_null_state_index)
-        and mixed_qkv.dtype == torch.bfloat16
-        and a.dtype == torch.bfloat16
-        and b.dtype == torch.bfloat16
-        and A_log.dtype == torch.float32
-        and dt_bias.dtype in (torch.bfloat16, torch.float32)
-        and recurrent_state.dtype in (torch.bfloat16, torch.float32)
-        and state_indices.dtype == torch.int32
-        and output.dtype == torch.bfloat16
-    )
-
-
 def _make_qwen_binding(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -464,6 +410,7 @@ def _make_qwen_binding(
     value_head_dim: int,
     sigmoid_gate: bool,
     qk_l2norm: bool,
+    null_state_index: int | None,
     duplicate_table_size: int,
 ):
     from ._impl import Binding, Caps, plan
@@ -482,6 +429,7 @@ def _make_qwen_binding(
         state_dtype=recurrent_state.dtype,
         gate_activation="sigmoid" if sigmoid_gate else "silu",
         qk_l2norm=qk_l2norm,
+        null_state_index=null_state_index,
     )
     launch_plan = plan(caps)
     if launch_plan.duplicate_table_size != duplicate_table_size:
@@ -546,41 +494,16 @@ def _launch_gdn_decode(
     recurrent_num_warps: int,
     norm_num_warps: int,
 ) -> None:
-    qualified_qwen38_cute = _is_qualified_qwen38_cute_recurrence(
-        mixed_qkv,
-        a,
-        b,
-        A_log,
-        dt_bias,
-        recurrent_state,
-        state_indices,
-        output,
-        max_tokens=max_tokens,
-        max_seqs=max_seqs,
-        state_index_columns=state_index_columns,
-        key_heads=key_heads,
-        value_heads=value_heads,
-        key_head_dim=key_head_dim,
-        value_head_dim=value_head_dim,
-        sigmoid_gate=sigmoid_gate,
-        qk_l2norm=qk_l2norm,
-        lower_bounded_kda=lower_bounded_kda,
-        has_null_state_index=has_null_state_index,
-    )
     if lower_bounded_kda:
         if key_heads != value_heads or not sigmoid_gate:
             raise RuntimeError(
                 "GLM/KDA decode requires equal Q/K/V head counts and a "
                 "sigmoid output gate"
             )
-    elif not qualified_qwen38_cute:
+    elif value_heads != 3 * key_heads:
         raise RuntimeError(
-            "Qwen3.8 GDN decode requires the qualified CuTe TP2 "
-            "contract: max_tokens=16, max_seqs=4, state_index_columns=4, "
-            "key_heads=8, value_heads=24, 128-wide heads, BF16 model tensors, "
-            "FP32 A_log, BF16 or FP32 dt_bias and recurrent state, int32 state "
-            "indices, sigmoid output gate, "
-            "Q/K L2 normalization, and no null state index"
+            "Qwen GDN decode requires three value heads per key head, got "
+            f"key_heads={key_heads}, value_heads={value_heads}"
         )
 
     _reset_validation_kernel[(triton.cdiv(duplicate_table_size, _VALIDATION_BLOCK),)](
@@ -621,7 +544,7 @@ def _launch_gdn_decode(
         num_warps=1,
         num_stages=1,
     )
-    if qualified_qwen38_cute:
+    if not lower_bounded_kda:
         binding = _make_qwen_binding(
             mixed_qkv,
             a,
@@ -649,6 +572,9 @@ def _launch_gdn_decode(
             value_head_dim=value_head_dim,
             sigmoid_gate=sigmoid_gate,
             qk_l2norm=qk_l2norm,
+            null_state_index=(
+                null_state_index if has_null_state_index else None
+            ),
             duplicate_table_size=duplicate_table_size,
         )
         from ._cute_kernels import run_packed_recurrent_qwen

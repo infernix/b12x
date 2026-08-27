@@ -232,73 +232,6 @@ def test_research_qwen_cute_launcher_caches_are_device_scoped() -> None:
     assert _norm_key(binding, norm_fp32=False)[0] == expected_device
 
 
-def test_qwen38_cute_recurrence_classification_is_exact() -> None:
-    from b12x.sequence.gdn_decode._kernels import (
-        _is_qualified_qwen38_cute_recurrence,
-    )
-
-    bf16 = torch.empty(1, dtype=torch.bfloat16)
-    fp32 = torch.empty(1, dtype=torch.float32)
-    int32 = torch.empty(1, dtype=torch.int32)
-    tensors = {
-        "mixed_qkv": bf16,
-        "a": bf16,
-        "b": bf16,
-        "A_log": fp32,
-        "dt_bias": fp32,
-        "recurrent_state": fp32,
-        "state_indices": int32,
-        "output": bf16,
-    }
-    geometry = {
-        "max_tokens": 16,
-        "max_seqs": 4,
-        "state_index_columns": 4,
-        "key_heads": 8,
-        "value_heads": 24,
-        "key_head_dim": 128,
-        "value_head_dim": 128,
-        "sigmoid_gate": True,
-        "qk_l2norm": True,
-        "lower_bounded_kda": False,
-        "has_null_state_index": False,
-        "compute_capability": (12, 0),
-    }
-
-    assert _is_qualified_qwen38_cute_recurrence(**tensors, **geometry)
-    assert _is_qualified_qwen38_cute_recurrence(
-        **tensors, **(geometry | {"compute_capability": (12, 1)})
-    )
-
-    for name, value in (
-        ("max_tokens", 128),
-        ("max_seqs", 32),
-        ("state_index_columns", 1),
-        ("key_heads", 16),
-        ("value_heads", 48),
-        ("lower_bounded_kda", True),
-        ("has_null_state_index", True),
-    ):
-        incompatible = geometry | {name: value}
-        assert not _is_qualified_qwen38_cute_recurrence(
-            **tensors, **incompatible
-        )
-
-    assert _is_qualified_qwen38_cute_recurrence(
-        **(tensors | {"recurrent_state": bf16}), **geometry
-    )
-    assert _is_qualified_qwen38_cute_recurrence(
-        **(tensors | {"dt_bias": bf16}), **geometry
-    )
-    assert not _is_qualified_qwen38_cute_recurrence(
-        **(tensors | {"A_log": bf16}), **geometry
-    )
-    assert not _is_qualified_qwen38_cute_recurrence(
-        **(tensors | {"recurrent_state": torch.empty(1, dtype=torch.float16)}),
-        **geometry,
-    )
-
-
 @pytest.mark.parametrize(
     "query_lengths",
     (
@@ -310,7 +243,7 @@ def test_qwen38_cute_recurrence_classification_is_exact() -> None:
         (4, 4, 4, 4),
     ),
 )
-def test_public_qwen38_tp2_capacity_uses_correct_recurrence(
+def test_public_qwen38_planned_capacity_uses_correct_recurrence(
     query_lengths: tuple[int, ...],
 ) -> None:
     device = require_sm120()
@@ -340,7 +273,40 @@ def test_public_qwen38_tp2_capacity_uses_correct_recurrence(
     )
 
 
-def test_public_qwen38_tp2_capacity_is_graph_safe_without_replay_allocation() -> None:
+@pytest.mark.parametrize(
+    "key_heads,value_heads",
+    (
+        pytest.param(16, 48, id="16qk-48v"),
+        pytest.param(8, 24, id="8qk-24v"),
+        pytest.param(4, 12, id="4qk-12v"),
+    ),
+)
+def test_public_qwen38_sharded_head_geometries_use_cute_recurrence(
+    key_heads: int,
+    value_heads: int,
+) -> None:
+    device = require_sm120()
+    binding, _ = _make_case(
+        device=device,
+        query_lengths=(4, 2, 1, 3),
+        key_heads=key_heads,
+        value_heads=value_heads,
+    )
+    initial_state = binding.recurrent_state.clone()
+    expected_state = initial_state.clone()
+    expected = _reference(binding, expected_state)
+
+    actual = gdn.run(binding)
+    torch.cuda.synchronize(device)
+
+    assert binding.error_code.item() == 0
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(
+        binding.recurrent_state, expected_state, rtol=1e-5, atol=2e-5
+    )
+
+
+def test_public_qwen38_cute_path_is_graph_safe_without_replay_allocation() -> None:
     device = require_sm120()
     binding, _ = _make_case(
         device=device,
@@ -349,8 +315,8 @@ def test_public_qwen38_tp2_capacity_is_graph_safe_without_replay_allocation() ->
         max_seqs=4,
         columns=4,
         state_slots=17,
-        key_heads=8,
-        value_heads=24,
+        key_heads=16,
+        value_heads=48,
         activation="sigmoid",
         state_dtype=torch.float32,
     )
@@ -389,7 +355,7 @@ def test_public_qwen38_tp2_capacity_is_graph_safe_without_replay_allocation() ->
     )
 
 
-def test_public_qwen38_tp2_capacity_surfaces_cute_launch_failure(
+def test_public_qwen38_surfaces_cute_launch_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from b12x.sequence.gdn_decode import _cute_kernels
@@ -402,8 +368,8 @@ def test_public_qwen38_tp2_capacity_surfaces_cute_launch_failure(
         max_seqs=4,
         columns=4,
         state_slots=17,
-        key_heads=8,
-        value_heads=24,
+        key_heads=16,
+        value_heads=48,
         activation="sigmoid",
         state_dtype=torch.float32,
     )
@@ -579,39 +545,25 @@ def test_qwen3_8_flash_next_output_norm_preserves_parameter_dtype_rounding(
     )
 
 
-@pytest.mark.parametrize(
-    "key_heads,value_heads,activation,state_dtype",
-    (
-        (1, 1, "sigmoid", torch.float32),
-        (8, 24, "silu", torch.float32),
-    ),
-)
-def test_unqualified_qwen_layouts_fail_instead_of_using_triton(
-    key_heads: int,
-    value_heads: int,
-    activation: str,
-    state_dtype: torch.dtype,
-) -> None:
+def test_qwen_rejects_non_three_to_one_head_ratio_without_using_triton() -> None:
     device = require_sm120()
     binding, _ = _make_case(
         device=device,
         query_lengths=(1,),
-        key_heads=key_heads,
-        value_heads=value_heads,
-        activation=activation,
-        state_dtype=state_dtype,
+        key_heads=1,
+        value_heads=1,
     )
     state_before = binding.recurrent_state.clone()
     output_before = binding.output.clone()
 
-    with pytest.raises(RuntimeError, match="qualified CuTe TP2 contract"):
+    with pytest.raises(RuntimeError, match="three value heads per key head"):
         gdn.run(binding)
 
     torch.testing.assert_close(binding.recurrent_state, state_before, rtol=0, atol=0)
     torch.testing.assert_close(binding.output, output_before, rtol=0, atol=0)
 
 
-def test_qwen_bf16_state_uses_qualified_cute_recurrence() -> None:
+def test_qwen_bf16_state_uses_cute_recurrence() -> None:
     device = require_sm120()
     binding, _ = _make_case(
         device=device,
@@ -770,7 +722,7 @@ def test_rejected_draft_restarts_next_iteration_from_accepted_checkpoint() -> No
     )
 
 
-def test_qwen3_8_flash_next_qualified_capacity_shapes() -> None:
+def test_qwen3_8_flash_next_planned_capacity_shapes() -> None:
     device = require_sm120()
     binding, _ = _make_case(
         device=device,
@@ -1057,7 +1009,7 @@ def test_torch_compile_fullgraph_keeps_outer_op_opaque() -> None:
     )
 
 
-def test_qualified_qwen_grouped_state_slot_offset_past_int32_boundary() -> None:
+def test_qwen_grouped_state_slot_offset_past_int32_boundary() -> None:
     device = require_sm120()
     key_heads, value_heads = 8, 24
     slot_elements = value_heads * 128 * 128

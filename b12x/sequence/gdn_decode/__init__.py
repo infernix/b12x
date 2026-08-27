@@ -74,14 +74,12 @@ META = OpMeta(
     test_path="tests/sequence/test_gdn_decode.py",
     since="1.3.0",
     notes=(
-        "Qwen3.8 Flash Next GDN is qualified only for the TP2 capacity "
-        "max_tokens=16,max_seqs=4,state_index_columns=4 with 8 Q/K heads, 24 "
-        "value heads, BF16 or FP32 recurrent state, and int32 state indices. "
-        "Its "
-        "recurrence is mandatory CuTeDSL; Triton is used only for metadata "
-        "validation and gated RMSNorm auxiliaries. Other Qwen contracts are "
-        "unsupported. The separately named GLM/KDA API retains its dedicated "
-        "Triton recurrence for equal 128-wide Q/K/V head counts."
+        "Qwen3.8 Flash Next uses the CuTeDSL recurrence for any planned "
+        "capacity with three value heads per Q/K head. BF16 and FP32 recurrent "
+        "state and int32 or int64 state indices are supported. Triton is used "
+        "only for metadata validation and gated RMSNorm auxiliaries. The "
+        "separately named GLM/KDA API retains its dedicated Triton recurrence "
+        "for equal 128-wide Q/K/V head counts."
     ),
 )
 

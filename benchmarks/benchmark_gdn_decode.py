@@ -3,8 +3,8 @@
 
 The benchmark restores the recurrent state before every measured invocation.
 State restoration is reported separately from CUDA-graph replay latency and is
-never included in the kernel result.  The GLM/Kimi KDA API is intentionally
-outside this corpus.
+never included in the kernel result. The GLM/Kimi KDA API is intentionally
+outside this benchmark.
 """
 
 from __future__ import annotations
@@ -55,12 +55,15 @@ class BenchmarkCase:
 
 
 QWEN38_GDN_CASES = (
-    BenchmarkCase("tp2-decode-bs1", (1,), 8, 24),
-    BenchmarkCase("tp2-decode-bs4", (1, 1, 1, 1), 8, 24),
-    BenchmarkCase("tp2-spec2-bs4", (2, 2, 2, 2), 8, 24),
-    BenchmarkCase("tp2-spec4-bs1", (4,), 8, 24),
-    BenchmarkCase("tp2-spec4-uneven", (4, 2, 1, 3), 8, 24),
-    BenchmarkCase("tp2-spec4-bs4", (4, 4, 4, 4), 8, 24),
+    BenchmarkCase("qk16-v48-decode-bs1", (1,), 16, 48),
+    BenchmarkCase("qk8-v24-decode-bs1", (1,), 8, 24),
+    BenchmarkCase("qk8-v24-decode-bs4", (1, 1, 1, 1), 8, 24),
+    BenchmarkCase("qk8-v24-spec2-bs4", (2, 2, 2, 2), 8, 24),
+    BenchmarkCase("qk8-v24-spec4-bs1", (4,), 8, 24),
+    BenchmarkCase("qk8-v24-spec4-uneven", (4, 2, 1, 3), 8, 24),
+    BenchmarkCase("qk8-v24-spec4-bs4", (4, 4, 4, 4), 8, 24),
+    BenchmarkCase("qk4-v12-decode-bs1", (1,), 4, 12),
+    BenchmarkCase("qk2-v6-decode-bs1", (1,), 2, 6),
 )
 
 
@@ -76,16 +79,16 @@ def resolve_capacity(
     capacity_seqs: int | None,
     capacity_columns: int | None,
 ) -> tuple[int, int, int]:
-    max_seqs = 4 if capacity_seqs is None else int(capacity_seqs)
-    columns = 4 if capacity_columns is None else int(capacity_columns)
-    if (max_seqs, columns) != (4, 4):
+    max_seqs = max(4, case.sequences) if capacity_seqs is None else int(capacity_seqs)
+    columns = max(4, case.columns) if capacity_columns is None else int(capacity_columns)
+    if (
+        case.sequences > max_seqs
+        or case.columns > columns
+        or case.tokens > max_seqs * columns
+    ):
         raise ValueError(
-            "Qwen3.8 GDN benchmark requires the qualified fixed capacity "
-            f"capacity_seqs=4,capacity_columns=4; got {max_seqs}/{columns}"
-        )
-    if case.sequences > max_seqs or case.columns > columns or case.tokens > 16:
-        raise ValueError(
-            f"case {case.name} exceeds the qualified 4x4 serving capacity"
+            f"case {case.name} exceeds planned capacity "
+            f"capacity_seqs={max_seqs},capacity_columns={columns}"
         )
     return max_seqs, columns, max_seqs * columns
 
@@ -557,12 +560,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--capacity-seqs",
         type=int,
-        help="qualified fixed serving max_num_seqs; only 4 is accepted",
+        help="planned max_num_seqs; defaults to at least 4",
     )
     parser.add_argument(
         "--capacity-columns",
         type=int,
-        help="qualified fixed state-index columns; only 4 is accepted",
+        help="planned state-index columns; defaults to at least 4",
     )
     parser.add_argument("--json", type=pathlib.Path)
     args = parser.parse_args(argv)
@@ -608,10 +611,11 @@ def main(argv: list[str] | None = None) -> int:
         "warmup": args.warmup,
         "iterations": args.iterations,
         "l2_flush": bool(args.l2_flush),
-        "fixed_capacity": {
-            "max_seqs": 4,
-            "state_index_columns": 4,
-            "max_tokens": 16,
+        "capacity_policy": {
+            "requested_max_seqs": args.capacity_seqs,
+            "requested_state_index_columns": args.capacity_columns,
+            "default_minimum_max_seqs": 4,
+            "default_minimum_state_index_columns": 4,
         },
     }
     print(json.dumps(_jsonable(provenance), sort_keys=True))
