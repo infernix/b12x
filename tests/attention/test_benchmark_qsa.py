@@ -76,6 +76,30 @@ def test_cli_filters_tp_profiles_rows_and_full_context() -> None:
     }
 
 
+def test_cli_builds_actual_packed_qwen_prefill_geometry() -> None:
+    args = benchmark_qsa._parse_args(
+        [
+            "--profiles",
+            "tp2",
+            "--rows",
+            "1",
+            "--prefill-rows",
+            "3008",
+            "--contexts",
+            "2048,8192",
+        ]
+    )
+    cases = benchmark_qsa._resolve_cases(args)
+    (prefill,) = [case for case in cases if case.kind == "prefill"]
+
+    assert prefill.name == "tp2-prefill-r3008-c8192"
+    assert prefill.request_count == 1
+    assert prefill.positions[0] == 5184
+    assert prefill.positions[-1] == 8191
+    assert prefill.active_sequence_length == 8192
+    assert prefill.rank_prefix_groups == 1296
+
+
 def test_all_profile_alias_and_full_context_cases_are_explicit() -> None:
     args = benchmark_qsa._parse_args(
         ["--profiles", "all", "--contexts", "2048,8192,32768,131072,full"]

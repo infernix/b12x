@@ -207,12 +207,14 @@ class _CandidateTensor:
         (4, 24, 2, True),
     ],
 )
+@pytest.mark.parametrize("splits", [1, 8, 64])
 def test_cute_candidate_accepts_all_qwen_rows_for_interleaved_blh_cache_views(
     monkeypatch: pytest.MonkeyPatch,
     rows: int,
     q_heads: int,
     kv_heads: int,
     expected: bool,
+    splits: int,
 ) -> None:
     pages, layers, page_size = 128, 64, 1504
     allocation = torch.empty(
@@ -261,17 +263,17 @@ def test_cute_candidate_accepts_all_qwen_rows_for_interleaved_blh_cache_views(
             partial_output=_CandidateTensor(
                 (
                     rows,
-                    cute_config.NUM_SPLITS,
+                    splits,
                     q_heads,
                     cute_config.HEAD_DIM,
                 ),
                 torch.float32,
             ),
             partial_lse=_CandidateTensor(
-                (rows, cute_config.NUM_SPLITS, q_heads), torch.float32
+                (rows, splits, q_heads), torch.float32
             ),
             block_n=cute_config.BLOCK_N,
-            splits=cute_config.NUM_SPLITS,
+            splits=splits,
         )
         is expected
     )
@@ -287,7 +289,8 @@ def test_qwen_split_policy_does_not_route_large_rows_to_triton() -> None:
     )
 
     assert _target_splits(caps, 1) == (16, 64)
-    assert _target_splits(caps, 32) == (16, 64)
+    assert _target_splits(caps, 4) == (16, 32)
+    assert _target_splits(caps, 32) == (16, 16)
 
     with pytest.raises(NotImplementedError, match="requires the CuTe Qwen"):
         _target_splits(
@@ -829,7 +832,7 @@ def test_sparse_gqa_reuses_binaries_across_runtime_rows_and_page_sizes(
         compile_targets.append(type(target).__name__)
         return original_compile(target, *args, **kwargs)
 
-    def launch(rows: int, page_size: int) -> torch.Tensor:
+    def launch(rows: int, page_size: int, splits: int) -> torch.Tensor:
         query = torch.randn(
             (rows, q_heads, head_dim), dtype=torch.bfloat16, device=device
         )
@@ -845,10 +848,10 @@ def test_sparse_gqa_reuses_binaries_across_runtime_rows_and_page_sizes(
         query_positions = torch.zeros((rows,), dtype=torch.int64, device=device)
         output = torch.empty_like(query)
         partial_output = torch.empty(
-            (rows, 64, q_heads, head_dim), dtype=torch.float32, device=device
+            (rows, splits, q_heads, head_dim), dtype=torch.float32, device=device
         )
         partial_lse = torch.empty(
-            (rows, 64, q_heads), dtype=torch.float32, device=device
+            (rows, splits, q_heads), dtype=torch.float32, device=device
         )
         return launch_sparse_paged_gqa(
             query=query,
@@ -863,19 +866,19 @@ def test_sparse_gqa_reuses_binaries_across_runtime_rows_and_page_sizes(
             partial_lse=partial_lse,
             softmax_scale=1.0 / math.sqrt(head_dim),
             block_n=16,
-            splits=64,
+            splits=splits,
         )
 
     cute_impl.clear_caches()
     monkeypatch.setattr(cute_impl, "b12x_compile", traced_compile)
     try:
-        assert torch.count_nonzero(launch(1, 16)).item() == 0
+        assert torch.count_nonzero(launch(1, 16, 64)).item() == 0
         compiled_after_first_launch = tuple(compile_targets)
         assert compiled_after_first_launch.count("_SparseGqaSplitKernel") == 1
         assert compiled_after_first_launch.count("_SparseGqaMergeKernel") == 1
 
         freeze_kernel_resolution("QSA runtime-row cache reuse test")
-        assert torch.count_nonzero(launch(17, 3008)).item() == 0
+        assert torch.count_nonzero(launch(17, 3008, 8)).item() == 0
         assert tuple(compile_targets) == compiled_after_first_launch
     finally:
         unfreeze_kernel_resolution()

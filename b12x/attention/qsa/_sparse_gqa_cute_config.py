@@ -38,6 +38,7 @@ def is_qwen_geometry(
     splits: int,
 ) -> bool:
     """Return whether scalar dimensions select the Qwen sparse-GQA kernel."""
+    splits = int(splits)
     return (
         int(q_heads) > 0
         and int(kv_heads) > 0
@@ -45,7 +46,9 @@ def is_qwen_geometry(
         and int(head_dim) == HEAD_DIM
         and int(selection_width) == SELECTION_WIDTH
         and int(block_n) == BLOCK_N
-        and int(splits) == NUM_SPLITS
+        and splits > 0
+        and splits <= NUM_SPLITS
+        and splits & (splits - 1) == 0
     )
 
 
@@ -130,9 +133,9 @@ def is_candidate(
         and tuple(request_ids.shape) == (rows,)
         and tuple(query_positions.shape) == (rows,)
         and int(partial_output.shape[0]) >= rows
-        and tuple(partial_output.shape[1:]) == (NUM_SPLITS, q_heads, HEAD_DIM)
+        and tuple(partial_output.shape[1:]) == (int(splits), q_heads, HEAD_DIM)
         and int(partial_lse.shape[0]) >= rows
-        and tuple(partial_lse.shape[1:]) == (NUM_SPLITS, q_heads)
+        and tuple(partial_lse.shape[1:]) == (int(splits), q_heads)
     )
 
 

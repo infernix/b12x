@@ -1,9 +1,10 @@
 """CuTeDSL indexed sparse paged causal GQA for Qwen3.8 Flash Next.
 
 This private stage reads BF16 or globally scaled FP8 E4M3 main-cache K/V at
-caller-selected logical token positions. It never writes either cache. The supported Qwen geometry
-always launches the CuTe split and merge kernels; every other geometry,
-layout, or device fails instead of selecting an alternate implementation.
+caller-selected logical token positions. It never writes either cache. The
+supported Qwen geometry always launches the CuTe split and merge kernels;
+every other geometry, layout, or device fails instead of selecting an alternate
+implementation.
 """
 
 from __future__ import annotations
@@ -258,12 +259,14 @@ def launch_sparse_paged_gqa(
         partial_output=partial_output,
         partial_lse=partial_lse,
         softmax_scale=softmax_scale,
+        splits=splits,
     )
     launch_sparse_gqa_merge(
         partial_output=partial_output,
         partial_lse=partial_lse,
         output=output,
         rows=rows,
+        splits=splits,
     )
     return output[:rows]
 

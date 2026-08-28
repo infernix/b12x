@@ -151,7 +151,6 @@ def plan(caps: Caps) -> Plan:
         max_tokens=caps.max_tokens,
         streams=caps.streams,
         hidden_size=caps.hidden_size,
-        device=caps.device,
     )
     h = caps.hidden_size
     s = caps.streams

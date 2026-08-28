@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark the public Qwen3.8 Flash Next QSA decode transaction.
+"""Benchmark public Qwen3.8 Flash Next QSA decode and prefill transactions.
 
 The harness constructs every case through ``Caps -> plan -> bind -> run``. The
 timed operation is the bound ``qsa.run`` transaction: selector query
@@ -99,7 +99,7 @@ class BenchmarkCase:
     preceding_accepted_tokens: int = 1
 
     def __post_init__(self) -> None:
-        if self.kind not in {"throughput", "stream_phase", "speculative"}:
+        if self.kind not in {"throughput", "prefill", "stream_phase", "speculative"}:
             raise ValueError(f"unknown QSA benchmark case kind {self.kind!r}")
         if self.context % COMPRESS_RATIO:
             raise ValueError("QSA benchmark capacity must be compression aligned")
@@ -117,6 +117,8 @@ class BenchmarkCase:
             raise ValueError(
                 "preceding_accepted_tokens is only configurable for speculative cases"
             )
+        if self.kind == "prefill" and self.rows > self.context:
+            raise ValueError("prefill rows cannot exceed the active context")
 
     @property
     def name(self) -> str:
@@ -127,11 +129,13 @@ class BenchmarkCase:
                 f"{self.profile.name}-r4-cap{self.context}-spec-"
                 f"accept{self.preceding_accepted_tokens}"
             )
+        if self.kind == "prefill":
+            return f"{self.profile.name}-prefill-r{self.rows}-c{self.context}"
         return f"{self.profile.name}-r{self.rows}-c{self.context}"
 
     @property
     def request_count(self) -> int:
-        return 1 if self.kind == "speculative" else self.rows
+        return 1 if self.kind in {"prefill", "speculative"} else self.rows
 
     @property
     def max_speculative_tokens(self) -> int:
@@ -150,6 +154,8 @@ class BenchmarkCase:
             setup_start = self.context - 2 * COMPRESS_RATIO
             start = setup_start + self.preceding_accepted_tokens
             return tuple(range(start, start + self.rows))
+        if self.kind == "prefill":
+            return tuple(range(self.context - self.rows, self.context))
         return (self.context - 1,) * self.rows
 
     @property
@@ -171,6 +177,8 @@ class BenchmarkCase:
     def rank_prefix_groups(self) -> int:
         if self.kind == "speculative":
             return (self.context - 2 * COMPRESS_RATIO) // COMPRESS_RATIO
+        if self.kind == "prefill":
+            return (self.context - self.rows) // COMPRESS_RATIO
         return self.groups - 1
 
     @property
@@ -366,6 +374,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="comma-separated packed decode row counts",
     )
     parser.add_argument(
+        "--prefill-rows",
+        type=_parse_positive_csv,
+        default=(),
+        help=(
+            "comma-separated packed single-request prefill row counts; cases "
+            "whose row count exceeds the selected context are omitted"
+        ),
+    )
+    parser.add_argument(
         "--contexts",
         type=_parse_context_csv,
         default=DEFAULT_CONTEXTS,
@@ -419,9 +436,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise BenchmarkFailure("warmup and replay counts must be positive")
     if args.l2_flush_bytes < 0:
         raise BenchmarkFailure("L2 flush bytes must be non-negative")
-    if any(rows > 2048 for rows in args.rows):
+    if any(rows > 4096 for rows in (*args.rows, *args.prefill_rows)):
         raise BenchmarkFailure(
-            "row counts above 2048 require an explicit harness change"
+            "row counts above 4096 require an explicit harness change"
         )
 
 
@@ -432,6 +449,13 @@ def _resolve_cases(args: argparse.Namespace) -> tuple[BenchmarkCase, ...]:
         for rows in args.rows
         for context in args.contexts
     ]
+    cases.extend(
+        BenchmarkCase(PROFILES[profile], rows, context, kind="prefill")
+        for profile in args.profiles
+        for rows in args.prefill_rows
+        for context in args.contexts
+        if rows <= context
+    )
     if args.contract_cases:
         profile = PROFILES["tp2"]
         cases.extend(
@@ -935,7 +959,7 @@ def _prepare_case(
         (case.rows, INDEX_HEAD_DIM), generator=generator, device=device
     )
     query_positions = torch.tensor(case.positions, dtype=torch.int64, device=device)
-    if case.kind == "speculative":
+    if case.kind in {"prefill", "speculative"}:
         request_ids = torch.zeros((case.rows,), dtype=torch.int64, device=device)
         query_start_loc = torch.tensor([0, case.rows], dtype=torch.int32, device=device)
     else:
@@ -961,6 +985,12 @@ def _prepare_case(
         ),
         "query_start_loc": query_start_loc,
         "num_accepted_tokens": accepted,
+        "is_prefilling": torch.full(
+            (case.request_count,),
+            case.kind == "prefill",
+            dtype=torch.bool,
+            device=device,
+        ),
     }
 
     prepared_selector_query = gemma_rmsnorm_reference(
@@ -1004,7 +1034,11 @@ def _prepare_case(
             raw_rope[request, slot, :] = prior
 
     setup_metadata: dict[str, object] = {
-        "transaction": "single_decode_interval",
+        "transaction": (
+            "packed_prefill_interval"
+            if case.kind == "prefill"
+            else "single_decode_interval"
+        ),
         "setup_transaction_executed": False,
     }
     if case.setup_positions is not None:
@@ -1046,6 +1080,7 @@ def _prepare_case(
                 [0, case.rows], dtype=torch.int32, device=device
             ),
             "num_accepted_tokens": torch.ones((1,), dtype=torch.int32, device=device),
+            "is_prefilling": torch.zeros((1,), dtype=torch.bool, device=device),
         }
         setup_oracle_compressed = compressed.clone()
         setup_oracle_raw_ring = raw_ring[0].clone()
@@ -1115,7 +1150,7 @@ def _prepare_case(
             "setup_main_kv_read_only": True,
         }
 
-    if case.kind == "speculative":
+    if case.kind in {"prefill", "speculative"}:
         compressed_rows = compressed
     else:
         completed_groups = {
@@ -1182,6 +1217,7 @@ def _validate_correctness(
             oracle_raw_rope[state_slot],
             prior_interval_start_position=int(expected_anchors[state_slot]),
             num_accepted_tokens=int(prepared.dynamic["num_accepted_tokens"][request]),
+            is_prefilling=bool(prepared.dynamic["is_prefilling"][request]),
             compress_ratio=COMPRESS_RATIO,
             key_norm_weight=binding.index_k_norm_weight,
             eps=binding.plan.caps.rms_norm_eps,
@@ -1245,9 +1281,12 @@ def _validate_correctness(
         binding.index_q_norm_weight,
         binding.plan.caps.rms_norm_eps,
     )
+    final_workspace_rows = case.rows % binding.plan.workspace_q_rows
+    if final_workspace_rows == 0:
+        final_workspace_rows = min(case.rows, binding.plan.workspace_q_rows)
     torch.testing.assert_close(
-        binding.prepared_index_query[: case.rows],
-        prepared_query,
+        binding.prepared_index_query[:final_workspace_rows],
+        prepared_query[-final_workspace_rows:],
         rtol=0.0,
         atol=2e-2,
     )
@@ -1268,7 +1307,23 @@ def _validate_correctness(
         sparse_gqa_atol = 4e-2
     max_abs = 0.0
     tail_lengths: list[int] = []
-    for row in range(case.rows):
+    if case.rows <= 64:
+        reference_rows = tuple(range(case.rows))
+    else:
+        reference_rows = tuple(
+            sorted(
+                {
+                    0,
+                    1,
+                    COMPRESS_RATIO - 1,
+                    COMPRESS_RATIO,
+                    case.rows // 2,
+                    case.rows - 2,
+                    case.rows - 1,
+                }
+            )
+        )
+    for row in reference_rows:
         request = int(prepared.dynamic["request_ids"][row])
         sequence_length = int(prepared.dynamic["sequence_lengths"][request])
         _, expected_selected = score_select_reference(
@@ -1349,7 +1404,7 @@ def _validate_correctness(
                 "packed_stream_compress_reference + score_select_reference + "
                 "sparse_paged_gqa_reference"
             ),
-            "reference_rows": case.rows,
+            "reference_rows": list(reference_rows),
             "selector_exact": True,
             "sparse_gqa_rtol": 0.0,
             "sparse_gqa_atol": sparse_gqa_atol,
@@ -1663,6 +1718,7 @@ def main(argv: list[str] | None = None) -> int:
         cases = _resolve_cases(args)
         l2_flush = make_l2_flush_fn(args.flush_l2, bytes_hint=args.l2_flush_bytes)
         properties = torch.cuda.get_device_properties(device)
+        capability = torch.cuda.get_device_capability(device)
         result: dict[str, object] = {
             "kind": _RESULT_KIND,
             "schema_version": _RESULT_SCHEMA_VERSION,
@@ -1694,7 +1750,7 @@ def main(argv: list[str] | None = None) -> int:
             "contract": {
                 "model": "Qwen3.8 Flash Next",
                 "api": ["Caps", "plan", "bind", "run"],
-                "timed_operation": "bound qsa.run decode transaction",
+                "timed_operation": "bound qsa.run transaction",
                 "setup_operation": "Caps -> plan -> bind",
                 "main_kv_pool": (
                     "disjoint read-only physical pages per request with "
@@ -1711,6 +1767,7 @@ def main(argv: list[str] | None = None) -> int:
             "parameters": {
                 "profiles": list(args.profiles),
                 "rows": list(args.rows),
+                "prefill_rows": list(args.prefill_rows),
                 "contexts": list(args.contexts),
                 "main_cache_layout": args.main_cache_layout,
                 "kv_cache_dtype": args.kv_cache_dtype,

@@ -15,6 +15,7 @@ _SCORE_WORKSPACE_LIMIT_BYTES = 128 * 1024 * 1024
 _MIN_TOPK_WORKSPACE_BYTES = 1024 * 1024
 _STABLE_TOPK_BLOCK = 512
 _MAX_SCORE_CHUNK_GROUPS = 65536
+_MIN_WORKSPACE_Q_ROWS = 128
 
 
 def _align_up(value: int, alignment: int = _ALIGN_BYTES) -> int:
@@ -411,6 +412,7 @@ class Plan:
     """Fixed-capacity QSA policy and caller-allocated scratch contract."""
 
     caps: Caps
+    workspace_q_rows: int
     score_chunk_groups: int
     score_workspace_width: int
     num_score_chunks: int
@@ -516,8 +518,6 @@ def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
         is_qwen_geometry,
     )
 
-    del rows
-
     if is_qwen_geometry(
         q_heads=int(caps.q_heads),
         kv_heads=int(caps.kv_heads),
@@ -526,7 +526,9 @@ def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
         block_n=QWEN_CUTE_BLOCK_N,
         splits=QWEN_CUTE_NUM_SPLITS,
     ):
-        return QWEN_CUTE_BLOCK_N, QWEN_CUTE_NUM_SPLITS
+        rows = int(rows)
+        splits = 64 if rows == 1 else 32 if rows <= 4 else 16
+        return QWEN_CUTE_BLOCK_N, splits
     raise NotImplementedError(
         "QSA requires the CuTe Qwen sparse-GQA geometry: q_heads divisible by "
         "kv_heads, head_dim=256, selection_width=2051; "
@@ -537,10 +539,19 @@ def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
     )
 
 
-def _scratch_layout(caps: Caps) -> tuple[_ScratchLayout, int, int, int, int]:
+def _scratch_layout(
+    caps: Caps,
+) -> tuple[_ScratchLayout, int, int, int, int, int]:
+    workspace_q_rows = min(
+        int(caps.max_q_rows),
+        max(
+            _MIN_WORKSPACE_Q_ROWS,
+            int(caps.max_batch) * (int(caps.max_speculative_tokens) + 1),
+        ),
+    )
     score_width_limit = max(
         1,
-        _SCORE_WORKSPACE_LIMIT_BYTES // (int(caps.max_q_rows) * torch.float32.itemsize),
+        _SCORE_WORKSPACE_LIMIT_BYTES // (workspace_q_rows * torch.float32.itemsize),
     )
     score_width_limit = min(
         score_width_limit,
@@ -558,16 +569,13 @@ def _scratch_layout(caps: Caps) -> tuple[_ScratchLayout, int, int, int, int]:
         score_workspace_width = int(caps.group_budget) + score_chunk_groups
     num_score_chunks = math.ceil(int(caps.max_groups) / score_chunk_groups)
     prepared_query_nbytes = (
-        int(caps.max_q_rows)
+        workspace_q_rows
         * int(caps.index_heads)
         * int(caps.index_head_dim)
         * torch.bfloat16.itemsize
     )
-    score_nbytes = int(caps.max_q_rows) * score_workspace_width * torch.float32.itemsize
-    max_split_row_product = max(
-        rows * _target_splits(caps, rows)[1]
-        for rows in range(1, int(caps.max_q_rows) + 1)
-    )
+    score_nbytes = workspace_q_rows * score_workspace_width * torch.float32.itemsize
+    max_split_row_product = workspace_q_rows * _target_splits(caps, 1)[1]
     partial_output_nbytes = (
         max_split_row_product
         * int(caps.q_heads)
@@ -578,27 +586,27 @@ def _scratch_layout(caps: Caps) -> tuple[_ScratchLayout, int, int, int, int]:
         max_split_row_product * int(caps.q_heads) * torch.float32.itemsize
     )
     work_metadata_nbytes = max(
-        int(caps.max_q_rows) * 8 * torch.int64.itemsize,
+        workspace_q_rows * 8 * torch.int64.itemsize,
         (int(caps.num_compressed_cache_pages) + 1) * torch.int32.itemsize,
     )
-    eligible_counts_nbytes = int(caps.max_q_rows) * torch.int32.itemsize
-    merge_lengths_nbytes = int(caps.max_q_rows) * torch.int32.itemsize
+    eligible_counts_nbytes = workspace_q_rows * torch.int32.itemsize
+    merge_lengths_nbytes = workspace_q_rows * torch.int32.itemsize
     topk_values_nbytes = (
-        int(caps.max_q_rows) * int(caps.group_budget) * torch.float32.itemsize
+        workspace_q_rows * int(caps.group_budget) * torch.float32.itemsize
     )
     topk_indices_nbytes = (
-        int(caps.max_q_rows) * int(caps.group_budget) * torch.int32.itemsize
+        workspace_q_rows * int(caps.group_budget) * torch.int32.itemsize
     )
     state_errors_nbytes = int(caps.max_q_rows) * torch.int32.itemsize
     # One error word per request plus one global packed-boundary word.
     request_errors_nbytes = (int(caps.max_batch) + 1) * torch.int32.itemsize
     stable_topk_blocks = math.ceil(score_workspace_width / _STABLE_TOPK_BLOCK)
     stable_topk_nbytes = (
-        2 * int(caps.max_q_rows) * stable_topk_blocks * torch.int32.itemsize
-        + int(caps.max_q_rows)
+        2 * workspace_q_rows * stable_topk_blocks * torch.int32.itemsize
+        + workspace_q_rows
         * int(caps.group_budget)
         * (torch.float32.itemsize + torch.int32.itemsize)
-        + int(caps.max_q_rows) * (torch.float32.itemsize + torch.int32.itemsize)
+        + workspace_q_rows * (torch.float32.itemsize + torch.int32.itemsize)
     )
     topk_workspace_nbytes = _align_up(
         max(_MIN_TOPK_WORKSPACE_BYTES, stable_topk_nbytes)
@@ -670,6 +678,7 @@ def _scratch_layout(caps: Caps) -> tuple[_ScratchLayout, int, int, int, int]:
         score_workspace_width,
         num_score_chunks,
         max_split_row_product,
+        workspace_q_rows,
     )
 
 
@@ -681,9 +690,11 @@ def plan(caps: Caps) -> Plan:
         score_workspace_width,
         num_score_chunks,
         max_split_row_product,
+        workspace_q_rows,
     ) = _scratch_layout(caps)
     return Plan(
         caps=caps,
+        workspace_q_rows=workspace_q_rows,
         score_chunk_groups=score_chunk_groups,
         score_workspace_width=score_workspace_width,
         num_score_chunks=num_score_chunks,
@@ -1221,11 +1232,12 @@ def bind(
         ),
     )
     layout = plan._layout
+    workspace_q_rows = int(plan.workspace_q_rows)
     prepared_index_query = _scratch_view(
         scratch_storage,
         offset_bytes=layout.prepared_query_offset_bytes,
         shape=(
-            int(caps.max_q_rows),
+            workspace_q_rows,
             int(caps.index_heads),
             int(caps.index_head_dim),
         ),
@@ -1234,43 +1246,43 @@ def bind(
     scores = _scratch_view(
         scratch_storage,
         offset_bytes=layout.score_offset_bytes,
-        shape=(int(caps.max_q_rows), int(plan.score_workspace_width)),
+        shape=(workspace_q_rows, int(plan.score_workspace_width)),
         dtype=torch.float32,
     )
     eligible_group_counts = _scratch_view(
         scratch_storage,
         offset_bytes=layout.eligible_counts_offset_bytes,
-        shape=(int(caps.max_q_rows),),
+        shape=(workspace_q_rows,),
         dtype=torch.int32,
     )
     merge_lengths = _scratch_view(
         scratch_storage,
         offset_bytes=layout.merge_lengths_offset_bytes,
-        shape=(int(caps.max_q_rows),),
+        shape=(workspace_q_rows,),
         dtype=torch.int32,
     )
     topk_values = _scratch_view(
         scratch_storage,
         offset_bytes=layout.topk_values_offset_bytes,
-        shape=(int(caps.max_q_rows), int(caps.group_budget)),
+        shape=(workspace_q_rows, int(caps.group_budget)),
         dtype=torch.float32,
     )
     topk_group_ids = _scratch_view(
         scratch_storage,
         offset_bytes=layout.topk_indices_offset_bytes,
-        shape=(int(caps.max_q_rows), int(caps.group_budget)),
+        shape=(workspace_q_rows, int(caps.group_budget)),
         dtype=torch.int32,
     )
     topk_values_b = _scratch_view(
         scratch_storage,
         offset_bytes=layout.topk_values_b_offset_bytes,
-        shape=(int(caps.max_q_rows), int(caps.group_budget)),
+        shape=(workspace_q_rows, int(caps.group_budget)),
         dtype=torch.float32,
     )
     topk_group_ids_b = _scratch_view(
         scratch_storage,
         offset_bytes=layout.topk_indices_b_offset_bytes,
-        shape=(int(caps.max_q_rows), int(caps.group_budget)),
+        shape=(workspace_q_rows, int(caps.group_budget)),
         dtype=torch.int32,
     )
     state_errors = _scratch_view(
@@ -1347,6 +1359,7 @@ def _qsa_decode_impl(
     sequence_lengths: torch.Tensor,
     query_start_loc: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
+    is_prefilling: torch.Tensor,
     scratch: torch.Tensor,
     main_k_cache: torch.Tensor,
     main_v_cache: torch.Tensor,
@@ -1380,6 +1393,7 @@ def _qsa_decode_impl(
     score_workspace_width: int,
     num_score_chunks: int,
     max_split_row_product: int,
+    workspace_q_rows: int,
     prepared_query_offset_bytes: int,
     score_offset_bytes: int,
     eligible_counts_offset_bytes: int,
@@ -1430,55 +1444,58 @@ def _qsa_decode_impl(
     )
 
     max_q_rows = int(output.shape[0])
+    work_rows = int(workspace_q_rows)
+    if not 0 < work_rows <= max_q_rows:
+        raise RuntimeError("invalid planned QSA workspace row capacity")
     group_budget = int(budget) // int(compress_ratio)
     prepared_query = _scratch_view(
         scratch,
         offset_bytes=int(prepared_query_offset_bytes),
-        shape=(max_q_rows, index_heads, index_head_dim),
+        shape=(work_rows, index_heads, index_head_dim),
         dtype=torch.bfloat16,
-    )[:rows]
+    )
     scores = _scratch_view(
         scratch,
         offset_bytes=int(score_offset_bytes),
-        shape=(max_q_rows, int(score_workspace_width)),
+        shape=(work_rows, int(score_workspace_width)),
         dtype=torch.float32,
-    )[:rows]
+    )
     eligible_counts = _scratch_view(
         scratch,
         offset_bytes=int(eligible_counts_offset_bytes),
-        shape=(max_q_rows,),
+        shape=(work_rows,),
         dtype=torch.int32,
-    )[:rows]
+    )
     merge_lengths = _scratch_view(
         scratch,
         offset_bytes=int(merge_lengths_offset_bytes),
-        shape=(max_q_rows,),
+        shape=(work_rows,),
         dtype=torch.int32,
-    )[:rows]
+    )
     topk_values = _scratch_view(
         scratch,
         offset_bytes=int(topk_values_offset_bytes),
-        shape=(max_q_rows, group_budget),
+        shape=(work_rows, group_budget),
         dtype=torch.float32,
-    )[:rows]
+    )
     topk_ids = _scratch_view(
         scratch,
         offset_bytes=int(topk_indices_offset_bytes),
-        shape=(max_q_rows, group_budget),
+        shape=(work_rows, group_budget),
         dtype=torch.int32,
-    )[:rows]
+    )
     topk_values_b = _scratch_view(
         scratch,
         offset_bytes=int(topk_values_b_offset_bytes),
-        shape=(max_q_rows, group_budget),
+        shape=(work_rows, group_budget),
         dtype=torch.float32,
-    )[:rows]
+    )
     topk_ids_b = _scratch_view(
         scratch,
         offset_bytes=int(topk_indices_b_offset_bytes),
-        shape=(max_q_rows, group_budget),
+        shape=(work_rows, group_budget),
         dtype=torch.int32,
-    )[:rows]
+    )
     state_errors = _scratch_view(
         scratch,
         offset_bytes=int(state_errors_offset_bytes),
@@ -1493,48 +1510,48 @@ def _qsa_decode_impl(
     )
     stable_topk_blocks = math.ceil(int(score_workspace_width) / _STABLE_TOPK_BLOCK)
     stable_offset = int(topk_offset_bytes)
-    stable_count_nbytes = max_q_rows * stable_topk_blocks * torch.int32.itemsize
+    stable_count_nbytes = work_rows * stable_topk_blocks * torch.int32.itemsize
     tie_counts = _scratch_view(
         scratch,
         offset_bytes=stable_offset,
-        shape=(max_q_rows, stable_topk_blocks),
+        shape=(work_rows, stable_topk_blocks),
         dtype=torch.int32,
-    )[:rows]
+    )
     stable_offset += stable_count_nbytes
     greater_counts = _scratch_view(
         scratch,
         offset_bytes=stable_offset,
-        shape=(max_q_rows, stable_topk_blocks),
+        shape=(work_rows, stable_topk_blocks),
         dtype=torch.int32,
-    )[:rows]
+    )
     stable_offset += stable_count_nbytes
     stable_values = _scratch_view(
         scratch,
         offset_bytes=stable_offset,
-        shape=(max_q_rows, group_budget),
+        shape=(work_rows, group_budget),
         dtype=torch.float32,
-    )[:rows]
-    stable_offset += max_q_rows * group_budget * torch.float32.itemsize
+    )
+    stable_offset += work_rows * group_budget * torch.float32.itemsize
     stable_ids = _scratch_view(
         scratch,
         offset_bytes=stable_offset,
-        shape=(max_q_rows, group_budget),
+        shape=(work_rows, group_budget),
         dtype=torch.int32,
-    )[:rows]
-    stable_offset += max_q_rows * group_budget * torch.int32.itemsize
+    )
+    stable_offset += work_rows * group_budget * torch.int32.itemsize
     thresholds = _scratch_view(
         scratch,
         offset_bytes=stable_offset,
-        shape=(max_q_rows,),
+        shape=(work_rows,),
         dtype=torch.float32,
-    )[:rows]
-    stable_offset += max_q_rows * torch.float32.itemsize
+    )
+    stable_offset += work_rows * torch.float32.itemsize
     greater_totals = _scratch_view(
         scratch,
         offset_bytes=stable_offset,
-        shape=(max_q_rows,),
+        shape=(work_rows,),
         dtype=torch.int32,
-    )[:rows]
+    )
     partial_output_storage = _scratch_view(
         scratch,
         offset_bytes=int(partial_output_offset_bytes),
@@ -1574,20 +1591,21 @@ def _qsa_decode_impl(
         launch_stabilize_topk,
         launch_stage_topk_carry,
         launch_topk_groups,
-        launch_update_raw_ring,
+        launch_commit_raw_ring,
         launch_validate_completed_groups,
-        launch_validate_decode_rows,
+        launch_validate_rows,
         launch_validate_page_tables,
         launch_validate_shared_pool_ownership,
     )
 
-    launch_validate_decode_rows(
+    launch_validate_rows(
         request_ids=request_ids,
         query_positions=query_positions,
         rope_positions=rope_positions,
         sequence_lengths=sequence_lengths,
         query_start_loc=query_start_loc,
         num_accepted_tokens=num_accepted_tokens,
+        is_prefilling=is_prefilling,
         raw_state_slot_ids=raw_state_slot_ids,
         raw_interval_start_positions=raw_interval_start_positions,
         request_errors=request_errors,
@@ -1618,17 +1636,6 @@ def _qsa_decode_impl(
             num_compressed_pages=int(compressed_k_cache.shape[0]),
             caps=caps,
         )
-    launch_prepare_index_query(
-        index_query=index_query,
-        request_ids=request_ids,
-        norm_weight=index_q_norm_weight,
-        rope_positions=rope_positions,
-        rope_cos=rope_cos,
-        rope_sin=rope_sin,
-        state_errors=state_errors,
-        prepared_query=prepared_query,
-        caps=caps,
-    )
     launch_validate_completed_groups(
         query_positions=query_positions,
         rope_positions=rope_positions,
@@ -1666,12 +1673,14 @@ def _qsa_decode_impl(
         state_errors=state_errors,
         caps=caps,
     )
-    launch_update_raw_ring(
+    launch_commit_raw_ring(
         raw_index_key=raw_index_key,
         query_positions=query_positions,
         rope_positions=rope_positions,
         request_ids=request_ids,
         query_start_loc=query_start_loc,
+        sequence_lengths=sequence_lengths,
+        is_prefilling=is_prefilling,
         raw_state_slot_ids=raw_state_slot_ids,
         raw_k_ring=raw_k_ring,
         raw_logical_positions=raw_logical_positions,
@@ -1681,110 +1690,146 @@ def _qsa_decode_impl(
         caps=caps,
     )
 
-    prior_values = topk_values_b
-    prior_ids = topk_ids_b
-    final_ids = prior_ids
-    for chunk_index in range(int(num_score_chunks)):
-        group_offset = chunk_index * int(score_chunk_groups)
-        group_count = min(int(score_chunk_groups), int(caps.max_groups) - group_offset)
-        output_values = topk_values if chunk_index % 2 == 0 else topk_values_b
-        output_ids = topk_ids if chunk_index % 2 == 0 else topk_ids_b
-        if group_offset:
-            launch_stage_topk_carry(
-                prior_values=prior_values,
-                eligible_counts=eligible_counts,
-                scores=scores,
+    from ._sparse_gqa import launch_sparse_paged_gqa
+
+    for row_offset in range(0, rows, work_rows):
+        chunk_rows = min(work_rows, rows - row_offset)
+        row_slice = slice(row_offset, row_offset + chunk_rows)
+        chunk_request_ids = request_ids[row_slice]
+        chunk_positions = query_positions[row_slice]
+        chunk_rope = rope_positions[row_slice]
+        chunk_errors = state_errors[row_slice]
+        chunk_prepared = prepared_query[:chunk_rows]
+        chunk_scores = scores[:chunk_rows]
+        chunk_eligible = eligible_counts[:chunk_rows]
+        chunk_merge_lengths = merge_lengths[:chunk_rows]
+        chunk_topk_values = topk_values[:chunk_rows]
+        chunk_topk_ids = topk_ids[:chunk_rows]
+        chunk_topk_values_b = topk_values_b[:chunk_rows]
+        chunk_topk_ids_b = topk_ids_b[:chunk_rows]
+        chunk_tie_counts = tie_counts[:chunk_rows]
+        chunk_greater_counts = greater_counts[:chunk_rows]
+        chunk_stable_values = stable_values[:chunk_rows]
+        chunk_stable_ids = stable_ids[:chunk_rows]
+        chunk_thresholds = thresholds[:chunk_rows]
+        chunk_greater_totals = greater_totals[:chunk_rows]
+
+        launch_prepare_index_query(
+            index_query=index_query[row_slice],
+            request_ids=chunk_request_ids,
+            norm_weight=index_q_norm_weight,
+            rope_positions=chunk_rope,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+            state_errors=chunk_errors,
+            prepared_query=chunk_prepared,
+            caps=caps,
+        )
+        prior_values = chunk_topk_values_b
+        prior_ids = chunk_topk_ids_b
+        final_ids = prior_ids
+        for score_chunk in range(int(num_score_chunks)):
+            group_offset = score_chunk * int(score_chunk_groups)
+            group_count = min(
+                int(score_chunk_groups), int(caps.max_groups) - group_offset
+            )
+            output_values = (
+                chunk_topk_values if score_chunk % 2 == 0 else chunk_topk_values_b
+            )
+            output_ids = chunk_topk_ids if score_chunk % 2 == 0 else chunk_topk_ids_b
+            if group_offset:
+                launch_stage_topk_carry(
+                    prior_values=prior_values,
+                    eligible_counts=chunk_eligible,
+                    scores=chunk_scores,
+                    group_offset=group_offset,
+                    group_budget=group_budget,
+                )
+            launch_score_representatives(
+                prepared_query=chunk_prepared,
+                query_positions=chunk_positions,
+                request_ids=chunk_request_ids,
+                sequence_lengths=sequence_lengths,
+                compressed_cache=compressed_k_cache,
+                compressed_block_table=compressed_block_table,
+                state_errors=chunk_errors,
+                scores=chunk_scores,
+                eligible_counts=chunk_eligible,
+                merge_lengths=chunk_merge_lengths,
+                group_offset=group_offset,
+                group_count=group_count,
+                caps=caps,
+            )
+            launch_topk_groups(
+                scores=chunk_scores,
+                eligible_counts=chunk_merge_lengths,
+                topk_values=output_values,
+                topk_group_ids=output_ids,
+                group_budget=group_budget,
+            )
+            launch_remap_topk_group_ids(
+                local_ids=output_ids,
+                prior_ids=prior_ids,
+                eligible_counts=chunk_eligible,
+                merge_lengths=chunk_merge_lengths,
                 group_offset=group_offset,
                 group_budget=group_budget,
             )
-        launch_score_representatives(
-            prepared_query=prepared_query,
-            query_positions=query_positions,
-            request_ids=request_ids,
-            sequence_lengths=sequence_lengths,
-            compressed_cache=compressed_k_cache,
-            compressed_block_table=compressed_block_table,
-            state_errors=state_errors,
-            scores=scores,
-            eligible_counts=eligible_counts,
-            merge_lengths=merge_lengths,
-            group_offset=group_offset,
-            group_count=group_count,
+            launch_stabilize_topk(
+                scores=chunk_scores,
+                merge_lengths=chunk_merge_lengths,
+                prior_ids=prior_ids,
+                eligible_counts=chunk_eligible,
+                topk_values=output_values,
+                topk_group_ids=output_ids,
+                tie_counts=chunk_tie_counts,
+                greater_counts=chunk_greater_counts,
+                stable_values=chunk_stable_values,
+                stable_ids=chunk_stable_ids,
+                thresholds=chunk_thresholds,
+                greater_totals=chunk_greater_totals,
+                group_offset=group_offset,
+                group_budget=group_budget,
+            )
+            prior_values, prior_ids = output_values, output_ids
+            final_ids = output_ids
+
+        selected = selected_positions[row_slice]
+        launch_expand_selected_groups(
+            topk_group_ids=final_ids,
+            eligible_counts=chunk_eligible,
+            query_positions=chunk_positions,
+            state_errors=chunk_errors,
+            selected_positions=selected,
             caps=caps,
         )
-        launch_topk_groups(
-            scores=scores,
-            eligible_counts=merge_lengths,
-            topk_values=output_values,
-            topk_group_ids=output_ids,
-            group_budget=group_budget,
-        )
-        launch_remap_topk_group_ids(
-            local_ids=output_ids,
-            prior_ids=prior_ids,
-            eligible_counts=eligible_counts,
-            merge_lengths=merge_lengths,
-            group_offset=group_offset,
-            group_budget=group_budget,
-        )
-        launch_stabilize_topk(
-            scores=scores,
-            merge_lengths=merge_lengths,
-            prior_ids=prior_ids,
-            eligible_counts=eligible_counts,
-            topk_values=output_values,
-            topk_group_ids=output_ids,
-            tie_counts=tie_counts,
-            greater_counts=greater_counts,
-            stable_values=stable_values,
-            stable_ids=stable_ids,
-            thresholds=thresholds,
-            greater_totals=greater_totals,
-            group_offset=group_offset,
-            group_budget=group_budget,
-        )
-        prior_values, prior_ids = output_values, output_ids
-        final_ids = output_ids
 
-    selected = selected_positions[:rows]
-    launch_expand_selected_groups(
-        topk_group_ids=final_ids,
-        eligible_counts=eligible_counts,
-        query_positions=query_positions,
-        state_errors=state_errors,
-        selected_positions=selected,
-        caps=caps,
-    )
-
-    from ._sparse_gqa import launch_sparse_paged_gqa
-
-    block_n, splits = _target_splits(caps, rows)
-    split_output = None
-    split_lse = None
-    if splits > 1:
-        split_output = partial_output_storage[: rows * splits].view(
-            rows, splits, q_heads, head_dim
+        block_n, splits = _target_splits(caps, chunk_rows)
+        split_output = partial_output_storage[: chunk_rows * splits].view(
+            chunk_rows, splits, q_heads, head_dim
         )
-        split_lse = partial_lse_storage[: rows * splits].view(rows, splits, q_heads)
-    active_output = output[:rows]
-    launch_sparse_paged_gqa(
-        query=query,
-        key_cache=main_k_cache,
-        value_cache=main_v_cache,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        block_table=main_block_table,
-        request_ids=request_ids,
-        selected_positions=selected,
-        query_positions=query_positions,
-        output=active_output,
-        partial_output=split_output,
-        partial_lse=split_lse,
-        softmax_scale=1.0 / math.sqrt(head_dim),
-        block_n=block_n,
-        splits=splits,
-    )
-    launch_poison_failed_rows(output=active_output, state_errors=state_errors)
+        split_lse = partial_lse_storage[: chunk_rows * splits].view(
+            chunk_rows, splits, q_heads
+        )
+        active_output = output[row_slice]
+        launch_sparse_paged_gqa(
+            query=query[row_slice],
+            key_cache=main_k_cache,
+            value_cache=main_v_cache,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            block_table=main_block_table,
+            request_ids=chunk_request_ids,
+            selected_positions=selected,
+            query_positions=chunk_positions,
+            output=active_output,
+            partial_output=split_output,
+            partial_lse=split_lse,
+            softmax_scale=1.0 / math.sqrt(head_dim),
+            block_n=block_n,
+            splits=splits,
+        )
+        launch_poison_failed_rows(output=active_output, state_errors=chunk_errors)
 
 
 _QSA_MUTATED_ARGUMENTS = (
@@ -1813,6 +1858,7 @@ def _qsa_decode_op(
     sequence_lengths: torch.Tensor,
     query_start_loc: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
+    is_prefilling: torch.Tensor,
     scratch: torch.Tensor,
     main_k_cache: torch.Tensor,
     main_v_cache: torch.Tensor,
@@ -1846,6 +1892,7 @@ def _qsa_decode_op(
     score_workspace_width: int,
     num_score_chunks: int,
     max_split_row_product: int,
+    workspace_q_rows: int,
     prepared_query_offset_bytes: int,
     score_offset_bytes: int,
     eligible_counts_offset_bytes: int,
@@ -1882,6 +1929,7 @@ def _qsa_decode_op(
             ("sequence_lengths", sequence_lengths),
             ("query_start_loc", query_start_loc),
             ("num_accepted_tokens", num_accepted_tokens),
+            ("is_prefilling", is_prefilling),
         ),
     )
     _qsa_decode_impl(
@@ -1894,6 +1942,7 @@ def _qsa_decode_op(
         sequence_lengths,
         query_start_loc,
         num_accepted_tokens,
+        is_prefilling,
         scratch,
         main_k_cache,
         main_v_cache,
@@ -1927,6 +1976,7 @@ def _qsa_decode_op(
         score_workspace_width,
         num_score_chunks,
         max_split_row_product,
+        workspace_q_rows,
         prepared_query_offset_bytes,
         score_offset_bytes,
         eligible_counts_offset_bytes,
@@ -1955,6 +2005,7 @@ def _qsa_decode_fake(
     sequence_lengths: torch.Tensor,
     query_start_loc: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
+    is_prefilling: torch.Tensor,
     scratch: torch.Tensor,
     main_k_cache: torch.Tensor,
     main_v_cache: torch.Tensor,
@@ -1988,6 +2039,7 @@ def _qsa_decode_fake(
     score_workspace_width: int,
     num_score_chunks: int,
     max_split_row_product: int,
+    workspace_q_rows: int,
     prepared_query_offset_bytes: int,
     score_offset_bytes: int,
     eligible_counts_offset_bytes: int,
@@ -2084,6 +2136,7 @@ def _qsa_decode_shared_op(
     sequence_lengths: torch.Tensor,
     query_start_loc: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
+    is_prefilling: torch.Tensor,
     scratch: torch.Tensor,
     main_k_cache: torch.Tensor,
     main_v_cache: torch.Tensor,
@@ -2115,6 +2168,7 @@ def _qsa_decode_shared_op(
     score_workspace_width: int,
     num_score_chunks: int,
     max_split_row_product: int,
+    workspace_q_rows: int,
     prepared_query_offset_bytes: int,
     score_offset_bytes: int,
     eligible_counts_offset_bytes: int,
@@ -2147,6 +2201,7 @@ def _qsa_decode_shared_op(
             ("sequence_lengths", sequence_lengths),
             ("query_start_loc", query_start_loc),
             ("num_accepted_tokens", num_accepted_tokens),
+            ("is_prefilling", is_prefilling),
         ),
     )
     (
@@ -2171,6 +2226,7 @@ def _qsa_decode_shared_op(
         sequence_lengths,
         query_start_loc,
         num_accepted_tokens,
+        is_prefilling,
         scratch,
         main_k_cache,
         main_v_cache,
@@ -2204,6 +2260,7 @@ def _qsa_decode_shared_op(
         score_workspace_width,
         num_score_chunks,
         max_split_row_product,
+        workspace_q_rows,
         prepared_query_offset_bytes,
         score_offset_bytes,
         eligible_counts_offset_bytes,
@@ -2232,6 +2289,7 @@ def _qsa_decode_shared_fake(
     sequence_lengths: torch.Tensor,
     query_start_loc: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
+    is_prefilling: torch.Tensor,
     scratch: torch.Tensor,
     main_k_cache: torch.Tensor,
     main_v_cache: torch.Tensor,
@@ -2263,6 +2321,7 @@ def _qsa_decode_shared_fake(
     score_workspace_width: int,
     num_score_chunks: int,
     max_split_row_product: int,
+    workspace_q_rows: int,
     prepared_query_offset_bytes: int,
     score_offset_bytes: int,
     eligible_counts_offset_bytes: int,
@@ -2293,6 +2352,7 @@ def run(
     sequence_lengths: torch.Tensor,
     query_start_loc: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
+    is_prefilling: torch.Tensor,
 ) -> torch.Tensor:
     """Run one packed QSA decode transaction after main K/V is populated.
 
@@ -2381,6 +2441,12 @@ def run(
             (int(caps.max_batch),),
             (torch.int32,),
         ),
+        (
+            is_prefilling,
+            "is_prefilling",
+            (int(caps.max_batch),),
+            (torch.bool,),
+        ),
     )
     for tensor, name, shape, dtypes in dynamic_specs:
         _check_tensor(
@@ -2427,6 +2493,7 @@ def run(
             sequence_lengths,
             query_start_loc,
             num_accepted_tokens,
+            is_prefilling,
             binding.scratch,
             binding.main_k_cache,
             binding.main_v_cache,
@@ -2458,6 +2525,7 @@ def run(
             int(binding.plan.score_workspace_width),
             int(binding.plan.num_score_chunks),
             int(binding.plan.max_split_row_product),
+            int(binding.plan.workspace_q_rows),
             int(layout.prepared_query_offset_bytes),
             int(layout.score_offset_bytes),
             int(layout.eligible_counts_offset_bytes),
@@ -2484,6 +2552,7 @@ def run(
         sequence_lengths,
         query_start_loc,
         num_accepted_tokens,
+        is_prefilling,
         binding.scratch,
         binding.main_k_cache,
         binding.main_v_cache,
@@ -2517,6 +2586,7 @@ def run(
         int(binding.plan.score_workspace_width),
         int(binding.plan.num_score_chunks),
         int(binding.plan.max_split_row_product),
+        int(binding.plan.workspace_q_rows),
         int(layout.prepared_query_offset_bytes),
         int(layout.score_offset_bytes),
         int(layout.eligible_counts_offset_bytes),
