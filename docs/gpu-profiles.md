@@ -62,6 +62,10 @@ A matching embedded entry is authoritative: invalid embedded data fails closed
 instead of falling back to a heuristic. Explicit operational modes remain
 available for qualification and emergency rollback:
 
+In AUTO mode, a device, component, or query miss logs a warning once for each
+component/device pair before using the heuristic. Explicit `HEURISTIC_ONLY`
+mode is intentional and does not warn.
+
 ```python
 from b12x.policy import PolicyContext, PolicyMode
 
@@ -89,6 +93,14 @@ provenance. It performs policy lookup only and does not allocate model weights:
 ./scripts/inspect_model_policy.py --list-models
 ./scripts/inspect_model_policy.py qwen3.8-flash-next-180b \
     --tp 1 --device gb10
+./scripts/inspect_model_policy.py deepseek-v4-flash \
+    --tp 2 --device gb10
+./scripts/inspect_model_policy.py minimax-m3 \
+    --tp 4 --device gb10
+./scripts/inspect_model_policy.py glm-5.2 \
+    --tp 8 --device gb10
+./scripts/inspect_model_policy.py glm-5.3-flash \
+    --tp 4 --device gb10
 ./scripts/inspect_model_policy.py qwen3.8-27b \
     --tp 2 --device nvidia.gb10.48sm --json
 ```
@@ -97,6 +109,23 @@ The installed command is `b12x-inspect-model-policy`. Device selection accepts
 `auto`, an embedded profile ID, or an unambiguous product-name fragment. Each
 row reports `preplanned` or `heuristic`, so uncovered shapes are visible rather
 than silently presented as tuned decisions.
+
+Preset contracts are derived from the production presets in
+`benchmarks/benchmark_moe.py` and the attention benchmark suite. GLM-5.2
+includes its DSA indexer, sparse MLA, and ModelOpt W4A8/NVFP4 MoE paths.
+GLM-5.3 Flash composes KDA, pooled DSA indexing, no-RoPE sparse MLA, mHC, and
+ModelOpt NVFP4/A16 MoE. The GLM attention presets are qualified through TP8; TP16
+would leave four local attention heads and is rejected until that kernel shape
+passes its oracle. The independent MoE corpus still covers TP1 through TP16.
+
+The catalog also includes every model profile exposed by
+`benchmark_moe.py`: Qwen3.5-397B, Nemotron Super, Nano3.5, both DSV4F weight
+recipes, MiniMax-M2.7/M3, Laguna S-2.1, DeepSeek V4 Flash, and GLM-5.1. The
+paged-attention, QSA, GDN, dense/sparse/compressed MLA, DSA/MSA indexer, and
+paged-indexer benchmark presets and default suites contribute their component
+contracts. Shape-only and historical benchmark spellings remain accepted
+aliases, while `--list-models` prints one canonical name for each deduplicated
+model.
 
 ## Generation boundary
 
@@ -120,6 +149,21 @@ serializing an unmeasured heuristic.
 Completed MoE geometries resume entirely from checkpoint metadata. Candidate
 enumeration and eligibility run on the host; a CUDA worker and expert weights
 are created lazily only when a race checkpoint is missing.
+
+Checkpoint compatibility is based on checkpoint schema, device identity,
+measurement case and candidate IDs, and timing settings. `source_revision` is
+provenance rather than a measurement input, so committing an identical source
+tree or extending a corpus does not discard unrelated measurements. A cached
+sampling protocol may satisfy a weaker requested protocol, but not the reverse.
+Discrete sweep checkpoints also carry a component-owned candidate-contract
+version. A fully compatible allocation group skips session setup and candidate
+enumeration even after unrelated source changes or a commit. Providers must
+bump that version when candidate enumeration or eligibility changes; case IDs
+independently invalidate corpus changes. Legacy checkpoints receive one
+candidate-ID comparison before being upgraded to this contract.
+Fixed-backend qualifications similarly persist the ordered probe case IDs and
+the qualified config, so changing either invalidates only that component's
+checkpoint.
 
 The built-in measured corpus covers common model geometries and TP sizes 1
 through 16,

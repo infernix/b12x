@@ -7,6 +7,7 @@ from b12x.policy.generation import (
     synthesize_integer_axis_coverage,
 )
 from b12x.policy.serialization import profile_from_dict
+from b12x.policy.types import RangeDecisionNode
 
 
 def _record(family: str, rows: int, backend: str) -> DecisionRecord:
@@ -75,6 +76,60 @@ def test_serialized_generated_tree_round_trips_through_runtime_parser() -> None:
     assert component is not None
     assert component.coverage["query_points"] == 2
     assert component.lookup({"family": "a", "rows": 5}).config["backend"] == "micro"
+
+
+def test_reducer_rle_compresses_unmarked_consecutive_integer_branches() -> None:
+    tree = build_axis_tree(
+        (_record("a", 4, "micro"), _record("a", 5, "micro")),
+        field_order=("family", "rows"),
+    )
+
+    rows = tree.branches[0][1]
+    assert isinstance(rows, RangeDecisionNode)
+    assert rows.branches[0][0].minimum == 4
+    assert rows.branches[0][0].maximum == 5
+    assert rows.lookup({"family": "a", "rows": 6}) is None
+
+
+def test_serializer_groups_exact_values_with_the_same_subtree() -> None:
+    tree = build_axis_tree(
+        (_record("a", 4, "micro"), _record("b", 4, "micro")),
+        field_order=("family", "rows"),
+    )
+
+    encoded = decision_node_to_dict(tree)
+    branches = encoded["branches"]
+    assert isinstance(branches, list)
+    assert len(branches) == 1
+    assert branches[0]["values"] == ["a", "b"]
+    assert branches[0]["node"]["kind"] == "exact"
+    assert branches[0]["node"]["field"] == "rows"
+    profile = profile_from_dict(
+        {
+            "profile_id": "nvidia.synthetic.grouped-exact",
+            "targets": [
+                {
+                    "vendor": "nvidia",
+                    "compute_capability": [12, 1],
+                    "sm_count": 48,
+                    "product_name": "Synthetic GPU",
+                }
+            ],
+            "components": [
+                {
+                    "component_id": "test.decode",
+                    "query_schema_version": 1,
+                    "config_schema_version": 1,
+                    "planner": encoded,
+                }
+            ],
+        }
+    )
+    component = profile.component("test.decode")
+    assert component is not None
+    assert component.lookup({"family": "a", "rows": 4}) is not None
+    assert component.lookup({"family": "b", "rows": 4}) is not None
+    assert component.lookup({"family": "c", "rows": 4}) is None
 
 
 def test_integer_axis_coverage_uses_nearest_valid_anchor() -> None:

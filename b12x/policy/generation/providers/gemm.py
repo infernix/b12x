@@ -276,6 +276,13 @@ class _WoProjectionProbe:
         return len(self._CASES)
 
     @property
+    def case_ids(self) -> tuple[str, ...]:
+        return tuple(
+            f"m{tokens}-tp{tp_size}"
+            for tokens, tp_size in self._CASES
+        )
+
+    @property
     def description(self) -> str:
         return "production W_o two-GEMM graph qualification over TP slices"
 

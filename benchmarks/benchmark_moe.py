@@ -468,6 +468,21 @@ MODEL_PROFILES = {
         default_quant_mode="w4a8_nvfp4",
         default_validate="none",
     ),
+    "glm53-flash-shape": ModelProfile(
+        label="GLM-5.3 Flash (shape)",
+        checkpoint_family="glm53_flash_shape",
+        default_layer_idx=3,
+        tp_size=1,
+        hf_repo_id=None,
+        default_quant_mode="w4a16",
+        default_validate="none",
+        shape=ShapeSpec(
+            hidden_size=4096,
+            intermediate_size=2048,
+            num_experts=288,
+            top_k=8,
+        ),
+    ),
     "minimax-m27": ModelProfile(
         label="MiniMax-M2.7",
         checkpoint_family="minimax_m2",

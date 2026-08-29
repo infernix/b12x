@@ -119,6 +119,7 @@ class GdnAttentionGenerator(_AttentionGenerator):
             corpus_name="gdn",
             geometry_count=len(GDN_GEOMETRIES),
             benchmark_factory=benchmark_factory or GdnBenchmarkFactory(),
+            config_schema_version=2,
         )
 
 
@@ -173,6 +174,15 @@ class _QsaProbe:
     @property
     def case_count(self) -> int:
         return len(self._CASES)
+
+    @property
+    def case_ids(self) -> tuple[str, ...]:
+        from benchmarks.benchmark_qsa import BenchmarkCase, PROFILES
+
+        return tuple(
+            BenchmarkCase(PROFILES[profile], rows, sequence).name
+            for profile, rows, sequence, _kv_dtype in self._CASES
+        )
 
     @property
     def description(self) -> str:

@@ -57,7 +57,20 @@ def _activation_mode(quant_mode: str):
         "nvfp4": fused_moe.ActivationMode.A4,
         "w4a16": fused_moe.ActivationMode.A16,
         "w4a8_mx": fused_moe.ActivationMode.A8,
+        "w4a8_nvfp4": fused_moe.ActivationMode.A8,
     }[quant_mode]
+
+
+def _benchmark_input_scale(geometry: MoePhysicalGeometry) -> float:
+    if (
+        geometry.recipe.quant_mode == "w4a16"
+        and geometry.activation == "relu2"
+        and geometry.recipe.source_format != "btx"
+    ):
+        return 2.0**-20
+    if geometry.recipe.source_format == "btx":
+        return 1.0e-2
+    return 1.0
 
 
 def _packed_weights(
@@ -377,11 +390,17 @@ def _cosine_similarity(left, right) -> float:
 
     left = left.float().flatten()
     right = right.float().flatten()
-    left_norm = float(torch.linalg.vector_norm(left))
-    right_norm = float(torch.linalg.vector_norm(right))
-    if left_norm == 0.0 or right_norm == 0.0:
+    left_scale = torch.amax(torch.abs(left))
+    right_scale = torch.amax(torch.abs(right))
+    if float(left_scale) == 0.0 or float(right_scale) == 0.0:
         return 1.0 if torch.equal(left, right) else 0.0
-    return float(torch.nn.functional.cosine_similarity(left, right, dim=0))
+    return float(
+        torch.nn.functional.cosine_similarity(
+            left / left_scale,
+            right / right_scale,
+            dim=0,
+        )
+    )
 
 
 def _finite_float_or_none(value: float) -> float | None:
@@ -699,8 +718,9 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
             device=self._device,
             dtype=self._experts.plan.activation.io_dtype,
         )
-        if self._geometry.recipe.source_format == "btx":
-            x.mul_(1.0e-2)
+        input_scale = _benchmark_input_scale(self._geometry)
+        if input_scale != 1.0:
+            x.mul_(input_scale)
         self._query_key = query_key
         self._query_inputs = _QueryInputs(
             x=x,
@@ -899,6 +919,9 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
                             "finite": finite,
                             "graph_cosine": graph_cosine_metric,
                             "implementation": prepared.actual_implementation,
+                            "input_scale": _benchmark_input_scale(
+                                self._geometry
+                            ),
                             "route_planner": prepared.route_planner,
                             "max_active_clusters": (
                                 prepared.max_active_clusters

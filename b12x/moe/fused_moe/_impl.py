@@ -3768,6 +3768,41 @@ def _derive_w4a8_weight_grids(
     return ue8m0.contiguous(), residual.view(torch.uint8).contiguous()
 
 
+def _pad_w4a8_grid_rows(
+    grid: torch.Tensor,
+    *,
+    logical_n: int,
+    is_gated: bool,
+) -> torch.Tensor:
+    padded_n = align_up(logical_n, _LEVEL_TILE_N)
+    if padded_n == logical_n:
+        return grid
+    padded_rows = 2 * padded_n if is_gated else padded_n
+    padded = grid.new_zeros((grid.shape[0], padded_rows, grid.shape[2]))
+    if is_gated:
+        padded[:, :logical_n].copy_(grid[:, :logical_n])
+        padded[:, padded_n : padded_n + logical_n].copy_(
+            grid[:, logical_n : 2 * logical_n]
+        )
+    else:
+        padded[:, :logical_n].copy_(grid)
+    return padded
+
+
+def _pad_w4a8_grid_columns(
+    grid: torch.Tensor,
+    *,
+    logical_n: int,
+    elements_per_scale: int,
+) -> torch.Tensor:
+    padded_columns = align_up(logical_n, _LEVEL_TILE_N) // elements_per_scale
+    if padded_columns == grid.shape[2]:
+        return grid
+    padded = grid.new_zeros((grid.shape[0], grid.shape[1], padded_columns))
+    padded[:, :, : grid.shape[2]].copy_(grid)
+    return padded
+
+
 def _as_e8m0_k32_grid(
     scales: torch.Tensor, rows: int, k_dim: int, *, name: str
 ) -> torch.Tensor:
@@ -4953,11 +4988,39 @@ def _get_weight_views(
     )
     if _is_w4a8_quant_mode(quant_mode):
         if quant_mode == "w4a8_nvfp4":
-            views.sfb_w13_mx, views.w13_residual = _derive_w4a8_weight_grids(
+            dynamic_w13_storage = _pad_w4a8_grid_rows(
+                w1_fp4,
+                logical_n=n,
+                is_gated=activation_spec.is_gated,
+            )
+            views.w13_fp4 = dynamic_w13_storage.permute(1, 2, 0).view(
+                torch.uint8
+            )
+            w13_mx, w13_residual = _derive_w4a8_weight_grids(
                 bs_u8, w1_n, k
             )
-            views.sfb_down_mx, views.down_residual = _derive_w4a8_weight_grids(
+            down_mx, down_residual = _derive_w4a8_weight_grids(
                 w2_blockscale.view(torch.uint8), k, n
+            )
+            views.sfb_w13_mx = _pad_w4a8_grid_rows(
+                w13_mx,
+                logical_n=n,
+                is_gated=activation_spec.is_gated,
+            )
+            views.w13_residual = _pad_w4a8_grid_rows(
+                w13_residual,
+                logical_n=n,
+                is_gated=activation_spec.is_gated,
+            )
+            views.sfb_down_mx = _pad_w4a8_grid_columns(
+                down_mx,
+                logical_n=n,
+                elements_per_scale=32,
+            )
+            views.down_residual = _pad_w4a8_grid_columns(
+                down_residual,
+                logical_n=n,
+                elements_per_scale=16,
             )
         else:
             # w4a8_mx: the checkpoint E8M0 K/32 grids feed the kernel
@@ -9266,32 +9329,54 @@ class _DynamicMoEW4A8Launch:
                 (rows_padded * (self._n + self._n // 32) // 4,), stride=(1,)
             ),
         )
+        w13_grid_rows = self._w1_n
+        down_mx_columns = self._n // 32
+        down_residual_columns = self._n // 16
+        if cutlass.const_expr(self._kernel.w4a8_residual):
+            padded_n = align_up(self._n, _LEVEL_TILE_N)
+            w13_grid_rows = (
+                2 * padded_n if self._kernel.is_gated else padded_n
+            )
+            down_mx_columns = padded_n // 32
+            down_residual_columns = padded_n // 16
         sfb_w13_mx = cute.make_tensor(
             sfb_w13_mx_ptr,
             layout=cute.make_layout(
-                (self._w1_n, self._k // 32, row_counts.shape[0]),
-                stride=(self._k // 32, 1, self._w1_n * (self._k // 32)),
+                (w13_grid_rows, self._k // 32, row_counts.shape[0]),
+                stride=(
+                    self._k // 32,
+                    1,
+                    w13_grid_rows * (self._k // 32),
+                ),
             ),
         )
         sfb_down_mx = cute.make_tensor(
             sfb_down_mx_ptr,
             layout=cute.make_layout(
-                (self._k, self._n // 32, row_counts.shape[0]),
-                stride=(self._n // 32, 1, self._k * (self._n // 32)),
+                (self._k, down_mx_columns, row_counts.shape[0]),
+                stride=(down_mx_columns, 1, self._k * down_mx_columns),
             ),
         )
         w13_residual = cute.make_tensor(
             w13_residual_ptr,
             layout=cute.make_layout(
-                (self._w1_n, self._k // 16, row_counts.shape[0]),
-                stride=(self._k // 16, 1, self._w1_n * (self._k // 16)),
+                (w13_grid_rows, self._k // 16, row_counts.shape[0]),
+                stride=(
+                    self._k // 16,
+                    1,
+                    w13_grid_rows * (self._k // 16),
+                ),
             ),
         )
         down_residual = cute.make_tensor(
             down_residual_ptr,
             layout=cute.make_layout(
-                (self._k, self._n // 16, row_counts.shape[0]),
-                stride=(self._n // 16, 1, self._k * (self._n // 16)),
+                (self._k, down_residual_columns, row_counts.shape[0]),
+                stride=(
+                    down_residual_columns,
+                    1,
+                    self._k * down_residual_columns,
+                ),
             ),
         )
         num_experts = row_counts.shape[0]
@@ -9734,12 +9819,16 @@ def _get_dynamic_kernel(
         cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
     w1_n = activation_spec.w1_rows(n)
+    dynamic_w1_n = w1_n
+    if quant_mode == "w4a8_nvfp4":
+        padded_n = align_up(n, _LEVEL_TILE_N)
+        dynamic_w1_n = 2 * padded_n if activation_spec.is_gated else padded_n
     # w6a8_mx weight tensors are the 3:4-packed FP6 bytes, so their gmem K
     # extent is 3K/4 one-byte elements (the kernel expands to full-K
     # byte-containers in smem).
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype,
-        (w1_n, 3 * k // 4 if is_w6a8 else k, E),
+        (dynamic_w1_n, 3 * k // 4 if is_w6a8 else k, E),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )

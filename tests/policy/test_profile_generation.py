@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from b12x.policy import DeviceIdentity
+from b12x.policy import ComponentPolicy, DeviceIdentity
 from b12x.policy.generation import (
     CheckpointStore,
     ComponentGenerationResult,
@@ -15,6 +15,10 @@ from b12x.policy.generation import (
     WorkEstimate,
 )
 from b12x.policy.generation.progress import NullProgressReporter
+from b12x.policy.generation.measured import (
+    GpuProbeMeasurement,
+    MeasuredPolicyGenerator,
+)
 from b12x.policy.generation.runner import (
     generate_profile_artifact,
     write_artifact_atomic,
@@ -131,3 +135,120 @@ def test_source_fingerprint_excludes_generated_profile_payloads() -> None:
     assert not _is_generated_profile_data(
         Path("b12x/policy/_profiles/data/__init__.py")
     )
+
+
+@dataclass(frozen=True)
+class _MeasuredQuery:
+    rows: int
+
+
+@dataclass(frozen=True)
+class _MeasuredConfig:
+    backend: str
+
+
+@dataclass
+class _Probe:
+    case_ids: tuple[str, ...]
+    calls: list[tuple[str, ...]]
+
+    @property
+    def case_count(self) -> int:
+        return len(self.case_ids)
+
+    @property
+    def description(self) -> str:
+        return "synthetic fixed-backend qualification"
+
+    def __call__(self, context):
+        del context
+        self.calls.append(self.case_ids)
+        return tuple(
+            GpuProbeMeasurement(
+                label=case_id,
+                latency_us=1.0,
+                correct=True,
+            )
+            for case_id in self.case_ids
+        )
+
+
+def _measured_generator(*, backend: str, probe: _Probe):
+    policy = ComponentPolicy(
+        component_id="test.measured",
+        query_schema_version=1,
+        config_schema_version=1,
+        query_fields=frozenset({"rows"}),
+        config_fields=frozenset({"backend"}),
+        encode_query=lambda query: {"rows": query.rows},
+        decode_profile=lambda payload: _MeasuredConfig(
+            backend=str(payload["backend"])
+        ),
+        heuristic=lambda _query, _device: _MeasuredConfig(backend=backend),
+        validate_config=lambda _query, _config, _device: None,
+    )
+    return MeasuredPolicyGenerator(
+        policy=policy,
+        queries=(_MeasuredQuery(rows=1),),
+        encode_config=lambda config: {"backend": config.backend},
+        probe=probe,
+    )
+
+
+def test_measured_generator_resume_tracks_case_ids_and_config(tmp_path) -> None:
+    calls = []
+    context = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="abc123",
+        settings=GenerationSettings(),
+    )
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    probe = _Probe(("case-a",), calls)
+    generator = _measured_generator(backend="fixed", probe=probe)
+
+    generator.generate(
+        context,
+        progress=NullProgressReporter(),
+        checkpoints=checkpoints,
+    )
+    generator.generate(
+        context,
+        progress=NullProgressReporter(),
+        checkpoints=checkpoints,
+    )
+    assert calls == [("case-a",)]
+
+    changed_source = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="def456",
+        settings=GenerationSettings(),
+    )
+    generator.generate(
+        changed_source,
+        progress=NullProgressReporter(),
+        checkpoints=checkpoints,
+    )
+    assert calls == [("case-a",)]
+
+    changed_probe = _Probe(("case-b",), calls)
+    _measured_generator(backend="fixed", probe=changed_probe).generate(
+        changed_source,
+        progress=NullProgressReporter(),
+        checkpoints=checkpoints,
+    )
+    _measured_generator(backend="new-fixed", probe=changed_probe).generate(
+        changed_source,
+        progress=NullProgressReporter(),
+        checkpoints=checkpoints,
+    )
+    assert calls == [("case-a",), ("case-b",), ("case-b",)]
+
+    checkpoint = checkpoints.load("test.measured", "production-qualification")
+    assert checkpoint is not None
+    assert checkpoint["schema_version"] == 2
+    assert checkpoint["case_ids"] == ["case-b"]
+    assert checkpoint["config"] == {"backend": "new-fixed"}

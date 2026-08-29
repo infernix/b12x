@@ -223,6 +223,31 @@ class KdaBinding:
     output: torch.Tensor
 
 
+def _materialize_plan(
+    caps: Caps,
+    *,
+    policy_resolution: object | None,
+) -> Plan:
+    error_code_offset_bytes = align_up(0, SCRATCH_ALIGN_BYTES)
+    cursor = error_code_offset_bytes + dtype_nbytes(torch.int32)
+    duplicate_table_offset_bytes = align_up(cursor, SCRATCH_ALIGN_BYTES)
+    duplicate_table_size = _next_power_of_two(
+        2 * caps.max_seqs * caps.state_index_columns
+    )
+    cursor = duplicate_table_offset_bytes + (
+        duplicate_table_size * dtype_nbytes(torch.int64)
+    )
+    spec = scratch_buffer_spec("gdn_decode", nbytes=cursor, device=caps.device)
+    return Plan(
+        caps=caps,
+        duplicate_table_size=duplicate_table_size,
+        duplicate_table_offset_bytes=duplicate_table_offset_bytes,
+        error_code_offset_bytes=error_code_offset_bytes,
+        _scratch_specs=(spec,),
+        policy_resolution=policy_resolution,
+    )
+
+
 def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
     """Plan GDN decode for a fixed serving capacity and state layout."""
 
@@ -245,24 +270,7 @@ def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
             state_index_columns=caps.state_index_columns,
         ),
     )
-    error_code_offset_bytes = align_up(0, SCRATCH_ALIGN_BYTES)
-    cursor = error_code_offset_bytes + dtype_nbytes(torch.int32)
-    duplicate_table_offset_bytes = align_up(cursor, SCRATCH_ALIGN_BYTES)
-    duplicate_table_size = _next_power_of_two(
-        2 * caps.max_seqs * caps.state_index_columns
-    )
-    cursor = duplicate_table_offset_bytes + (
-        duplicate_table_size * dtype_nbytes(torch.int64)
-    )
-    spec = scratch_buffer_spec("gdn_decode", nbytes=cursor, device=caps.device)
-    return Plan(
-        caps=caps,
-        duplicate_table_size=duplicate_table_size,
-        duplicate_table_offset_bytes=duplicate_table_offset_bytes,
-        error_code_offset_bytes=error_code_offset_bytes,
-        _scratch_specs=(spec,),
-        policy_resolution=resolution,
-    )
+    return _materialize_plan(caps, policy_resolution=resolution)
 
 
 def _require_tensor(

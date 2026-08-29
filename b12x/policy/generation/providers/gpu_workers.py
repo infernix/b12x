@@ -19,6 +19,7 @@ from b12x.policy.generation.sweep import (
 class _GdnBuffers:
     binding: object
     initial_state: object
+    decay_recipe: str
 
 
 def _gdn_random_tensor(
@@ -56,8 +57,13 @@ def _build_gdn_buffers(
     query_lengths = tuple(int(value) for value in raw_lengths)
     key_heads = int(case.query["key_heads"])
     value_heads = int(case.query["value_heads"])
-    if value_heads != 3 * key_heads:
+    decay_recipe = str(case.metadata.get("decay_recipe", "gdn"))
+    if decay_recipe == "gdn" and value_heads != 3 * key_heads:
         raise ValueError("Qwen GDN requires value_heads=3*key_heads")
+    if decay_recipe == "kda" and value_heads != key_heads:
+        raise ValueError("GLM KDA requires value_heads=key_heads")
+    if decay_recipe not in {"gdn", "kda"}:
+        raise ValueError(f"unknown GDN decay recipe {decay_recipe!r}")
     state_dtype = {
         "bfloat16": torch.bfloat16,
         "float32": torch.float32,
@@ -67,9 +73,13 @@ def _build_gdn_buffers(
 
     live_tokens = sum(query_lengths)
     live_sequences = len(query_lengths)
-    max_sequences = max(4, live_sequences)
-    columns = max(4, max(query_lengths))
-    max_tokens = max_sequences * columns
+    max_sequences = int(case.query["max_seqs"])
+    columns = int(case.query["state_index_columns"])
+    max_tokens = int(case.query["max_tokens"])
+    if live_sequences > max_sequences or max(query_lengths) > columns:
+        raise ValueError("GDN live shape exceeds the profiled capacity")
+    if max_tokens != max_sequences * columns:
+        raise ValueError("GDN token capacity must equal sequences times columns")
     state_slots = max_tokens + 1
     caps = gdn.Caps(
         device=device,
@@ -107,7 +117,7 @@ def _build_gdn_buffers(
         dtype=torch.int32,
         device=device,
     ).view(max_sequences, columns)
-    tensors = {
+    shared_tensors = {
         "scratch": torch.empty(
             scratch_spec.shape,
             dtype=scratch_spec.dtype,
@@ -119,37 +129,11 @@ def _build_gdn_buffers(
             generator=generator,
             dtype=torch.bfloat16,
         ),
-        "a": _gdn_random_tensor(
-            (max_tokens, value_heads),
-            device=device,
-            generator=generator,
-            dtype=torch.bfloat16,
-        ),
-        "b": _gdn_random_tensor(
-            (max_tokens, value_heads),
-            device=device,
-            generator=generator,
-            dtype=torch.bfloat16,
-        ),
         "z": _gdn_random_tensor(
             (max_tokens, value_heads, 128),
             device=device,
             generator=generator,
             dtype=torch.bfloat16,
-        ),
-        "A_log": _gdn_random_tensor(
-            (value_heads,),
-            device=device,
-            generator=generator,
-            dtype=torch.float32,
-            scale=0.1,
-        ),
-        "dt_bias": _gdn_random_tensor(
-            (value_heads,),
-            device=device,
-            generator=generator,
-            dtype=torch.float32,
-            scale=0.1,
         ),
         "norm_weight": (
             1.0
@@ -183,10 +167,72 @@ def _build_gdn_buffers(
             device=device,
         ),
     }
-    binding = gdn.bind(planned, **tensors)
+    if decay_recipe == "kda":
+        binding = gdn.bind_kda(
+            planned,
+            **shared_tensors,
+            raw_g=_gdn_random_tensor(
+                (max_tokens, key_heads, 128),
+                device=device,
+                generator=generator,
+                dtype=torch.bfloat16,
+            ),
+            raw_beta=_gdn_random_tensor(
+                (max_tokens, key_heads),
+                device=device,
+                generator=generator,
+                dtype=torch.bfloat16,
+            ),
+            A_log=_gdn_random_tensor(
+                (key_heads,),
+                device=device,
+                generator=generator,
+                dtype=torch.float32,
+                scale=0.1,
+            ),
+            dt_bias=_gdn_random_tensor(
+                (key_heads, 128),
+                device=device,
+                generator=generator,
+                dtype=torch.float32,
+                scale=0.1,
+            ),
+        )
+    else:
+        binding = gdn.bind(
+            planned,
+            **shared_tensors,
+            a=_gdn_random_tensor(
+                (max_tokens, value_heads),
+                device=device,
+                generator=generator,
+                dtype=torch.bfloat16,
+            ),
+            b=_gdn_random_tensor(
+                (max_tokens, value_heads),
+                device=device,
+                generator=generator,
+                dtype=torch.bfloat16,
+            ),
+            A_log=_gdn_random_tensor(
+                (value_heads,),
+                device=device,
+                generator=generator,
+                dtype=torch.float32,
+                scale=0.1,
+            ),
+            dt_bias=_gdn_random_tensor(
+                (value_heads,),
+                device=device,
+                generator=generator,
+                dtype=torch.float32,
+                scale=0.1,
+            ),
+        )
     return _GdnBuffers(
         binding=binding,
         initial_state=binding.recurrent_state.clone(),
+        decay_recipe=decay_recipe,
     )
 
 
@@ -196,25 +242,44 @@ def _gdn_reference(buffers: _GdnBuffers):
     binding = buffers.binding
     caps = binding.plan.caps
     state = buffers.initial_state.clone()
-    output = gdn.reference.decode(
-        binding.mixed_qkv,
-        binding.a,
-        binding.b,
-        binding.z,
-        binding.A_log,
-        binding.dt_bias,
-        binding.norm_weight,
-        state,
-        binding.query_start_loc,
-        binding.num_accepted_tokens,
-        binding.state_indices,
-        binding.num_seqs,
-        binding.num_tokens,
-        key_heads=caps.key_heads,
-        value_heads=caps.value_heads,
-        gate_activation="sigmoid",
-        qk_l2norm=True,
-    )
+    if buffers.decay_recipe == "kda":
+        output = gdn.reference.decode_kda(
+            binding.mixed_qkv,
+            binding.raw_g,
+            binding.raw_beta,
+            binding.z,
+            binding.A_log,
+            binding.dt_bias,
+            binding.norm_weight,
+            state,
+            binding.query_start_loc,
+            binding.num_accepted_tokens,
+            binding.state_indices,
+            binding.num_seqs,
+            binding.num_tokens,
+            heads=caps.key_heads,
+            qk_l2norm=True,
+        )
+    else:
+        output = gdn.reference.decode(
+            binding.mixed_qkv,
+            binding.a,
+            binding.b,
+            binding.z,
+            binding.A_log,
+            binding.dt_bias,
+            binding.norm_weight,
+            state,
+            binding.query_start_loc,
+            binding.num_accepted_tokens,
+            binding.state_indices,
+            binding.num_seqs,
+            binding.num_tokens,
+            key_heads=caps.key_heads,
+            value_heads=caps.value_heads,
+            gate_activation="sigmoid",
+            qk_l2norm=True,
+        )
     return output, state
 
 
@@ -288,7 +353,10 @@ def _cuda_event_samples_us(
 
 
 class _GdnSession(AbstractContextManager["_GdnSession"]):
-    _CANDIDATES = (SweepCandidate.create({"backend": "cutedsl"}),)
+    _CANDIDATES = {
+        "gdn": (SweepCandidate.create({"backend": "cutedsl"}),),
+        "kda": (SweepCandidate.create({"backend": "triton"}),),
+    }
 
     def __init__(self, context: GenerationContext) -> None:
         self._context = context
@@ -307,8 +375,7 @@ class _GdnSession(AbstractContextManager["_GdnSession"]):
         return None
 
     def candidates(self, case: SweepCase) -> tuple[SweepCandidate, ...]:
-        del case
-        return self._CANDIDATES
+        return self._CANDIDATES[str(case.metadata.get("decay_recipe", "gdn"))]
 
     def measure(
         self,
@@ -319,7 +386,8 @@ class _GdnSession(AbstractContextManager["_GdnSession"]):
 
         from b12x.sequence import gdn_decode as gdn
 
-        if candidates != self._CANDIDATES:
+        expected_candidates = self.candidates(case)
+        if candidates != expected_candidates:
             raise ValueError("GDN worker received an unknown candidate set")
         settings = self._context.settings
         device = torch.device("cuda", self._context.device_ordinal)
@@ -336,7 +404,10 @@ class _GdnSession(AbstractContextManager["_GdnSession"]):
                 binding.recurrent_state.copy_(buffers.initial_state)
 
             def run() -> None:
-                gdn.run(binding)
+                if buffers.decay_recipe == "kda":
+                    gdn.run_kda(binding)
+                else:
+                    gdn.run(binding)
 
             for _ in range(settings.warmup):
                 restore()
@@ -433,12 +504,10 @@ class _GdnSession(AbstractContextManager["_GdnSession"]):
 
 
 class GdnBenchmarkFactory:
-    """Allocate, capture, measure, and release one GDN geometry at a time."""
+    """Measure GDN cases independently within each corpus group."""
 
     def __call__(self, group_id, cases, context):
-        del group_id
-        if len(cases) != 1:
-            raise ValueError("each GDN allocation group must contain one case")
+        del group_id, cases
         return _GdnSession(context)
 
 
@@ -832,7 +901,6 @@ class _GqaSession(AbstractContextManager["_GqaSession"]):
                     settings,
                     pilot_us=float(start.elapsed_time(end)) * 1_000.0,
                 )
-                gc.collect()
                 allocated_before = torch.cuda.memory_allocated(device)
                 samples_us = _cuda_event_samples_us(
                     graph.replay,
@@ -879,8 +947,6 @@ class _GqaSession(AbstractContextManager["_GqaSession"]):
                 )
                 graph.reset()
                 torch.cuda.synchronize(device)
-                gc.collect()
-                torch.cuda.empty_cache()
         return tuple(measurements)
 
 

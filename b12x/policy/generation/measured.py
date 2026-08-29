@@ -73,6 +73,9 @@ class GpuQualificationProbe(Protocol):
     def case_count(self) -> int: ...
 
     @property
+    def case_ids(self) -> tuple[str, ...]: ...
+
+    @property
     def description(self) -> str: ...
 
     def __call__(
@@ -99,10 +102,19 @@ class MeasuredPolicyGenerator(Generic[QueryT, ConfigT]):
         self._queries = tuple(queries)
         self._encode_config = encode_config
         self._probe = probe
+        self._case_ids = tuple(probe.case_ids)
         if not self._queries:
             raise ValueError(f"{self.component_id} requires validation queries")
         if self._probe.case_count <= 0:
             raise ValueError(f"{self.component_id} requires GPU probe cases")
+        if len(self._case_ids) != self._probe.case_count:
+            raise ValueError(
+                f"{self.component_id} probe case IDs do not match its case count"
+            )
+        if any(not case_id for case_id in self._case_ids):
+            raise ValueError(f"{self.component_id} probe case IDs must be non-empty")
+        if len(self._case_ids) != len(set(self._case_ids)):
+            raise ValueError(f"{self.component_id} probe case IDs must be unique")
 
     def estimate(self, context: GenerationContext) -> WorkEstimate:
         del context
@@ -139,18 +151,56 @@ class MeasuredPolicyGenerator(Generic[QueryT, ConfigT]):
         self,
         context: GenerationContext,
         checkpoints: CheckpointStore,
+        encoded_config: FrozenMapping,
     ) -> tuple[GpuProbeMeasurement, ...]:
         checkpoint_id = "production-qualification"
         cached = checkpoints.load(self.component_id, checkpoint_id)
         if (
             cached is not None
-            and cached.get("generation") == context.checkpoint_metadata()
+            and cached.get("schema_version") in (1, 2)
+            and context.checkpoint_metadata_matches(cached.get("generation"))
             and cached.get("case_count") == self._probe.case_count
         ):
             raw = cached.get("measurements")
             if not isinstance(raw, list):
                 raise TypeError("GPU qualification checkpoint must contain an array")
-            return tuple(GpuProbeMeasurement.from_dict(item) for item in raw)
+            measurements = tuple(
+                GpuProbeMeasurement.from_dict(item) for item in raw
+            )
+            measured_case_ids = tuple(item.label for item in measurements)
+            raw_case_ids = cached.get("case_ids")
+            raw_config = cached.get("config")
+            case_ids_match = (
+                measured_case_ids == self._case_ids
+                and (
+                    raw_case_ids is None
+                    or raw_case_ids == list(self._case_ids)
+                )
+            )
+            config_matches = (
+                raw_config is None or raw_config == encoded_config.to_dict()
+            )
+            if case_ids_match and config_matches:
+                raw_generation = cached.get("generation")
+                if not isinstance(raw_generation, Mapping):
+                    raise TypeError(
+                        "GPU qualification generation must be an object"
+                    )
+                if (
+                    cached.get("schema_version") != 2
+                    or raw_case_ids != list(self._case_ids)
+                    or raw_config != encoded_config.to_dict()
+                ):
+                    checkpoints.save(
+                        self.component_id,
+                        checkpoint_id,
+                        self._checkpoint_payload(
+                            generation=raw_generation,
+                            encoded_config=encoded_config,
+                            measurements=measurements,
+                        ),
+                    )
+                return measurements
 
         measurements = self._probe(context)
         if len(measurements) != self._probe.case_count:
@@ -158,17 +208,37 @@ class MeasuredPolicyGenerator(Generic[QueryT, ConfigT]):
                 f"{self.component_id} GPU probe returned {len(measurements)} "
                 f"measurements, expected {self._probe.case_count}"
             )
+        measured_case_ids = tuple(item.label for item in measurements)
+        if measured_case_ids != self._case_ids:
+            raise ValueError(
+                f"{self.component_id} GPU probe returned unexpected case IDs"
+            )
         checkpoints.save(
             self.component_id,
             checkpoint_id,
-            {
-                "schema_version": 1,
-                "generation": context.checkpoint_metadata(),
-                "case_count": self._probe.case_count,
-                "measurements": [item.to_dict() for item in measurements],
-            },
+            self._checkpoint_payload(
+                generation=context.checkpoint_metadata(),
+                encoded_config=encoded_config,
+                measurements=measurements,
+            ),
         )
         return measurements
+
+    def _checkpoint_payload(
+        self,
+        *,
+        generation: Mapping[str, object],
+        encoded_config: FrozenMapping,
+        measurements: Sequence[GpuProbeMeasurement],
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 2,
+            "generation": dict(generation),
+            "case_count": self._probe.case_count,
+            "case_ids": list(self._case_ids),
+            "config": encoded_config.to_dict(),
+            "measurements": [item.to_dict() for item in measurements],
+        }
 
     def generate(
         self,
@@ -184,7 +254,7 @@ class MeasuredPolicyGenerator(Generic[QueryT, ConfigT]):
             stage="production-path GPU qualification",
             total=self._probe.case_count,
         )
-        measurements = self._measure(context, checkpoints)
+        measurements = self._measure(context, checkpoints, encoded_config)
         for measurement in measurements:
             if not measurement.correct:
                 raise RuntimeError(

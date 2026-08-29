@@ -12,11 +12,25 @@ COMMON_BATCHES = (1, 2, 4, 8, 12, 16)
 COMMON_CONTEXT_TOKENS = (128, 16_384, 32_768, 65_536, 131_072)
 COMMON_PAGE_SIZES = (64, 128)
 COMMON_KV_DTYPES = ("bfloat16", "float8_e4m3fn")
-QSA_BATCHES = (1, 4, 16)
-QSA_CONTEXT_TOKENS = (65_536, 131_072)
+QSA_BATCHES = (1, 4, 16, 64)
+QSA_CONTEXT_TOKENS = (2_048, 8_192, 32_768, 65_536, 131_072, 262_144)
 QSA_PAGE_SIZES = (16, 64)
-QSA_SPECULATIVE_TOKENS = (0, 3)
+QSA_SPECULATIVE_CONTEXT_TOKENS = (8_192, 65_536, 131_072)
 QSA_POSITION_LAYOUTS = ((1, False), (3, False), (3, True))
+
+
+@dataclass(frozen=True, kw_only=True)
+class AttentionBenchmarkPreset:
+    preset_id: str
+    component: str
+    model_id: str
+    source: str
+
+    def __post_init__(self) -> None:
+        if not self.preset_id or not self.component or not self.model_id:
+            raise ValueError("attention benchmark preset fields must be non-empty")
+        if not self.source:
+            raise ValueError("attention benchmark presets require a source")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -27,6 +41,9 @@ class GdnGeometry:
     query_lengths: tuple[int, ...]
     source: str
     state_dtype: str = "float32"
+    decay_recipe: str = "gdn"
+    capacity_seqs: tuple[int, ...] = (1, 4)
+    capacity_columns: int = 4
 
     def __post_init__(self) -> None:
         if not self.model_id or not self.source or not self.query_lengths:
@@ -35,6 +52,20 @@ class GdnGeometry:
             raise ValueError("GDN head counts must be positive")
         if any(length <= 0 for length in self.query_lengths):
             raise ValueError("GDN query lengths must be positive")
+        if not self.capacity_seqs or any(value <= 0 for value in self.capacity_seqs):
+            raise ValueError("GDN sequence capacities must be positive")
+        if len(self.capacity_seqs) != len(set(self.capacity_seqs)):
+            raise ValueError("GDN sequence capacities must be unique")
+        if self.capacity_columns < max(self.query_lengths):
+            raise ValueError("GDN column capacity must cover every query length")
+        if max(self.capacity_seqs) < len(self.query_lengths):
+            raise ValueError("GDN sequence capacity must cover the live batch")
+        if self.decay_recipe not in {"gdn", "kda"}:
+            raise ValueError("GDN decay recipe must be 'gdn' or 'kda'")
+        if self.decay_recipe == "gdn" and self.value_heads != 3 * self.key_heads:
+            raise ValueError("GDN geometries require three value heads per key head")
+        if self.decay_recipe == "kda" and self.value_heads != self.key_heads:
+            raise ValueError("KDA geometries require equal key and value heads")
 
 
 GDN_GEOMETRIES = (
@@ -102,11 +133,34 @@ GDN_GEOMETRIES = (
         source="benchmark_gdn_decode.QWEN38_GDN_CASES",
     ),
     GdnGeometry(
+        model_id="qwen3.8-flash-next-qk4-v12-spec4-bs1",
+        query_lengths=(4,),
+        key_heads=4,
+        value_heads=12,
+        source="Qwen3.8 Flash Next TP4 MTP serving capacity",
+    ),
+    GdnGeometry(
         model_id="qwen3.8-flash-next-qk2-v6-decode-bs1",
         query_lengths=(1,),
         key_heads=2,
         value_heads=6,
         source="benchmark_gdn_decode.QWEN38_GDN_CASES",
+    ),
+    *(
+        GdnGeometry(
+            model_id=(
+                f"glm-5.3-flash-kda-tp{tp_size}-"
+                f"{'decode' if query_lengths == (1,) else 'spec6'}-bs1"
+            ),
+            query_lengths=query_lengths,
+            key_heads=64 // tp_size,
+            value_heads=64 // tp_size,
+            source="GLM-5.3 Flash KDA serving geometry",
+            decay_recipe="kda",
+            capacity_columns=6,
+        )
+        for tp_size in (1, 2, 4, 8, 16)
+        for query_lengths in ((1,), (6,))
     ),
 )
 
@@ -118,6 +172,11 @@ class GqaGeometry:
     kv_heads: int
     head_dim: int
     source: str
+    kv_dtypes: tuple[str, ...] = COMMON_KV_DTYPES
+    page_sizes: tuple[int, ...] = COMMON_PAGE_SIZES
+    batch_sizes: tuple[int, ...] = COMMON_BATCHES
+    context_tokens: tuple[int, ...] = COMMON_CONTEXT_TOKENS
+    cache_layouts: tuple[str, ...] = ("separate", "combined")
 
     def __post_init__(self) -> None:
         if not self.model_id or not self.source:
@@ -126,6 +185,32 @@ class GqaGeometry:
             raise ValueError("GQA geometry values must be positive")
         if self.q_heads % self.kv_heads:
             raise ValueError("GQA query heads must be divisible by KV heads")
+        if not all(
+            (
+                self.kv_dtypes,
+                self.page_sizes,
+                self.batch_sizes,
+                self.context_tokens,
+                self.cache_layouts,
+            )
+        ):
+            raise ValueError("GQA sweep axes must be non-empty")
+
+
+def _tp_sliced_gqa_geometry(
+    *,
+    model_id: str,
+    q_heads: int,
+    kv_heads: int,
+    source: str,
+) -> GqaGeometry:
+    return GqaGeometry(
+        model_id=model_id,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        head_dim=256,
+        source=source,
+    )
 
 
 GQA_GEOMETRIES = (
@@ -136,12 +221,36 @@ GQA_GEOMETRIES = (
         head_dim=256,
         source="Qwen3.8 Flash Next text_config",
     ),
+    _tp_sliced_gqa_geometry(
+        model_id="qwen3.8-flash-next-180b-tp2",
+        q_heads=12,
+        kv_heads=1,
+        source="Qwen3.8 Flash Next tensor-parallel slicing",
+    ),
+    _tp_sliced_gqa_geometry(
+        model_id="qwen3.8-flash-next-180b-tp4",
+        q_heads=6,
+        kv_heads=1,
+        source="Qwen3.8 Flash Next tensor-parallel slicing",
+    ),
     GqaGeometry(
         model_id="qwen3.8-27b",
         q_heads=24,
         kv_heads=4,
         head_dim=256,
         source="benchmark_paged_attention.BENCHMARK_PROFILES",
+    ),
+    _tp_sliced_gqa_geometry(
+        model_id="qwen3.8-27b-tp2",
+        q_heads=12,
+        kv_heads=2,
+        source="Qwen3.8 27B tensor-parallel slicing",
+    ),
+    _tp_sliced_gqa_geometry(
+        model_id="qwen3.8-27b-tp8",
+        q_heads=3,
+        kv_heads=1,
+        source="Qwen3.8 27B tensor-parallel slicing",
     ),
     GqaGeometry(
         model_id="qwen-gqa",
@@ -156,6 +265,37 @@ GQA_GEOMETRIES = (
         kv_heads=4,
         head_dim=128,
         source="benchmark_paged_attention.BENCHMARK_PROFILES",
+    ),
+    *(
+        GqaGeometry(
+            model_id=f"minimax-m2.7-tp{tp_size}",
+            q_heads=48 // tp_size,
+            kv_heads=max(1, 8 // tp_size),
+            head_dim=128,
+            source="MiniMax-M2.7 tensor-parallel slicing",
+        )
+        for tp_size in (1, 3, 4, 6, 8, 12, 16)
+    ),
+    GqaGeometry(
+        model_id="minimax-m3",
+        q_heads=64,
+        kv_heads=4,
+        head_dim=128,
+        source="MiniMax-M3 production paged-attention benchmark contract",
+    ),
+    GqaGeometry(
+        model_id="minimax-m3-tp2",
+        q_heads=32,
+        kv_heads=2,
+        head_dim=128,
+        source="benchmark_moe MiniMax-M3 TP2 profile",
+    ),
+    GqaGeometry(
+        model_id="minimax-m3-tp4",
+        q_heads=16,
+        kv_heads=1,
+        head_dim=128,
+        source="benchmark_moe MiniMax-M3 TP4 shape profile",
     ),
 )
 
@@ -230,42 +370,170 @@ class SparseMlaGeometry:
     source: str
 
 
-SPARSE_MLA_GEOMETRIES = (
+SPARSE_MLA_GEOMETRIES = tuple(
     SparseMlaGeometry(
-        model_id="deepseek-v4-flash-swa",
+        model_id=f"deepseek-v4-flash-{contract}-h{heads}",
         layout="compressed_dsv4",
-        num_q_heads=32,
+        num_q_heads=heads,
         qk_head_dim=512,
         v_head_dim=448,
         swa_width=128,
         swa_page_size=64,
-        indexed_width=0,
-        indexed_page_size=64,
-        source="benchmark_compressed_sparse_mla.py",
+        indexed_width=indexed_width,
+        indexed_page_size=indexed_page_size,
+        source="benchmark_compressed_sparse_mla.py TP-sliced contracts",
+    )
+    for heads in (64, 32, 16, 8)
+    for contract, indexed_width, indexed_page_size in (
+        ("swa", 0, 64),
+        ("swa-c4", 512, 64),
+        ("swa-c128", 512, 2),
+    )
+)
+
+
+ATTENTION_BENCHMARK_PRESETS = (
+    AttentionBenchmarkPreset(
+        preset_id="paged:qwen3.8-27b",
+        component="attention.gqa",
+        model_id="qwen3.8-27b",
+        source="benchmark_paged_attention.BENCHMARK_PROFILES",
     ),
-    SparseMlaGeometry(
-        model_id="deepseek-v4-flash-swa-c4",
-        layout="compressed_dsv4",
-        num_q_heads=32,
-        qk_head_dim=512,
-        v_head_dim=448,
-        swa_width=128,
-        swa_page_size=64,
-        indexed_width=512,
-        indexed_page_size=64,
-        source="benchmark_compressed_sparse_mla.py",
+    AttentionBenchmarkPreset(
+        preset_id="paged:qwen-gqa",
+        component="attention.gqa",
+        model_id="qwen-gqa",
+        source="benchmark_paged_attention.BENCHMARK_PROFILES",
     ),
-    SparseMlaGeometry(
-        model_id="deepseek-v4-flash-swa-c128",
-        layout="compressed_dsv4",
-        num_q_heads=32,
-        qk_head_dim=512,
-        v_head_dim=448,
-        swa_width=128,
-        swa_page_size=64,
-        indexed_width=512,
-        indexed_page_size=2,
-        source="benchmark_compressed_sparse_mla.py",
+    AttentionBenchmarkPreset(
+        preset_id="paged:minimax-m2.7",
+        component="attention.gqa",
+        model_id="minimax-m2.7",
+        source="benchmark_paged_attention.BENCHMARK_PROFILES",
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="vllm-paged:qwen-gqa",
+        component="attention.gqa",
+        model_id="qwen-gqa",
+        source="benchmark_vllm_triton_paged_attention.PROFILES",
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="vllm-paged:minimax-m2.7",
+        component="attention.gqa",
+        model_id="minimax-m2.7",
+        source="benchmark_vllm_triton_paged_attention.PROFILES",
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="paged-msa:minimax-m3-default",
+        component="attention.gqa",
+        model_id="minimax-m3",
+        source="benchmark_paged_msa.py defaults",
+    ),
+    *(
+        AttentionBenchmarkPreset(
+            preset_id=f"qsa:{profile}",
+            component="attention.qsa",
+            model_id="qwen3.8-flash-next-180b",
+            source="benchmark_qsa.PROFILES",
+        )
+        for profile in ("tp1", "tp2", "tp4")
+    ),
+    *(
+        AttentionBenchmarkPreset(
+            preset_id=f"gdn:{case_name}",
+            component="attention.gdn",
+            model_id="qwen3.8-flash-next-180b",
+            source="benchmark_gdn_decode.QWEN38_GDN_CASES",
+        )
+        for case_name in (
+            "qk16-v48-decode-bs1",
+            "qk8-v24-decode-bs1",
+            "qk8-v24-decode-bs4",
+            "qk8-v24-spec2-bs4",
+            "qk8-v24-spec4-bs1",
+            "qk8-v24-spec4-uneven",
+            "qk8-v24-spec4-bs4",
+            "qk4-v12-decode-bs1",
+            "qk2-v6-decode-bs1",
+        )
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="dense-mla:kimi-k3",
+        component="attention.mla",
+        model_id="kimi-k3",
+        source="benchmark_dense_mla.py defaults",
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="dsa-indexer:glm-5.1-default",
+        component="attention.dsa_indexer",
+        model_id="glm-5.1",
+        source="benchmark_dsa_indexer.py defaults",
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="msa-indexer:minimax-m3-default",
+        component="attention.dsa_indexer",
+        model_id="minimax-m3",
+        source="benchmark_msa_indexer.py defaults",
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="paged-indexer:deepseek-v4-flash-default",
+        component="attention.dsa_indexer",
+        model_id="deepseek-v4-flash",
+        source="benchmark_paged_indexer.py defaults",
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="mla:glm-5.2-default",
+        component="attention.sparse_mla",
+        model_id="glm-5.2",
+        source="benchmark_mla.py defaults",
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="mla:target-prefill64k-bs1",
+        component="attention.sparse_mla",
+        model_id="glm-5.2",
+        source="benchmark_mla.TARGET_PREFILL64K_BS1_PRESET",
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="mla:target-glm52-prefill4k-ctx16k",
+        component="attention.sparse_mla",
+        model_id="glm-5.2",
+        source="benchmark_mla.TARGET_GLM52_PREFILL4K_CTX16K_PRESET",
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="mla:target-dsv4-trace",
+        component="attention.compressed_sparse_mla",
+        model_id="deepseek-v4-flash",
+        source="benchmark_mla.TARGET_DSV4_TRACE_PRESET",
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="compressed-mla:vllm-dsv4-trace",
+        component="attention.compressed_sparse_mla",
+        model_id="deepseek-v4-flash",
+        source="benchmark_compressed_sparse_mla.VLLM_DSV4_TRACE_PRESET",
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="compressed-mla:deepseek-v4-flash-default",
+        component="attention.compressed_sparse_mla",
+        model_id="deepseek-v4-flash",
+        source="benchmark_compressed_sparse_mla.py defaults",
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="unified-mla:glm-5.1-decode",
+        component="attention.sparse_mla",
+        model_id="glm-5.1",
+        source="benchmark_unified_mla_sm120.py defaults",
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="unified-mla:deepseek-v4-flash-decode",
+        component="attention.compressed_sparse_mla",
+        model_id="deepseek-v4-flash",
+        source="benchmark_unified_mla_sm120.py defaults",
+    ),
+    AttentionBenchmarkPreset(
+        preset_id="unified-mla:deepseek-v4-flash-prefill",
+        component="attention.compressed_sparse_mla",
+        model_id="deepseek-v4-flash",
+        source="benchmark_unified_mla_sm120.py defaults",
     ),
 )
 
@@ -274,45 +542,47 @@ def gdn_cases() -> tuple[SweepCase, ...]:
     cases = []
     for geometry in GDN_GEOMETRIES:
         lengths = geometry.query_lengths
-        max_seqs = len(lengths)
-        state_index_columns = max(lengths)
-        query = {
-            "gate_activation": "sigmoid",
-            "qk_l2norm": True,
-            "key_heads": geometry.key_heads,
-            "value_heads": geometry.value_heads,
-            "state_dtype": geometry.state_dtype,
-            "max_seqs": max_seqs,
-            "max_tokens": max_seqs * state_index_columns,
-            "state_index_columns": state_index_columns,
-        }
-        cases.append(
-            SweepCase.create(
-                group_id=geometry.model_id,
-                query=query,
-                metadata={
-                    "model_id": geometry.model_id,
-                    "query_lengths": list(lengths),
-                    "source": geometry.source,
-                },
-                label=geometry.model_id,
+        for max_seqs in geometry.capacity_seqs:
+            if max_seqs < len(lengths):
+                continue
+            query = {
+                "gate_activation": "sigmoid",
+                "qk_l2norm": True,
+                "key_heads": geometry.key_heads,
+                "value_heads": geometry.value_heads,
+                "state_dtype": geometry.state_dtype,
+                "max_seqs": max_seqs,
+                "max_tokens": max_seqs * geometry.capacity_columns,
+                "state_index_columns": geometry.capacity_columns,
+            }
+            cases.append(
+                SweepCase.create(
+                    group_id=geometry.model_id,
+                    query=query,
+                    metadata={
+                        "decay_recipe": geometry.decay_recipe,
+                        "model_id": geometry.model_id,
+                        "query_lengths": list(lengths),
+                        "source": geometry.source,
+                    },
+                    label=f"{geometry.model_id}-capacity-bs{max_seqs}",
+                )
             )
-        )
     return tuple(cases)
 
 
 def gqa_cases() -> tuple[SweepCase, ...]:
     cases = []
     for geometry in GQA_GEOMETRIES:
-        for kv_dtype in COMMON_KV_DTYPES:
-            for page_size in COMMON_PAGE_SIZES:
-                for batch_size in COMMON_BATCHES:
-                    for cache_tokens in COMMON_CONTEXT_TOKENS:
+        for kv_dtype in geometry.kv_dtypes:
+            for page_size in geometry.page_sizes:
+                for batch_size in geometry.batch_sizes:
+                    for cache_tokens in geometry.context_tokens:
                         group_id = (
                             f"{geometry.model_id}-{kv_dtype}-page{page_size}"
                             f"-ctx{cache_tokens}"
                         )
-                        for layout in ("separate", "combined"):
+                        for layout in geometry.cache_layouts:
                             query = {
                                 "mode": "decode",
                                 "q_dtype": "bfloat16",
@@ -344,6 +614,62 @@ def gqa_cases() -> tuple[SweepCase, ...]:
     return tuple(cases)
 
 
+def _qsa_query(
+    *,
+    geometry: QsaGeometry,
+    kv_dtype: str,
+    main_page_size: int,
+    max_batch: int,
+    max_q_rows: int,
+    max_seq_len: int,
+    max_speculative_tokens: int,
+    position_axes: int,
+    mrope_interleaved: bool,
+) -> dict[str, object]:
+    return {
+        "q_dtype": "bfloat16",
+        "kv_dtype": kv_dtype,
+        "q_heads": geometry.q_heads,
+        "kv_heads": geometry.kv_heads,
+        "head_dim": 256,
+        "index_heads": 4,
+        "index_kv_heads": 1,
+        "index_head_dim": 128,
+        "index_rotary_dim": 64,
+        "main_page_size": main_page_size,
+        "max_batch": max_batch,
+        "max_q_rows": max_q_rows,
+        "max_seq_len": max_seq_len,
+        "max_speculative_tokens": max_speculative_tokens,
+        "compress_ratio": 4,
+        "budget": 2_048,
+        "position_axes": position_axes,
+        "mrope_interleaved": mrope_interleaved,
+    }
+
+
+def _qsa_case(
+    *,
+    geometry: QsaGeometry,
+    query: dict[str, object],
+    label_suffix: str,
+) -> SweepCase:
+    group_id = (
+        f"{geometry.model_id}-{query['kv_dtype']}-page{query['main_page_size']}"
+        f"-ctx{query['max_seq_len']}"
+    )
+    return SweepCase.create(
+        group_id=group_id,
+        query=query,
+        metadata={
+            "model_id": geometry.model_id,
+            "source": geometry.source,
+            "tensor_parallel_size": geometry.tensor_parallel_size,
+        },
+        label=f"{geometry.model_id}-{label_suffix}",
+    )
+
+
 def qsa_cases() -> tuple[SweepCase, ...]:
     cases = []
     for geometry in QSA_GEOMETRIES:
@@ -351,50 +677,45 @@ def qsa_cases() -> tuple[SweepCase, ...]:
             for main_page_size in QSA_PAGE_SIZES:
                 for max_batch in QSA_BATCHES:
                     for max_seq_len in QSA_CONTEXT_TOKENS:
-                        for max_speculative_tokens in QSA_SPECULATIVE_TOKENS:
-                            for (
-                                position_axes,
-                                mrope_interleaved,
-                            ) in QSA_POSITION_LAYOUTS:
-                                max_q_rows = max_batch * (1 + max_speculative_tokens)
-                                group_id = (
-                                    f"{geometry.model_id}-{kv_dtype}"
-                                    f"-page{main_page_size}-ctx{max_seq_len}"
+                        for position_axes, mrope_interleaved in QSA_POSITION_LAYOUTS:
+                            query = _qsa_query(
+                                geometry=geometry,
+                                kv_dtype=kv_dtype,
+                                main_page_size=main_page_size,
+                                max_batch=max_batch,
+                                max_q_rows=max_batch,
+                                max_seq_len=max_seq_len,
+                                max_speculative_tokens=0,
+                                position_axes=position_axes,
+                                mrope_interleaved=mrope_interleaved,
+                            )
+                            cases.append(
+                                _qsa_case(
+                                    geometry=geometry,
+                                    query=query,
+                                    label_suffix="throughput",
                                 )
-                                query = {
-                                    "q_dtype": "bfloat16",
-                                    "kv_dtype": kv_dtype,
-                                    "q_heads": geometry.q_heads,
-                                    "kv_heads": geometry.kv_heads,
-                                    "head_dim": 256,
-                                    "index_heads": 4,
-                                    "index_kv_heads": 1,
-                                    "index_head_dim": 128,
-                                    "index_rotary_dim": 64,
-                                    "main_page_size": main_page_size,
-                                    "max_batch": max_batch,
-                                    "max_q_rows": max_q_rows,
-                                    "max_seq_len": max_seq_len,
-                                    "max_speculative_tokens": (max_speculative_tokens),
-                                    "compress_ratio": 4,
-                                    "budget": 2048,
-                                    "position_axes": position_axes,
-                                    "mrope_interleaved": mrope_interleaved,
-                                }
-                                cases.append(
-                                    SweepCase.create(
-                                        group_id=group_id,
-                                        query=query,
-                                        metadata={
-                                            "model_id": geometry.model_id,
-                                            "source": geometry.source,
-                                            "tensor_parallel_size": (
-                                                geometry.tensor_parallel_size
-                                            ),
-                                        },
-                                        label=geometry.model_id,
-                                    )
-                                )
+                            )
+                for max_seq_len in QSA_SPECULATIVE_CONTEXT_TOKENS:
+                    for position_axes, mrope_interleaved in QSA_POSITION_LAYOUTS:
+                        query = _qsa_query(
+                            geometry=geometry,
+                            kv_dtype=kv_dtype,
+                            main_page_size=main_page_size,
+                            max_batch=1,
+                            max_q_rows=4,
+                            max_seq_len=max_seq_len,
+                            max_speculative_tokens=3,
+                            position_axes=position_axes,
+                            mrope_interleaved=mrope_interleaved,
+                        )
+                        cases.append(
+                            _qsa_case(
+                                geometry=geometry,
+                                query=query,
+                                label_suffix="speculative",
+                            )
+                        )
     return tuple(cases)
 
 
@@ -477,6 +798,7 @@ def sparse_mla_cases() -> tuple[SweepCase, ...]:
 
 def _manifest_payload(component: str) -> dict[str, object]:
     shared = {
+        "benchmark_presets": [asdict(item) for item in ATTENTION_BENCHMARK_PRESETS],
         "common_batches": list(COMMON_BATCHES),
         "common_context_tokens": list(COMMON_CONTEXT_TOKENS),
         "common_kv_dtypes": list(COMMON_KV_DTYPES),
@@ -492,7 +814,9 @@ def _manifest_payload(component: str) -> dict[str, object]:
         shared["qsa_context_tokens"] = list(QSA_CONTEXT_TOKENS)
         shared["qsa_page_sizes"] = list(QSA_PAGE_SIZES)
         shared["qsa_position_layouts"] = [list(item) for item in QSA_POSITION_LAYOUTS]
-        shared["qsa_speculative_tokens"] = list(QSA_SPECULATIVE_TOKENS)
+        shared["qsa_speculative_context_tokens"] = list(
+            QSA_SPECULATIVE_CONTEXT_TOKENS
+        )
     elif component == "mla":
         shared["geometries"] = [asdict(item) for item in MLA_GEOMETRIES]
     elif component == "sparse_mla":
@@ -510,6 +834,8 @@ def attention_corpus_manifest(component: str) -> dict[str, object]:
 
 
 __all__ = [
+    "ATTENTION_BENCHMARK_PRESETS",
+    "AttentionBenchmarkPreset",
     "COMMON_BATCHES",
     "COMMON_CONTEXT_TOKENS",
     "COMMON_KV_DTYPES",
@@ -522,7 +848,7 @@ __all__ = [
     "QSA_CONTEXT_TOKENS",
     "QSA_PAGE_SIZES",
     "QSA_POSITION_LAYOUTS",
-    "QSA_SPECULATIVE_TOKENS",
+    "QSA_SPECULATIVE_CONTEXT_TOKENS",
     "SPARSE_MLA_GEOMETRIES",
     "attention_corpus_manifest",
     "gdn_cases",

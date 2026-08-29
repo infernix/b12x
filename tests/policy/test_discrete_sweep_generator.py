@@ -25,8 +25,13 @@ _DEVICE = DeviceIdentity(
 
 
 class _Session(AbstractContextManager["_Session"]):
-    def __init__(self, calls: list[str]) -> None:
+    def __init__(
+        self,
+        calls: list[str],
+        candidate_calls: list[str],
+    ) -> None:
         self._calls = calls
+        self._candidate_calls = candidate_calls
         self._candidates = (
             SweepCandidate.create({"backend": "left"}),
             SweepCandidate.create({"backend": "right"}),
@@ -39,7 +44,7 @@ class _Session(AbstractContextManager["_Session"]):
         return None
 
     def candidates(self, case):
-        del case
+        self._candidate_calls.append(case.case_id)
         return self._candidates
 
     def measure(self, case, candidates):
@@ -67,10 +72,13 @@ class _Session(AbstractContextManager["_Session"]):
 @dataclass
 class _Factory:
     calls: list[str]
+    candidate_calls: list[str]
+    session_calls: list[str]
 
     def __call__(self, group_id, cases, context):
-        del group_id, cases, context
-        return _Session(self.calls)
+        self.session_calls.append(group_id)
+        del cases, context
+        return _Session(self.calls, self.candidate_calls)
 
 
 def _cases():
@@ -88,6 +96,8 @@ def _cases():
 
 def test_discrete_sweep_reduces_scenarios_and_resumes(tmp_path) -> None:
     calls = []
+    candidate_calls = []
+    session_calls = []
     generator = DiscreteSweepGenerator(
         component_id="test.attention",
         query_schema_version=1,
@@ -95,7 +105,7 @@ def test_discrete_sweep_reduces_scenarios_and_resumes(tmp_path) -> None:
         query_fields=("family", "rows"),
         range_fields=frozenset({"rows"}),
         cases=_cases(),
-        benchmark_factory=_Factory(calls),
+        benchmark_factory=_Factory(calls, candidate_calls, session_calls),
         coverage={"corpus_sha256": "synthetic"},
     )
     context = GenerationContext(
@@ -121,10 +131,41 @@ def test_discrete_sweep_reduces_scenarios_and_resumes(tmp_path) -> None:
 
     assert first_call_count == 4
     assert len(calls) == first_call_count
+    assert len(candidate_calls) == first_call_count
+    assert len(session_calls) == 1
     assert result.component == resumed.component
 
-    changed_context = replace(
+    source_changed_context = replace(
         context,
+        source_revision="def456",
+        settings=GenerationSettings(warmup=1, repetitions=3, groups=3),
+    )
+    generator.generate(
+        source_changed_context,
+        progress=NullProgressReporter(),
+        checkpoints=checkpoints,
+    )
+    assert len(calls) == first_call_count
+    assert len(candidate_calls) == first_call_count
+    assert len(session_calls) == 1
+    checkpoint = checkpoints.load("test.attention", _cases()[0].case_id)
+    assert checkpoint is not None
+    generation = checkpoint["generation"]
+    assert isinstance(generation, dict)
+    assert generation["source_revision"] == "abc123"
+    assert generation["settings"] == context.settings.to_dict()
+
+    generator.generate(
+        source_changed_context,
+        progress=NullProgressReporter(),
+        checkpoints=checkpoints,
+    )
+    assert len(calls) == first_call_count
+    assert len(candidate_calls) == first_call_count
+    assert len(session_calls) == 1
+
+    changed_context = replace(
+        source_changed_context,
         settings=GenerationSettings(repetitions=31),
     )
     generator.generate(
@@ -133,6 +174,28 @@ def test_discrete_sweep_reduces_scenarios_and_resumes(tmp_path) -> None:
         checkpoints=checkpoints,
     )
     assert len(calls) == 2 * first_call_count
+    assert len(candidate_calls) == 2 * first_call_count
+    assert len(session_calls) == 2
+
+    changed_contract = DiscreteSweepGenerator(
+        component_id="test.attention",
+        query_schema_version=1,
+        config_schema_version=1,
+        query_fields=("family", "rows"),
+        range_fields=frozenset({"rows"}),
+        cases=_cases(),
+        benchmark_factory=_Factory(calls, candidate_calls, session_calls),
+        coverage={"corpus_sha256": "synthetic"},
+        candidate_contract_version=2,
+    )
+    changed_contract.generate(
+        changed_context,
+        progress=NullProgressReporter(),
+        checkpoints=checkpoints,
+    )
+    assert len(calls) == 3 * first_call_count
+    assert len(candidate_calls) == 3 * first_call_count
+    assert len(session_calls) == 3
     profile = profile_from_dict(
         {
             "profile_id": "nvidia.synthetic.48sm",

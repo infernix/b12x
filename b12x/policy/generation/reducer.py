@@ -80,31 +80,35 @@ def _build_node(
         )
         for value, group in grouped.items()
     }
-    if field not in range_fields:
-        branches = tuple(
-            (value, children[value])
-            for value in sorted(
-                children, key=lambda item: (type(item).__name__, repr(item))
-            )
-        )
-        return ExactDecisionNode(field=field, branches=branches)
-
     values = tuple(children)
-    if any(not isinstance(value, int) or isinstance(value, bool) for value in values):
+    integer_axis = all(
+        isinstance(value, int) and not isinstance(value, bool) for value in values
+    )
+    if field in range_fields and not integer_axis:
         raise TypeError(f"range field {field!r} must contain only integers")
-    ranges: list[tuple[MatchRange, DecisionNode]] = []
-    for value in sorted(values):
-        child = children[value]
-        if ranges:
-            previous, previous_child = ranges[-1]
-            if value == previous.maximum + 1 and child == previous_child:
-                ranges[-1] = (
-                    MatchRange(previous.minimum, value),
-                    previous_child,
-                )
-                continue
-        ranges.append((MatchRange(value, value), child))
-    return RangeDecisionNode(field=field, branches=tuple(ranges))
+    if integer_axis:
+        ranges: list[tuple[MatchRange, DecisionNode]] = []
+        for value in sorted(values):
+            child = children[value]
+            if ranges:
+                previous, previous_child = ranges[-1]
+                if value == previous.maximum + 1 and child == previous_child:
+                    ranges[-1] = (
+                        MatchRange(previous.minimum, value),
+                        previous_child,
+                    )
+                    continue
+            ranges.append((MatchRange(value, value), child))
+        if field in range_fields or len(ranges) < len(values):
+            return RangeDecisionNode(field=field, branches=tuple(ranges))
+
+    branches = tuple(
+        (value, children[value])
+        for value in sorted(
+            children, key=lambda item: (type(item).__name__, repr(item))
+        )
+    )
+    return ExactDecisionNode(field=field, branches=branches)
 
 
 def build_axis_tree(
@@ -230,15 +234,20 @@ def decision_node_to_dict(node: DecisionNode) -> dict[str, object]:
             result["evidence"] = node.evidence
         return result
     if isinstance(node, ExactDecisionNode):
+        grouped: dict[DecisionNode, list[object]] = {}
+        for value, child in node.branches:
+            grouped.setdefault(child, []).append(value)
         result = {
             "kind": "exact",
             "field": node.field,
             "branches": [
                 {
-                    "value": value,
+                    ("value" if len(values) == 1 else "values"): (
+                        values[0] if len(values) == 1 else values
+                    ),
                     "node": decision_node_to_dict(child),
                 }
-                for value, child in node.branches
+                for child, values in grouped.items()
             ],
         }
         if node.default is not None:

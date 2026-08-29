@@ -80,6 +80,11 @@ integrator-facing sequence and `b12x/policy/` for the contracts.
   production plans; single-implementation components must qualify that path on
   the GPU before emitting a profile. A completed profile may not contain a
   zero-measurement or precomputed provider.
+- Resumable discrete sweeps own a positive `candidate_contract_version`. Bump
+  it whenever candidate enumeration or eligibility changes; corpus changes are
+  independently invalidated by case IDs. Fixed-backend probes must expose
+  stable, ordered case IDs, and their checkpoints must bind those IDs to the
+  qualified serialized config.
 - Tests must keep planned-op metadata, catalog registrations, generators, and
   every embedded profile in lockstep. Cover a recognized GPU resolving to
   `PREPLANNED`, an unknown synthetic GPU resolving to `HEURISTIC`, invalid

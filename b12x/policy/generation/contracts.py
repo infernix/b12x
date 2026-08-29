@@ -67,6 +67,42 @@ class GenerationContext:
             "settings": self.settings.to_dict(),
         }
 
+    def checkpoint_metadata_matches(self, value: object) -> bool:
+        """Return whether measurements can be resumed in this context.
+
+        Source revision is retained for provenance, but is not a measurement
+        input. Case IDs, candidate IDs, checkpoint schema, device identity, and
+        timing settings independently invalidate incompatible measurements.
+        A cached sampling protocol may exceed the requested sampling strength.
+        """
+
+        if not isinstance(value, Mapping):
+            return False
+        expected = self.checkpoint_metadata()
+        if value.get("device") != expected["device"]:
+            return False
+        cached_settings = value.get("settings")
+        requested_settings = expected["settings"]
+        if not isinstance(cached_settings, Mapping):
+            return False
+        if set(cached_settings) != set(requested_settings):
+            return False
+        if any(
+            cached_settings[field] != requested_settings[field]
+            for field in ("seed", "cold_l2")
+        ):
+            return False
+        return all(
+            cached_settings[field] >= requested_settings[field]
+            for field in (
+                "warmup",
+                "repetitions",
+                "groups",
+                "minimum_cosine",
+                "max_candidate_seconds",
+            )
+        )
+
 
 @dataclass(frozen=True, kw_only=True)
 class WorkEstimate:

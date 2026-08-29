@@ -413,7 +413,7 @@ def _make_qwen_binding(
     null_state_index: int | None,
     duplicate_table_size: int,
 ):
-    from ._impl import Binding, Caps, plan
+    from ._impl import Binding, Caps, _materialize_plan
 
     caps = Caps(
         device=mixed_qkv.device,
@@ -431,7 +431,7 @@ def _make_qwen_binding(
         qk_l2norm=qk_l2norm,
         null_state_index=null_state_index,
     )
-    launch_plan = plan(caps)
+    launch_plan = _materialize_plan(caps, policy_resolution=None)
     if launch_plan.duplicate_table_size != duplicate_table_size:
         raise ValueError("GDN duplicate-table capacity does not match the plan")
     return Binding(

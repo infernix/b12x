@@ -27,6 +27,8 @@ from b12x.policy.generation.providers.moe import (
 )
 from b12x.policy.generation.providers.moe_gpu_worker import (
     MoeGpuBenchmarkFactory,
+    _activation_mode,
+    _benchmark_input_scale,
     _candidate_reference_output,
     _cosine_similarity,
     _finite_float_or_none,
@@ -46,6 +48,23 @@ _DEVICE = DeviceIdentity(
     sm_count=48,
     product_name="Synthetic GPU",
 )
+
+
+def test_modelopt_w4a8_profile_worker_uses_a8_activation() -> None:
+    from b12x.moe import fused_moe
+
+    assert _activation_mode("w4a8_nvfp4") is fused_moe.ActivationMode.A8
+
+
+def test_relu2_w4a16_profile_fixture_conditions_synthetic_inputs() -> None:
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.recipe_id == "modelopt-w4a16"
+        and geometry.activation == "relu2"
+    )
+
+    assert _benchmark_input_scale(geometry) == 2.0**-20
 
 
 class _Session(AbstractContextManager["_Session"]):
@@ -235,6 +254,12 @@ def test_moe_zero_outputs_have_defined_correctness_cosine() -> None:
 
     assert _cosine_similarity(zeros, zeros.clone()) == 1.0
     assert _cosine_similarity(zeros, torch.ones(8)) == 0.0
+
+
+def test_moe_cosine_does_not_overflow_on_large_finite_outputs() -> None:
+    large = torch.full((8_192,), 1.0e30)
+
+    assert _cosine_similarity(large, large.clone()) == pytest.approx(1.0)
 
 
 def test_moe_nonfinite_diagnostics_are_strict_json_values() -> None:

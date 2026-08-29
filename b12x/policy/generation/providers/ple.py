@@ -30,6 +30,12 @@ class _PleLayerProbe:
         return len(LAYER_PROFILES)
 
     @property
+    def case_ids(self) -> tuple[str, ...]:
+        from benchmarks.benchmark_ple import LAYER_PROFILES
+
+        return tuple(profile.name for profile in LAYER_PROFILES)
+
+    @property
     def description(self) -> str:
         return "production PLE layer graph qualification for every execution mode"
 
@@ -89,6 +95,12 @@ class _PleHashProbe:
         from benchmarks.benchmark_ple import PACKED_PROFILES
 
         return len(PACKED_PROFILES)
+
+    @property
+    def case_ids(self) -> tuple[str, ...]:
+        from benchmarks.benchmark_ple import PACKED_PROFILES
+
+        return tuple(profile.name for profile in PACKED_PROFILES)
 
     @property
     def description(self) -> str:
@@ -153,6 +165,15 @@ class _PleEmbeddingProbe:
     def case_count(self) -> int:
         return len(self._PROFILES) * len(self._QUANT_MODES) * len(
             self._TABLE_MEMORIES
+        )
+
+    @property
+    def case_ids(self) -> tuple[str, ...]:
+        return tuple(
+            f"{profile}-{quant_mode}-{table_memory}"
+            for profile in self._PROFILES
+            for quant_mode in self._QUANT_MODES
+            for table_memory in self._TABLE_MEMORIES
         )
 
     @property

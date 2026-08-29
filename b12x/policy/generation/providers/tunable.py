@@ -33,7 +33,7 @@ def _nvfp4_cases() -> tuple[SweepCase, ...]:
             },
         )
         for rows in (128, 512, 2_048)
-        for columns in (2_560, 4_096, 7_168, 10_240)
+        for columns in (2_560, 4_096, 5_120, 7_168, 10_240)
     )
 
 

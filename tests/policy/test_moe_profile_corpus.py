@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from benchmarks.benchmark_moe import MODEL_PROFILES
 from b12x.policy.generation.moe_corpus import (
     COMMON_MOE_MODELS,
     COMMON_ROUTE_PATTERNS,
     COMMON_TP_SIZES,
+    MOE_BENCHMARK_PRESETS,
+    MOE_RECIPES,
     MoeModelGeometry,
     MoeRecipe,
     corpus_manifest,
@@ -177,8 +180,56 @@ def test_default_sweep_has_stable_complete_cross_product() -> None:
     geometries = expand_physical_geometries()
     cases = expand_sweep_cases(geometries=geometries)
 
-    assert len(geometries) == 170
-    assert len(cases) == 65_280
+    assert len(geometries) == 253
+    assert len(cases) == 97_872
     assert {case.route_pattern for case in cases} == set(COMMON_ROUTE_PATTERNS)
     assert len({case.case_id for case in cases}) == len(cases)
     assert len(corpus_manifest()["corpus_sha256"]) == 64
+
+
+def test_glm_benchmark_recipes_expand_across_all_profiled_tp_sizes() -> None:
+    geometries = expand_physical_geometries()
+    covered = {
+        (alias.model_id, geometry.recipe.quant_mode, alias.tp_size)
+        for geometry in geometries
+        for alias in geometry.aliases
+        if alias.model_id.startswith("glm-")
+    }
+
+    for tp_size in COMMON_TP_SIZES:
+        assert ("glm-5.2", "w4a8_nvfp4", tp_size) in covered
+        assert ("glm-5.3-flash", "nvfp4", tp_size) in covered
+        assert ("glm-5.3-flash", "w4a16", tp_size) in covered
+
+
+def test_moe_benchmark_preset_catalog_is_fully_mapped_to_the_corpus() -> None:
+    expected = {
+        "deepseek-v4-flash",
+        "dsv4f",
+        "dsv4f-nvfp4",
+        "glm51",
+        "glm52",
+        "glm53-flash-shape",
+        "laguna-s21-shape",
+        "minimax-m27",
+        "minimax-m3",
+        "minimax-m3-shape",
+        "nano35-w4a16",
+        "nano35-w4a16-shape",
+        "nemotron-backbone",
+        "qwen38-flash-next",
+        "qwen38-flash-next-shape",
+        "qwen397b",
+    }
+    assert set(MODEL_PROFILES) == expected
+    assert {preset.preset_id for preset in MOE_BENCHMARK_PRESETS} == expected
+    models = {model.model_id: model for model in COMMON_MOE_MODELS}
+    recipes = {recipe.recipe_id: recipe for recipe in MOE_RECIPES}
+    for preset in MOE_BENCHMARK_PRESETS:
+        assert preset.model_id in models
+        assert preset.recipe_id in models[preset.model_id].recipe_ids
+        benchmark = MODEL_PROFILES[preset.preset_id]
+        assert preset.tp_size == benchmark.tp_size
+        assert recipes[preset.recipe_id].quant_mode == (
+            benchmark.default_quant_mode or "nvfp4"
+        )

@@ -8,7 +8,7 @@ import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import ContextManager, Protocol
+from typing import ContextManager, Protocol, cast
 
 from b12x.policy.types import FrozenMapping
 
@@ -152,6 +152,14 @@ class SweepMeasurement:
         )
 
 
+@dataclass(frozen=True, kw_only=True)
+class _CachedSweepMeasurements:
+    generation: Mapping[str, object]
+    candidate_ids: tuple[str, ...]
+    measurements: tuple[SweepMeasurement, ...]
+    checkpoint_schema_version: int
+
+
 class SweepSession(Protocol):
     """Stable-allocation measurement session for one case group."""
 
@@ -180,7 +188,12 @@ def _query_key(case: SweepCase, fields: tuple[str, ...]) -> tuple[object, ...]:
 
 
 class DiscreteSweepGenerator:
-    """Generate one planner from correctness-gated component measurements."""
+    """Generate one planner from correctness-gated component measurements.
+
+    Providers must bump ``candidate_contract_version`` when candidate
+    enumeration or eligibility changes. Case IDs independently version the
+    measured corpus.
+    """
 
     def __init__(
         self,
@@ -193,6 +206,7 @@ class DiscreteSweepGenerator:
         cases: Sequence[SweepCase],
         benchmark_factory: SweepBenchmarkFactory,
         coverage: Mapping[str, object],
+        candidate_contract_version: int = 1,
     ) -> None:
         self.component_id = component_id
         self.query_schema_version = int(query_schema_version)
@@ -202,6 +216,7 @@ class DiscreteSweepGenerator:
         self._cases = tuple(cases)
         self._benchmark_factory = benchmark_factory
         self._coverage = FrozenMapping(coverage)
+        self._candidate_contract_version = int(candidate_contract_version)
         if not self._cases:
             raise ValueError(f"{component_id} requires at least one sweep case")
         if not self._query_fields or len(self._query_fields) != len(
@@ -215,6 +230,8 @@ class DiscreteSweepGenerator:
             raise ValueError("sweep case query fields differ from the component schema")
         if len({case.case_id for case in self._cases}) != len(self._cases):
             raise ValueError("sweep case IDs must be unique")
+        if self._candidate_contract_version <= 0:
+            raise ValueError("candidate_contract_version must be positive")
 
     def estimate(self, context: GenerationContext) -> WorkEstimate:
         del context
@@ -244,24 +261,38 @@ class DiscreteSweepGenerator:
         session: SweepSession,
         context: GenerationContext,
         checkpoints: CheckpointStore,
+        cached: _CachedSweepMeasurements | None = None,
     ) -> tuple[SweepMeasurement, ...]:
+        if cached is None:
+            cached = self._load_checkpoint(
+                case=case,
+                context=context,
+                checkpoints=checkpoints,
+            )
+        if cached is not None and self._checkpoint_is_current(cached):
+            return cached.measurements
+
         candidates = session.candidates(case)
         if not candidates:
             raise RuntimeError(f"no candidates were produced for {case.case_id}")
         candidate_ids = [candidate.candidate_id for candidate in candidates]
         if len(candidate_ids) != len(set(candidate_ids)):
             raise ValueError(f"candidate IDs are not unique for {case.case_id}")
-        cached = checkpoints.load(self.component_id, case.case_id)
         if (
             cached is not None
-            and cached.get("generation") == context.checkpoint_metadata()
-            and cached.get("case_id") == case.case_id
-            and cached.get("candidate_ids") == candidate_ids
+            and cached.candidate_ids == tuple(candidate_ids)
         ):
-            raw = cached.get("measurements")
-            if not isinstance(raw, list):
-                raise TypeError("sweep checkpoint measurements must be an array")
-            return tuple(SweepMeasurement.from_dict(item) for item in raw)
+            checkpoints.save(
+                self.component_id,
+                case.case_id,
+                self._checkpoint_payload(
+                    case=case,
+                    generation=cached.generation,
+                    candidate_ids=candidate_ids,
+                    measurements=cached.measurements,
+                ),
+            )
+            return cached.measurements
 
         measurements = session.measure(case, candidates)
         measured_ids = [item.candidate.candidate_id for item in measurements]
@@ -272,19 +303,96 @@ class DiscreteSweepGenerator:
         checkpoints.save(
             self.component_id,
             case.case_id,
-            {
-                "schema_version": 1,
-                "generation": context.checkpoint_metadata(),
-                "case_id": case.case_id,
-                "group_id": case.group_id,
-                "query": case.query.to_dict(),
-                "scenario": case.scenario,
-                "metadata": case.metadata.to_dict(),
-                "candidate_ids": candidate_ids,
-                "measurements": [item.to_dict() for item in measurements],
-            },
+            self._checkpoint_payload(
+                case=case,
+                generation=context.checkpoint_metadata(),
+                candidate_ids=candidate_ids,
+                measurements=measurements,
+            ),
         )
         return measurements
+
+    def _load_checkpoint(
+        self,
+        *,
+        case: SweepCase,
+        context: GenerationContext,
+        checkpoints: CheckpointStore,
+    ) -> _CachedSweepMeasurements | None:
+        cached = checkpoints.load(self.component_id, case.case_id)
+        schema_version = None if cached is None else cached.get("schema_version")
+        if (
+            cached is None
+            or schema_version not in (1, 2)
+            or not context.checkpoint_metadata_matches(cached.get("generation"))
+            or cached.get("case_id") != case.case_id
+            or (
+                schema_version == 2
+                and cached.get("candidate_contract_version")
+                != self._candidate_contract_version
+            )
+        ):
+            return None
+        raw_candidate_ids = cached.get("candidate_ids")
+        raw_measurements = cached.get("measurements")
+        raw_generation = cached.get("generation")
+        if not isinstance(raw_candidate_ids, list) or not all(
+            isinstance(candidate_id, str) for candidate_id in raw_candidate_ids
+        ):
+            raise TypeError("sweep checkpoint candidate IDs must be an array")
+        if not isinstance(raw_measurements, list):
+            raise TypeError("sweep checkpoint measurements must be an array")
+        if not isinstance(raw_generation, Mapping):
+            raise TypeError("sweep checkpoint generation must be an object")
+        measurements = tuple(
+            SweepMeasurement.from_dict(item) for item in raw_measurements
+        )
+        candidate_ids = tuple(raw_candidate_ids)
+        measured_ids = tuple(
+            item.candidate.candidate_id for item in measurements
+        )
+        if measured_ids != candidate_ids:
+            raise ValueError(
+                "sweep checkpoint measurements do not match candidate IDs"
+            )
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("sweep checkpoint candidate IDs are not unique")
+        return _CachedSweepMeasurements(
+            generation=raw_generation,
+            candidate_ids=candidate_ids,
+            measurements=measurements,
+            checkpoint_schema_version=int(schema_version),
+        )
+
+    def _checkpoint_is_current(
+        self,
+        cached: _CachedSweepMeasurements | None,
+    ) -> bool:
+        return (
+            cached is not None
+            and cached.checkpoint_schema_version == 2
+        )
+
+    def _checkpoint_payload(
+        self,
+        *,
+        case: SweepCase,
+        generation: Mapping[str, object],
+        candidate_ids: Sequence[str],
+        measurements: Sequence[SweepMeasurement],
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 2,
+            "candidate_contract_version": self._candidate_contract_version,
+            "generation": dict(generation),
+            "case_id": case.case_id,
+            "group_id": case.group_id,
+            "query": case.query.to_dict(),
+            "scenario": case.scenario,
+            "metadata": case.metadata.to_dict(),
+            "candidate_ids": list(candidate_ids),
+            "measurements": [item.to_dict() for item in measurements],
+        }
 
     def generate(
         self,
@@ -311,32 +419,71 @@ class DiscreteSweepGenerator:
                 units=0,
                 detail=f"prepare {group_id}",
             )
-            with self._benchmark_factory(group_id, group_cases, context) as session:
+            cached_by_case = {
+                case.case_id: self._load_checkpoint(
+                    case=case,
+                    context=context,
+                    checkpoints=checkpoints,
+                )
+                for case in group_cases
+            }
+            if all(
+                self._checkpoint_is_current(
+                    cached_by_case[case.case_id],
+                )
+                for case in group_cases
+            ):
+                group_measurements = []
                 for case in group_cases:
+                    cached = cast(
+                        _CachedSweepMeasurements,
+                        cached_by_case[case.case_id],
+                    )
                     progress.advance(
                         self.component_id,
                         units=0,
                         detail=f"race {case.case_id}",
                     )
-                    measurements = self._measure_case(
-                        case=case,
-                        session=session,
-                        context=context,
-                        checkpoints=checkpoints,
-                    )
-                    if not any(item.passes() for item in measurements):
-                        raise RuntimeError(
-                            f"all candidates failed correctness for {case.case_id}"
+                    group_measurements.append((case, cached.measurements))
+            else:
+                group_measurements = []
+                with self._benchmark_factory(
+                    group_id,
+                    group_cases,
+                    context,
+                ) as session:
+                    for case in group_cases:
+                        progress.advance(
+                            self.component_id,
+                            units=0,
+                            detail=f"race {case.case_id}",
                         )
-                    measured.append((case, measurements))
-                    if len(measurements) == 1:
-                        qualification_cases += 1
-                    else:
-                        race_cases += 1
-                    progress.advance(
-                        self.component_id,
-                        detail=f"race {case.case_id}",
+                        group_measurements.append(
+                            (
+                                case,
+                                self._measure_case(
+                                    case=case,
+                                    session=session,
+                                    context=context,
+                                    checkpoints=checkpoints,
+                                    cached=cached_by_case[case.case_id],
+                                ),
+                            )
+                        )
+            for case, measurements in group_measurements:
+                if not any(item.passes() for item in measurements):
+                    raise RuntimeError(
+                        f"all candidates failed correctness for {case.case_id}"
                     )
+                measured.append((case, measurements))
+                if len(measurements) == 1:
+                    qualification_cases += 1
+                else:
+                    race_cases += 1
+                progress.advance(
+                    self.component_id,
+                    detail=f"race {case.case_id}",
+                )
 
         grouped_results: dict[
             tuple[object, ...],

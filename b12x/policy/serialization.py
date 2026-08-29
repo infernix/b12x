@@ -160,21 +160,35 @@ def _planner_node(value: object, *, name: str, depth: int = 0) -> DecisionNode:
             branch_data = _object(
                 branch,
                 name=branch_name,
-                required=frozenset({"node", "value"}),
+                required=frozenset({"node"}),
+                optional=frozenset({"value", "values"}),
             )
-            branch_value = branch_data["value"]
-            if not isinstance(branch_value, (str, int, float, bool, type(None))):
-                raise TypeError(f"{branch_name}.value must be a scalar")
-            parsed_exact.append(
-                (
-                    branch_value,
-                    _planner_node(
-                        branch_data["node"],
-                        name=f"{branch_name}.node",
-                        depth=depth + 1,
-                    ),
+            have_value = "value" in branch_data
+            have_values = "values" in branch_data
+            if have_value == have_values:
+                raise ValueError(
+                    f"{branch_name} requires exactly one of value or values"
+                )
+            raw_values = (
+                (branch_data["value"],)
+                if have_value
+                else tuple(
+                    _sequence(branch_data["values"], name=f"{branch_name}.values")
                 )
             )
+            if not raw_values:
+                raise ValueError(f"{branch_name}.values must not be empty")
+            if any(
+                not isinstance(item, (str, int, float, bool, type(None)))
+                for item in raw_values
+            ):
+                raise TypeError(f"{branch_name} exact values must be scalars")
+            node = _planner_node(
+                branch_data["node"],
+                name=f"{branch_name}.node",
+                depth=depth + 1,
+            )
+            parsed_exact.extend((item, node) for item in raw_values)
         return ExactDecisionNode(
             field=field,
             branches=tuple(parsed_exact),

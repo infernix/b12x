@@ -396,7 +396,8 @@ class MoeDecodeGenerator:
         expected_ids = [candidate.candidate_id for candidate in candidates]
         if (
             cached is not None
-            and cached.get("generation") == context.checkpoint_metadata()
+            and cached.get("schema_version") == 1
+            and context.checkpoint_metadata_matches(cached.get("generation"))
             and cached.get("case_id") == case.case_id
             and cached.get("candidate_ids") == expected_ids
         ):

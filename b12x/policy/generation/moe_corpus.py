@@ -79,6 +79,20 @@ class MoeModelGeometry:
 
 
 @dataclass(frozen=True, kw_only=True)
+class MoeBenchmarkPreset:
+    preset_id: str
+    model_id: str
+    recipe_id: str
+    tp_size: int
+
+    def __post_init__(self) -> None:
+        if not self.preset_id or not self.model_id or not self.recipe_id:
+            raise ValueError("MoE benchmark preset fields must be non-empty")
+        if self.tp_size <= 0:
+            raise ValueError("MoE benchmark preset TP size must be positive")
+
+
+@dataclass(frozen=True, kw_only=True)
 class MoeGeometryAlias:
     model_id: str
     tp_size: int
@@ -158,6 +172,13 @@ MOE_RECIPES = (
         source_format="modelopt_nvfp4",
         intermediate_alignment=64,
         minimum_intermediate_size=64,
+    ),
+    MoeRecipe(
+        recipe_id="modelopt-w4a8-nvfp4",
+        quant_mode="w4a8_nvfp4",
+        source_format="modelopt_nvfp4",
+        intermediate_alignment=32,
+        minimum_intermediate_size=32,
     ),
     MoeRecipe(
         recipe_id="e8m0-w4a16",
@@ -247,28 +268,38 @@ COMMON_MOE_MODELS = (
         num_experts=128,
         native_top_k=6,
         activation="relu2",
-        recipe_ids=("compressed-tensors-w4a16",),
+        recipe_ids=("modelopt-w4a16", "compressed-tensors-w4a16"),
         source="Nano3.5 W4A16 benchmark profile",
     ),
     MoeModelGeometry(
-        model_id="deepseek-v4-flash",
+        model_id="nvidia-nemotron-3-super-120b",
+        hidden_size=1024,
+        intermediate_size=2688,
+        num_experts=512,
+        native_top_k=22,
+        activation="relu2",
+        recipe_ids=("modelopt-nvfp4",),
+        source="benchmark_moe.MODEL_PROFILES['nemotron-backbone']",
+    ),
+    MoeModelGeometry(
+        model_id="dsv4f-shape",
         hidden_size=6144,
         intermediate_size=2048,
         num_experts=256,
         native_top_k=8,
         activation="silu",
-        recipe_ids=("e8m0-w4a16", "e8m0-w4a8"),
-        source="DeepSeek V4 Flash benchmark profile",
+        recipe_ids=("e8m0-w4a16", "e8m0-w4a8", "modelopt-nvfp4"),
+        source="benchmark_moe dsv4f and dsv4f-nvfp4 shape profiles",
     ),
     MoeModelGeometry(
-        model_id="deepseek-ds4-flash",
+        model_id="deepseek-v4-flash",
         hidden_size=4096,
         intermediate_size=2048,
         num_experts=256,
         native_top_k=6,
         activation="silu",
         recipe_ids=("e8m0-w4a16", "e8m0-w4a8"),
-        source="benchmark_ds4_moe.py TP2 geometry",
+        source="benchmark_moe.MODEL_PROFILES['deepseek-v4-flash']",
     ),
     MoeModelGeometry(
         model_id="minimax-m3",
@@ -291,14 +322,44 @@ COMMON_MOE_MODELS = (
         source="Laguna S-2.1 benchmark profile",
     ),
     MoeModelGeometry(
+        model_id="minimax-m2.7",
+        hidden_size=3072,
+        intermediate_size=1536,
+        num_experts=256,
+        native_top_k=8,
+        activation="silu",
+        recipe_ids=("modelopt-nvfp4",),
+        source="benchmark_moe.MODEL_PROFILES['minimax-m27']",
+    ),
+    MoeModelGeometry(
+        model_id="glm-5.1",
+        hidden_size=6144,
+        intermediate_size=2048,
+        num_experts=256,
+        native_top_k=8,
+        activation="silu",
+        recipe_ids=("modelopt-nvfp4",),
+        source="benchmark_moe.MODEL_PROFILES['glm51']",
+    ),
+    MoeModelGeometry(
         model_id="glm-5.2",
         hidden_size=6144,
         intermediate_size=2048,
         num_experts=256,
         native_top_k=8,
         activation="silu",
-        recipe_ids=("trellis-glm-w4a16",),
-        source="GLM-5.2 hybrid serving geometry",
+        recipe_ids=("modelopt-w4a8-nvfp4", "trellis-glm-w4a16"),
+        source="benchmark_moe.MODEL_PROFILES['glm52']",
+    ),
+    MoeModelGeometry(
+        model_id="glm-5.3-flash",
+        hidden_size=4096,
+        intermediate_size=2048,
+        num_experts=288,
+        native_top_k=8,
+        activation="silu",
+        recipe_ids=("modelopt-nvfp4", "modelopt-w4a16"),
+        source="benchmark_moe.MODEL_PROFILES['glm53-flash-shape']",
     ),
     MoeModelGeometry(
         model_id="kimi-k3",
@@ -309,6 +370,106 @@ COMMON_MOE_MODELS = (
         activation="situ",
         recipe_ids=("trellis-k3-w4a16",),
         source="Kimi-K3 TP12 production geometry",
+    ),
+)
+
+
+MOE_BENCHMARK_PRESETS = (
+    MoeBenchmarkPreset(
+        preset_id="qwen38-flash-next",
+        model_id="qwen3.8-flash-next-180b",
+        recipe_id="modelopt-nvfp4",
+        tp_size=1,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="qwen38-flash-next-shape",
+        model_id="qwen3.8-flash-next-180b",
+        recipe_id="modelopt-nvfp4",
+        tp_size=1,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="qwen397b",
+        model_id="qwen3.5-397b-a17b",
+        recipe_id="modelopt-nvfp4",
+        tp_size=4,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="nemotron-backbone",
+        model_id="nvidia-nemotron-3-super-120b",
+        recipe_id="modelopt-nvfp4",
+        tp_size=1,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="nano35-w4a16",
+        model_id="nvidia-nano3.5",
+        recipe_id="modelopt-w4a16",
+        tp_size=1,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="nano35-w4a16-shape",
+        model_id="nvidia-nano3.5",
+        recipe_id="modelopt-w4a16",
+        tp_size=1,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="dsv4f",
+        model_id="dsv4f-shape",
+        recipe_id="e8m0-w4a16",
+        tp_size=2,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="dsv4f-nvfp4",
+        model_id="dsv4f-shape",
+        recipe_id="modelopt-nvfp4",
+        tp_size=2,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="minimax-m3-shape",
+        model_id="minimax-m3",
+        recipe_id="modelopt-nvfp4",
+        tp_size=4,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="laguna-s21-shape",
+        model_id="laguna-s2.1",
+        recipe_id="modelopt-nvfp4",
+        tp_size=1,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="deepseek-v4-flash",
+        model_id="deepseek-v4-flash",
+        recipe_id="e8m0-w4a16",
+        tp_size=4,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="glm51",
+        model_id="glm-5.1",
+        recipe_id="modelopt-nvfp4",
+        tp_size=8,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="glm52",
+        model_id="glm-5.2",
+        recipe_id="modelopt-w4a8-nvfp4",
+        tp_size=8,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="glm53-flash-shape",
+        model_id="glm-5.3-flash",
+        recipe_id="modelopt-w4a16",
+        tp_size=1,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="minimax-m27",
+        model_id="minimax-m2.7",
+        recipe_id="modelopt-nvfp4",
+        tp_size=2,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="minimax-m3",
+        model_id="minimax-m3",
+        recipe_id="modelopt-nvfp4",
+        tp_size=2,
     ),
 )
 
@@ -465,6 +626,7 @@ def corpus_manifest() -> dict[str, object]:
         "route_patterns": list(COMMON_ROUTE_PATTERNS),
         "recipes": [asdict(recipe) for recipe in MOE_RECIPES],
         "models": [asdict(model) for model in COMMON_MOE_MODELS],
+        "benchmark_presets": [asdict(preset) for preset in MOE_BENCHMARK_PRESETS],
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["corpus_sha256"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -477,7 +639,9 @@ __all__ = [
     "COMMON_ROUTE_PATTERNS",
     "COMMON_TOP_K",
     "COMMON_TP_SIZES",
+    "MOE_BENCHMARK_PRESETS",
     "MOE_RECIPES",
+    "MoeBenchmarkPreset",
     "MoeGeometryAlias",
     "MoeModelGeometry",
     "MoePhysicalGeometry",

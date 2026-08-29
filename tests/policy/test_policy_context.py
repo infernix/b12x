@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -144,6 +145,40 @@ def test_auto_uses_heuristic_for_uncovered_query_or_device() -> None:
     assert (
         unknown_device.resolve(_component(), _Query(family="a", rows=5)).source
         is PolicySource.HEURISTIC
+    )
+
+
+def test_auto_warns_once_per_heuristic_fallback(caplog) -> None:
+    component = replace(_component(), component_id="test.warning")
+    context = PolicyContext.for_identity(_DEVICE, registry=_registry())
+
+    with caplog.at_level(logging.WARNING, logger="b12x.policy.context"):
+        context.resolve(component, _Query(family="a", rows=5))
+        context.resolve(component, _Query(family="b", rows=6))
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "test.warning is using a heuristic" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    assert "has no component entry" in messages[0]
+
+
+def test_heuristic_only_does_not_warn(caplog) -> None:
+    component = replace(_component(), component_id="test.explicit_heuristic")
+    context = PolicyContext.for_identity(
+        _DEVICE,
+        mode=PolicyMode.HEURISTIC_ONLY,
+        registry=_registry(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="b12x.policy.context"):
+        context.resolve(component, _Query(family="a", rows=5))
+
+    assert not any(
+        "test.explicit_heuristic is using a heuristic" in record.getMessage()
+        for record in caplog.records
     )
 
 

@@ -35,6 +35,117 @@ class DeviceSelection:
     runtime_device: str
 
 
+@dataclass(frozen=True, kw_only=True)
+class MoePreset:
+    quant_mode: str
+    source_format: str
+    activation: str
+    num_experts: int
+    hidden_size: int
+    intermediate_size: int
+    top_k: int
+    intermediate_alignment: int
+    minimum_intermediate_size: int
+
+
+def _aligned_shard_size(total: int, tp_size: int, alignment: int, minimum: int) -> int:
+    logical_size = (total + tp_size - 1) // tp_size
+    return ((max(logical_size, minimum) + alignment - 1) // alignment) * alignment
+
+
+def _moe_queries(tp_size: int, preset: MoePreset) -> tuple[KernelQuery, ...]:
+    from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
+
+    if not 1 <= tp_size <= 16 or tp_size > preset.intermediate_size:
+        raise ValueError("MoE benchmark presets support sliceable TP 1 through 16")
+    intermediate = _aligned_shard_size(
+        preset.intermediate_size,
+        tp_size,
+        preset.intermediate_alignment,
+        preset.minimum_intermediate_size,
+    )
+    return tuple(
+        KernelQuery(
+            scenario=f"moe-m{tokens}",
+            kernel_family="fused-moe",
+            policy=MOE_DECODE_POLICY,
+            query=MoeDecodeQuery(
+                quant_mode=preset.quant_mode,
+                source_format=preset.source_format,
+                activation=preset.activation,
+                num_experts=preset.num_experts,
+                hidden_size=preset.hidden_size,
+                intermediate_size=intermediate,
+                top_k=preset.top_k,
+                num_tokens=tokens,
+                routed_rows=tokens * preset.top_k,
+            ),
+        )
+        for tokens in (1, 4, 7)
+    )
+
+
+def _paged_gqa_query(
+    *,
+    runtime_device: str,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    kv_dtype: str = "bfloat16",
+    page_size: int = 64,
+) -> KernelQuery:
+    from b12x.attention.paged._policy import GQA_POLICY, GqaQuery
+
+    return KernelQuery(
+        scenario="full-attention-decode",
+        kernel_family="paged-gqa",
+        policy=GQA_POLICY,
+        query=GqaQuery(
+            device=runtime_device,
+            mode="decode",
+            q_dtype="bfloat16",
+            kv_dtype=kv_dtype,
+            q_heads=q_heads,
+            kv_heads=kv_heads,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            page_size=page_size,
+            kv_cache_layout="separate",
+            batch_size=1,
+            query_len=1,
+            cache_tokens=65_536,
+            window_left=-1,
+            requested_graph_ctas_per_sm=None,
+            requested_max_work_items=None,
+            requested_max_partial_rows=None,
+            force_split_kv=None,
+        ),
+    )
+
+
+def _sliced_gqa_query(
+    *,
+    model: str,
+    tp_size: int,
+    runtime_device: str,
+    global_q_heads: int,
+    global_kv_heads: int,
+    head_dim: int,
+) -> KernelQuery:
+    if not 1 <= tp_size <= 16 or global_q_heads % tp_size:
+        raise ValueError(f"{model} does not have an integral TP {tp_size} Q-head shard")
+    q_heads = global_q_heads // tp_size
+    kv_heads = max(1, global_kv_heads // tp_size)
+    if q_heads % kv_heads:
+        raise ValueError(f"{model} TP {tp_size} does not produce a valid GQA shard")
+    return _paged_gqa_query(
+        runtime_device=runtime_device,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+    )
+
+
 def _qwen_flash_next_queries(
     tp_size: int,
     *,
@@ -138,8 +249,8 @@ def _qwen_flash_next_queries(
                 state_dtype="float32",
                 key_heads=gdn_key_heads,
                 value_heads=gdn_value_heads,
-                max_seqs=1,
-                max_tokens=4,
+                max_seqs=4,
+                max_tokens=16,
                 state_index_columns=4,
             ),
         ),
@@ -269,7 +380,6 @@ def _qwen_dense_queries(
     *,
     runtime_device: str,
 ) -> tuple[KernelQuery, ...]:
-    from b12x.attention.paged._policy import GQA_POLICY, GqaQuery
     from b12x.quantization.nvfp4._policy import (
         NVFP4_QUANTIZATION_POLICY,
         Nvfp4QuantizationQuery,
@@ -277,34 +387,16 @@ def _qwen_dense_queries(
 
     if tp_size not in (1, 2, 4, 8):
         raise ValueError("qwen3.8-27b supports profiled TP 1, 2, 4, or 8")
-    q_heads = 24 // tp_size
-    kv_heads = max(1, 4 // tp_size)
+    attention = _paged_gqa_query(
+        runtime_device=runtime_device,
+        q_heads=24 // tp_size,
+        kv_heads=max(1, 4 // tp_size),
+        head_dim=256,
+        kv_dtype="float8_e4m3fn",
+        page_size=128,
+    )
     return (
-        KernelQuery(
-            scenario="full-attention-decode",
-            kernel_family="paged-gqa",
-            policy=GQA_POLICY,
-            query=GqaQuery(
-                device=runtime_device,
-                mode="decode",
-                q_dtype="bfloat16",
-                kv_dtype="float8_e4m3fn",
-                q_heads=q_heads,
-                kv_heads=kv_heads,
-                head_dim_qk=256,
-                head_dim_vo=256,
-                page_size=128,
-                kv_cache_layout="separate",
-                batch_size=1,
-                query_len=1,
-                cache_tokens=65_536,
-                window_left=-1,
-                requested_graph_ctas_per_sm=None,
-                requested_max_work_items=None,
-                requested_max_partial_rows=None,
-                force_split_kv=None,
-            ),
-        ),
+        attention,
         KernelQuery(
             scenario="nvfp4-activation-block",
             kernel_family="nvfp4-quantization",
@@ -318,15 +410,574 @@ def _qwen_dense_queries(
     )
 
 
+_MOE_PRESETS = {
+    "qwen3.5-397b-a17b": MoePreset(
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        num_experts=512,
+        hidden_size=4_096,
+        intermediate_size=1_024,
+        top_k=10,
+        intermediate_alignment=16,
+        minimum_intermediate_size=16,
+    ),
+    "nvidia-nemotron-3-super-120b": MoePreset(
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        activation="relu2",
+        num_experts=512,
+        hidden_size=1_024,
+        intermediate_size=2_688,
+        top_k=22,
+        intermediate_alignment=16,
+        minimum_intermediate_size=16,
+    ),
+    "nvidia-nano3.5": MoePreset(
+        quant_mode="w4a16",
+        source_format="modelopt_nvfp4",
+        activation="relu2",
+        num_experts=128,
+        hidden_size=2_688,
+        intermediate_size=1_856,
+        top_k=6,
+        intermediate_alignment=64,
+        minimum_intermediate_size=64,
+    ),
+    "dsv4f": MoePreset(
+        quant_mode="w4a16",
+        source_format="fp4_e8m0_k32",
+        activation="silu",
+        num_experts=256,
+        hidden_size=6_144,
+        intermediate_size=2_048,
+        top_k=8,
+        intermediate_alignment=16,
+        minimum_intermediate_size=16,
+    ),
+    "dsv4f-nvfp4": MoePreset(
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        num_experts=256,
+        hidden_size=6_144,
+        intermediate_size=2_048,
+        top_k=8,
+        intermediate_alignment=16,
+        minimum_intermediate_size=16,
+    ),
+    "minimax-m3": MoePreset(
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        activation="swigluoai_uninterleave",
+        num_experts=128,
+        hidden_size=6_144,
+        intermediate_size=3_072,
+        top_k=4,
+        intermediate_alignment=16,
+        minimum_intermediate_size=16,
+    ),
+    "laguna-s2.1": MoePreset(
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        num_experts=256,
+        hidden_size=3_072,
+        intermediate_size=1_024,
+        top_k=10,
+        intermediate_alignment=16,
+        minimum_intermediate_size=16,
+    ),
+    "deepseek-v4-flash": MoePreset(
+        quant_mode="w4a16",
+        source_format="fp4_e8m0_k32",
+        activation="silu",
+        num_experts=256,
+        hidden_size=4_096,
+        intermediate_size=2_048,
+        top_k=6,
+        intermediate_alignment=16,
+        minimum_intermediate_size=16,
+    ),
+    "glm-5.1": MoePreset(
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        num_experts=256,
+        hidden_size=6_144,
+        intermediate_size=2_048,
+        top_k=8,
+        intermediate_alignment=16,
+        minimum_intermediate_size=16,
+    ),
+    "minimax-m2.7": MoePreset(
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        num_experts=256,
+        hidden_size=3_072,
+        intermediate_size=1_536,
+        top_k=8,
+        intermediate_alignment=16,
+        minimum_intermediate_size=16,
+    ),
+    "kimi-k3": MoePreset(
+        quant_mode="w4a16",
+        source_format="btx",
+        activation="situ",
+        num_experts=896,
+        hidden_size=3_584,
+        intermediate_size=3_072,
+        top_k=16,
+        intermediate_alignment=256,
+        minimum_intermediate_size=256,
+    ),
+}
+
+
+def _moe_only_factory(model: str):
+    def factory(
+        tp_size: int,
+        *,
+        runtime_device: str,
+    ) -> tuple[KernelQuery, ...]:
+        del runtime_device
+        return _moe_queries(tp_size, _MOE_PRESETS[model])
+
+    return factory
+
+
+def _minimax_m27_queries(
+    tp_size: int,
+    *,
+    runtime_device: str,
+) -> tuple[KernelQuery, ...]:
+    attention = _sliced_gqa_query(
+        model="minimax-m2.7",
+        tp_size=tp_size,
+        runtime_device=runtime_device,
+        global_q_heads=48,
+        global_kv_heads=8,
+        head_dim=128,
+    )
+    return (attention, *_moe_queries(tp_size, _MOE_PRESETS["minimax-m2.7"]))
+
+
+def _minimax_m3_queries(
+    tp_size: int,
+    *,
+    runtime_device: str,
+) -> tuple[KernelQuery, ...]:
+    from b12x.attention.dsa_indexer._policy import (
+        DSA_INDEXER_POLICY,
+        DsaIndexerQuery,
+    )
+
+    attention = _sliced_gqa_query(
+        model="minimax-m3",
+        tp_size=tp_size,
+        runtime_device=runtime_device,
+        global_q_heads=64,
+        global_kv_heads=4,
+        head_dim=128,
+    )
+    indexer = KernelQuery(
+        scenario="msa-indexer-decode",
+        kernel_family="msa-indexer",
+        policy=DSA_INDEXER_POLICY,
+        query=DsaIndexerQuery(
+            source_layout="paged",
+            mode="decode",
+            dtype="float8_e4m3fn",
+            kv_dtype="uint8",
+            num_q_heads=1,
+            num_idx_heads=4,
+            max_q_rows=4,
+            max_k_rows=0,
+            top_k=16,
+            page_size=64,
+            score_mode="msa",
+            shared_page_table=False,
+        ),
+    )
+    return (
+        attention,
+        indexer,
+        *_moe_queries(tp_size, _MOE_PRESETS["minimax-m3"]),
+    )
+
+
+def _qwen_gqa_queries(
+    tp_size: int,
+    *,
+    runtime_device: str,
+) -> tuple[KernelQuery, ...]:
+    if tp_size != 1:
+        raise ValueError("the synthetic qwen-gqa benchmark preset is rank-local TP1")
+    return (
+        _paged_gqa_query(
+            runtime_device=runtime_device,
+            q_heads=8,
+            kv_heads=1,
+            head_dim=256,
+        ),
+    )
+
+
+def _kimi_k3_queries(
+    tp_size: int,
+    *,
+    runtime_device: str,
+) -> tuple[KernelQuery, ...]:
+    from b12x.attention.dense_mla._policy import DENSE_MLA_POLICY, DenseMlaQuery
+
+    del runtime_device
+    if tp_size != 12:
+        raise ValueError("the reviewed Kimi-K3 dense-MLA preset is TP12")
+    attention = KernelQuery(
+        scenario="dense-mla-decode",
+        kernel_family="dense-mla",
+        policy=DENSE_MLA_POLICY,
+        query=DenseMlaQuery(
+            mode="decode",
+            q_dtype="float8_e4m3fn",
+            kv_dtype="float8_e4m3fn",
+            num_q_heads=8,
+            qk_head_dim=576,
+            v_head_dim=512,
+            page_size=944,
+            query_rows=1,
+            max_batch=1,
+            cache_tokens=65_536,
+            physical_record_width=576,
+            window_size=None,
+            use_cuda_graph=True,
+        ),
+    )
+    return (attention, *_moe_queries(tp_size, _MOE_PRESETS["kimi-k3"]))
+
+
+def _deepseek_v4_flash_queries(
+    tp_size: int,
+    *,
+    runtime_device: str,
+) -> tuple[KernelQuery, ...]:
+    from b12x.attention.compressed_sparse_mla._policy import (
+        COMPRESSED_SPARSE_MLA_POLICY,
+        SparseMlaQuery,
+    )
+    from b12x.attention.dsa_indexer._policy import (
+        DSA_INDEXER_POLICY,
+        DsaIndexerQuery,
+    )
+
+    del runtime_device
+    if tp_size not in (1, 2, 4, 8):
+        raise ValueError("deepseek-v4-flash supports profiled TP 1, 2, 4, or 8")
+    local_heads = 64 // tp_size
+    queries = [
+        KernelQuery(
+            scenario="paged-indexer-decode",
+            kernel_family="dsa-indexer",
+            policy=DSA_INDEXER_POLICY,
+            query=DsaIndexerQuery(
+                source_layout="paged",
+                mode="decode",
+                dtype="bfloat16",
+                kv_dtype="uint8",
+                num_q_heads=local_heads,
+                num_idx_heads=1,
+                max_q_rows=1,
+                max_k_rows=0,
+                top_k=512,
+                page_size=64,
+                score_mode="dsa",
+                shared_page_table=False,
+            ),
+        )
+    ]
+    for contract, indexed_width, indexed_page_size in (
+        ("swa", 0, 64),
+        ("swa-c4", 512, 64),
+        ("swa-c128", 512, 2),
+    ):
+        queries.append(
+            KernelQuery(
+                scenario=f"compressed-mla-{contract}",
+                kernel_family="compressed-sparse-mla",
+                policy=COMPRESSED_SPARSE_MLA_POLICY,
+                query=SparseMlaQuery(
+                    layout="compressed_dsv4",
+                    mode="decode",
+                    q_dtype="bfloat16",
+                    kv_dtype="float8_e4m3fn",
+                    num_q_heads=local_heads,
+                    qk_head_dim=512,
+                    v_head_dim=448,
+                    swa_width=128,
+                    swa_page_size=64,
+                    indexed_width=indexed_width,
+                    indexed_page_size=indexed_page_size,
+                    query_rows=1,
+                ),
+            )
+        )
+    queries.extend(_moe_queries(tp_size, _MOE_PRESETS["deepseek-v4-flash"]))
+    return tuple(queries)
+
+def _validate_glm_tp(model: str, tp_size: int) -> None:
+    if tp_size not in (1, 2, 4, 8):
+        raise ValueError(f"{model} supports profiled TP 1, 2, 4, or 8")
+
+
+def _glm52_queries(
+    tp_size: int,
+    *,
+    runtime_device: str,
+) -> tuple[KernelQuery, ...]:
+    from b12x.attention.dsa_indexer._policy import (
+        DSA_INDEXER_POLICY,
+        DsaIndexerQuery,
+    )
+    from b12x.attention.sparse_mla._policy import (
+        SPARSE_MLA_POLICY,
+        SparseMlaQuery,
+    )
+    from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
+
+    del runtime_device
+    _validate_glm_tp("glm-5.2", tp_size)
+    local_heads = 64 // tp_size
+    intermediate = ((2_048 + tp_size - 1) // tp_size + 31) // 32 * 32
+    queries = [
+        KernelQuery(
+            scenario="dsa-decode-spec4",
+            kernel_family="dsa-indexer",
+            policy=DSA_INDEXER_POLICY,
+            query=DsaIndexerQuery(
+                source_layout="paged",
+                mode="decode",
+                dtype="bfloat16",
+                kv_dtype="uint8",
+                num_q_heads=32,
+                num_idx_heads=1,
+                max_q_rows=4,
+                max_k_rows=0,
+                top_k=2_048,
+                page_size=64,
+                score_mode="dsa",
+                shared_page_table=False,
+            ),
+        ),
+        KernelQuery(
+            scenario="sparse-mla-spec4",
+            kernel_family="sparse-mla",
+            policy=SPARSE_MLA_POLICY,
+            query=SparseMlaQuery(
+                mode="decode",
+                dtype="bfloat16",
+                kv_dtype="uint8",
+                num_q_heads=local_heads,
+                qk_head_dim=576,
+                v_head_dim=512,
+                max_q_rows=4,
+                max_width=2_048,
+                page_size=64,
+                model_type=None,
+                head_major_output=False,
+            ),
+        ),
+    ]
+    for tokens in (1, 4, 7):
+        queries.append(
+            KernelQuery(
+                scenario=f"moe-m{tokens}",
+                kernel_family="fused-moe",
+                policy=MOE_DECODE_POLICY,
+                query=MoeDecodeQuery(
+                    quant_mode="w4a8_nvfp4",
+                    source_format="modelopt_nvfp4",
+                    activation="silu",
+                    num_experts=256,
+                    hidden_size=6_144,
+                    intermediate_size=intermediate,
+                    top_k=8,
+                    num_tokens=tokens,
+                    routed_rows=tokens * 8,
+                ),
+            )
+        )
+    return tuple(queries)
+
+
+def _glm51_queries(
+    tp_size: int,
+    *,
+    runtime_device: str,
+) -> tuple[KernelQuery, ...]:
+    attention = tuple(
+        item
+        for item in _glm52_queries(tp_size, runtime_device=runtime_device)
+        if item.policy.component_id != "moe.decode"
+    )
+    return (*attention, *_moe_queries(tp_size, _MOE_PRESETS["glm-5.1"]))
+
+
+def _glm53_flash_queries(
+    tp_size: int,
+    *,
+    runtime_device: str,
+) -> tuple[KernelQuery, ...]:
+    from b12x.attention._shared.mla.traits import ModelType
+    from b12x.attention.dsa_indexer._policy import (
+        DSA_INDEXER_POLICY,
+        DsaIndexerQuery,
+    )
+    from b12x.attention.sparse_mla._policy import (
+        SPARSE_MLA_POLICY,
+        SparseMlaQuery,
+    )
+    from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
+    from b12x.norm.mhc._policy import MHC_POLICY, MhcQuery
+    from b12x.sequence.gdn_decode._policy import GDN_POLICY, GdnQuery
+
+    del runtime_device
+    _validate_glm_tp("glm-5.3-flash", tp_size)
+    local_heads = 64 // tp_size
+    intermediate = ((2_048 + tp_size - 1) // tp_size + 15) // 16 * 16
+    queries = [
+        KernelQuery(
+            scenario="kda-spec6",
+            kernel_family="kda",
+            policy=GDN_POLICY,
+            query=GdnQuery(
+                gate_activation="sigmoid",
+                qk_l2norm=True,
+                state_dtype="float32",
+                key_heads=local_heads,
+                value_heads=local_heads,
+                max_seqs=4,
+                max_tokens=24,
+                state_index_columns=6,
+            ),
+        ),
+        KernelQuery(
+            scenario="pooled-indexer-spec6",
+            kernel_family="dsa-indexer",
+            policy=DSA_INDEXER_POLICY,
+            query=DsaIndexerQuery(
+                source_layout="paged",
+                mode="decode",
+                dtype="bfloat16",
+                kv_dtype="uint8",
+                num_q_heads=32,
+                num_idx_heads=1,
+                max_q_rows=6,
+                max_k_rows=0,
+                top_k=512,
+                page_size=64,
+                score_mode="dsa",
+                shared_page_table=False,
+            ),
+        ),
+        KernelQuery(
+            scenario="sparse-mla-spec6",
+            kernel_family="sparse-mla",
+            policy=SPARSE_MLA_POLICY,
+            query=SparseMlaQuery(
+                mode="decode",
+                dtype="bfloat16",
+                kv_dtype="uint8",
+                num_q_heads=local_heads,
+                qk_head_dim=512,
+                v_head_dim=512,
+                max_q_rows=6,
+                max_width=2_051,
+                page_size=256,
+                model_type=ModelType.GLM_NEXT,
+                head_major_output=False,
+            ),
+        ),
+        KernelQuery(
+            scenario="mhc-spec6",
+            kernel_family="mhc",
+            policy=MHC_POLICY,
+            query=MhcQuery(
+                dtype="bfloat16",
+                max_tokens=6,
+                hidden_size=4_096,
+                split_k=64,
+            ),
+        ),
+    ]
+    for tokens in (1, 4, 7):
+        queries.append(
+            KernelQuery(
+                scenario=f"moe-m{tokens}",
+                kernel_family="fused-moe",
+                policy=MOE_DECODE_POLICY,
+                query=MoeDecodeQuery(
+                    quant_mode="w4a16",
+                    source_format="modelopt_nvfp4",
+                    activation="silu",
+                    num_experts=288,
+                    hidden_size=4_096,
+                    intermediate_size=intermediate,
+                    top_k=8,
+                    num_tokens=tokens,
+                    routed_rows=tokens * 8,
+                ),
+            )
+        )
+    return tuple(queries)
+
+
 _MODEL_FACTORIES = {
+    "deepseek-v4-flash": _deepseek_v4_flash_queries,
+    "dsv4f": _moe_only_factory("dsv4f"),
+    "dsv4f-nvfp4": _moe_only_factory("dsv4f-nvfp4"),
+    "glm-5.1": _glm51_queries,
+    "glm-5.2": _glm52_queries,
+    "glm-5.3-flash": _glm53_flash_queries,
+    "kimi-k3": _kimi_k3_queries,
+    "laguna-s2.1": _moe_only_factory("laguna-s2.1"),
+    "minimax-m2.7": _minimax_m27_queries,
+    "minimax-m3": _minimax_m3_queries,
+    "nvidia-nano3.5": _moe_only_factory("nvidia-nano3.5"),
+    "nvidia-nemotron-3-super-120b": _moe_only_factory(
+        "nvidia-nemotron-3-super-120b"
+    ),
+    "qwen-gqa": _qwen_gqa_queries,
+    "qwen3.5-397b-a17b": _moe_only_factory("qwen3.5-397b-a17b"),
     "qwen3.8-flash-next-180b": _qwen_flash_next_queries,
     "qwen3.8-27b": _qwen_dense_queries,
 }
 _MODEL_ALIASES = {
+    "glm5.1": "glm-5.1",
+    "glm51": "glm-5.1",
+    "glm5.2": "glm-5.2",
+    "glm52": "glm-5.2",
+    "glm-5.3": "glm-5.3-flash",
+    "glm5.3": "glm-5.3-flash",
+    "glm5.3-flash": "glm-5.3-flash",
+    "glm53": "glm-5.3-flash",
+    "glm53-flash": "glm-5.3-flash",
+    "glm53-flash-shape": "glm-5.3-flash",
     "qwen3.8-flash-next": "qwen3.8-flash-next-180b",
     "qwen38-flash-next": "qwen3.8-flash-next-180b",
+    "qwen38-flash-next-shape": "qwen3.8-flash-next-180b",
     "qwen38-flash-next-180b": "qwen3.8-flash-next-180b",
     "qwen38-27b": "qwen3.8-27b",
+    "qwen397b": "qwen3.5-397b-a17b",
+    "nemotron-backbone": "nvidia-nemotron-3-super-120b",
+    "nano35-w4a16": "nvidia-nano3.5",
+    "nano35-w4a16-shape": "nvidia-nano3.5",
+    "minimax-m3-shape": "minimax-m3",
+    "laguna-s21": "laguna-s2.1",
+    "laguna-s21-shape": "laguna-s2.1",
+    "minimax-m27": "minimax-m2.7",
+    "minimax-m2": "minimax-m2.7",
+    "mimimax-m2.7": "minimax-m2.7",
 }
 
 
@@ -337,10 +988,19 @@ def _normalize_name(value: str) -> str:
 def _canonical_model(value: str) -> str:
     key = value.casefold()
     canonical = _MODEL_ALIASES.get(key, key)
-    if canonical not in _MODEL_FACTORIES:
-        choices = ", ".join(sorted(_MODEL_FACTORIES))
-        raise ValueError(f"unknown model preset {value!r}; choose one of {choices}")
-    return canonical
+    if canonical in _MODEL_FACTORIES:
+        return canonical
+    needle = _normalize_name(value)
+    normalized = {
+        _normalize_name(name): name for name in _MODEL_FACTORIES
+    }
+    for alias, target in _MODEL_ALIASES.items():
+        normalized[_normalize_name(alias)] = target
+    canonical = normalized.get(needle)
+    if canonical is not None:
+        return canonical
+    choices = ", ".join(sorted(_MODEL_FACTORIES))
+    raise ValueError(f"unknown model preset {value!r}; choose one of {choices}")
 
 
 def _device_selection(value: str) -> DeviceSelection:

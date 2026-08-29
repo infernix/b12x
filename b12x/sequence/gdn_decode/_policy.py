@@ -51,10 +51,11 @@ class GdnConfig:
 
 
 def _heuristic(
-    _query: GdnQuery,
+    query: GdnQuery,
     _device: DeviceIdentity | None,
 ) -> GdnConfig:
-    return GdnConfig(backend="cutedsl")
+    backend = "triton" if query.key_heads == query.value_heads else "cutedsl"
+    return GdnConfig(backend=backend)
 
 
 def _validate(
@@ -62,14 +63,14 @@ def _validate(
     config: GdnConfig,
     _device: DeviceIdentity | None,
 ) -> None:
-    if config.backend != "cutedsl":
+    if config.backend not in {"cutedsl", "triton"}:
         raise ValueError(f"unsupported GDN backend {config.backend!r}")
 
 
 GDN_POLICY = ComponentPolicy(
     component_id=GDN_ATTENTION,
     query_schema_version=1,
-    config_schema_version=1,
+    config_schema_version=2,
     query_fields=frozenset(
         {
             "gate_activation",
