@@ -955,7 +955,7 @@ def _prepare_case(
         generator=generator,
         device=device,
     )
-    if case.kind == "speculative":
+    if case.kind in {"prefill", "speculative"}:
         index_query[1:].copy_(index_query[:1].expand(case.rows - 1, -1, -1))
     raw_key = _random_bf16(
         (case.rows, INDEX_HEAD_DIM), generator=generator, device=device

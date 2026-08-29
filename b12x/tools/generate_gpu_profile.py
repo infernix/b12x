@@ -139,6 +139,30 @@ def _profile_id_for_device(device: DeviceIdentity) -> str:
     return _profile_id(device.product_name, device.sm_count)
 
 
+def _profile_output_paths(
+    profile_id: str,
+    *,
+    output: Path | None,
+    embed: bool,
+) -> tuple[Path, Path]:
+    embedded_output = (
+        _REPO_ROOT
+        / "b12x"
+        / "policy"
+        / "_profiles"
+        / "data"
+        / f"{profile_id}.json.gz"
+    ).resolve()
+    if output is not None:
+        return output.resolve(), embedded_output
+    if embed:
+        return embedded_output, embedded_output
+    generated_output = (
+        Path("validation/gpu_profiles/generated") / f"{profile_id}.json.gz"
+    ).resolve()
+    return generated_output, embedded_output
+
+
 def _load_registry() -> ComponentGeneratorRegistry:
     from b12x.policy.generation.providers import register_builtin_generators
 
@@ -306,7 +330,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--embed",
         action="store_true",
-        help="also install the generated artifact into b12x package data",
+        help=(
+            "write into b12x package data; this is the sole output unless "
+            "--output is provided"
+        ),
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--list-components", action="store_true")
@@ -346,18 +373,11 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("validated CUDA device lost its identity")
     profile_id = args.profile_id or _profile_id_for_device(detected.identity)
     work_dir = (args.work_dir or Path(".b12x-profile-work") / profile_id).resolve()
-    output = (
-        args.output
-        or Path("validation/gpu_profiles/generated") / f"{profile_id}.json.gz"
-    ).resolve()
-    embedded_output = (
-        _REPO_ROOT
-        / "b12x"
-        / "policy"
-        / "_profiles"
-        / "data"
-        / f"{profile_id}.json.gz"
-    ).resolve()
+    output, embedded_output = _profile_output_paths(
+        profile_id,
+        output=args.output,
+        embed=args.embed,
+    )
     merge_from = None if args.merge_from is None else args.merge_from.resolve()
     if selected_ids is not None and merge_from is None:
         if output.exists():
