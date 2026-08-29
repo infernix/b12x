@@ -15,6 +15,7 @@ from b12x.policy import (
     EMBEDDED_REGISTRY,
     ComponentPolicy,
     DeviceIdentity,
+    GpuProfile,
     PolicyContext,
     PolicyResolution,
     detect_device,
@@ -1054,28 +1055,69 @@ def _canonical_model(value: str) -> str:
     raise ValueError(f"unknown model preset {value!r}; choose one of {choices}")
 
 
+def _detected_selection(device: str | None) -> DeviceSelection | None:
+    detected = detect_device(device)
+    if detected.identity is None or detected.ordinal is None:
+        return None
+    return DeviceSelection(
+        identity=detected.identity,
+        runtime_device=f"cuda:{detected.ordinal}",
+    )
+
+
+def _profile_selection(profile: GpuProfile) -> DeviceSelection:
+    detected = _detected_selection(None)
+    if detected is not None and detected.identity in profile.targets:
+        return detected
+    return DeviceSelection(identity=profile.targets[0], runtime_device="cuda:0")
+
+
 def _device_selection(value: str) -> DeviceSelection:
     if value.casefold() == "auto":
-        detected = detect_device()
-        if detected.identity is None or detected.ordinal is None:
-            raise ValueError("--device auto did not find a CUDA device")
-        return DeviceSelection(
-            identity=detected.identity,
-            runtime_device=f"cuda:{detected.ordinal}",
-        )
+        selected = _detected_selection(None)
+        if selected is None:
+            raise ValueError(
+                "--device auto requires a CUDA-enabled PyTorch interpreter"
+            )
+        return selected
+
+    if value.isdecimal():
+        selected = _detected_selection(f"cuda:{value}")
+        if selected is None:
+            raise ValueError(
+                f"--device {value} did not find CUDA device ordinal {value}"
+            )
+        return selected
 
     needle = _normalize_name(value)
-    exact: list[tuple[object, DeviceIdentity]] = []
-    partial: list[tuple[object, DeviceIdentity]] = []
-    for profile in EMBEDDED_REGISTRY.list_profiles():
+    profiles = EMBEDDED_REGISTRY.list_profiles()
+    exact_profiles = [
+        profile
+        for profile in profiles
+        if needle == _normalize_name(profile.profile_id)
+    ]
+    partial_profiles = [
+        profile
+        for profile in profiles
+        if needle and needle in _normalize_name(profile.profile_id)
+    ]
+    matched_profiles = exact_profiles or partial_profiles
+    if len(matched_profiles) == 1:
+        return _profile_selection(matched_profiles[0])
+    if len(matched_profiles) > 1:
+        matched = ", ".join(profile.profile_id for profile in matched_profiles)
+        raise ValueError(f"ambiguous profile name {value!r}; matches {matched}")
+
+    exact_targets: list[tuple[object, DeviceIdentity]] = []
+    partial_targets: list[tuple[object, DeviceIdentity]] = []
+    for profile in profiles:
         for target in profile.targets:
-            aliases = (profile.profile_id, target.product_name)
-            normalized = tuple(_normalize_name(alias) for alias in aliases)
-            if needle in normalized:
-                exact.append((profile, target))
-            elif any(needle and needle in alias for alias in normalized):
-                partial.append((profile, target))
-    matches = exact or partial
+            normalized = _normalize_name(target.product_name)
+            if needle == normalized:
+                exact_targets.append((profile, target))
+            elif needle and needle in normalized:
+                partial_targets.append((profile, target))
+    matches = exact_targets or partial_targets
     unique = {
         (profile.profile_id, target): (profile, target)
         for profile, target in matches
@@ -1088,7 +1130,9 @@ def _device_selection(value: str) -> DeviceSelection:
             raise ValueError(
                 f"unknown embedded device/profile {value!r}; choose one of {choices}"
             )
-        matched = ", ".join(sorted(profile_id for profile_id, _ in unique))
+        matched = ", ".join(
+            sorted(target.product_name for _profile, target in unique.values())
+        )
         raise ValueError(f"ambiguous device name {value!r}; matches {matched}")
     _key, (_profile, identity) = next(iter(unique.items()))
     detected = detect_device()
@@ -1204,7 +1248,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--device",
         default="auto",
-        help="auto, an embedded profile ID, or a device-name fragment",
+        help=(
+            "auto, a CUDA ordinal, an embedded profile ID, or a device-name "
+            "fragment"
+        ),
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     parser.add_argument("--list-models", action="store_true")

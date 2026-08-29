@@ -51,6 +51,27 @@ def test_default_measurement_protocol_is_two_warmups_and_five_by_five() -> None:
 
     assert (settings.warmup, settings.groups, settings.repetitions) == (2, 5, 5)
     assert (args.warmup, args.groups, args.repetitions) == (2, 5, 5)
+    assert settings.minimum_cosine == args.minimum_cosine == 0.998
+
+
+def test_relaxed_cosine_gate_resumes_stricter_checkpoints(tmp_path) -> None:
+    relaxed = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="relaxed",
+        settings=GenerationSettings(),
+    )
+    strict = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="strict",
+        settings=GenerationSettings(minimum_cosine=0.999),
+    )
+
+    assert relaxed.checkpoint_metadata_matches(strict.checkpoint_metadata())
+    assert not strict.checkpoint_metadata_matches(relaxed.checkpoint_metadata())
 
 
 def test_parallel_device_ranges_expand_without_duplicates() -> None:

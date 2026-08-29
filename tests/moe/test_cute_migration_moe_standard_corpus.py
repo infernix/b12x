@@ -634,6 +634,84 @@ def test_standard_moe_qwen38_nvfp4_padding_live_graph_oracle(
     )
 
 
+@pytest.mark.parametrize(
+    ("m", "intermediate_size"),
+    [(1, 208), (2, 208), (2, 272)],
+)
+def test_standard_moe_micro_masks_source_native_w2_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    m: int,
+    intermediate_size: int,
+) -> None:
+    """Bound micro FC2 loads by logical W2 rows, not padded scale rows."""
+
+    num_experts = 4
+    hidden_size = 512
+    topk = 4
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(
+        device,
+        seed=121,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    initial = _make_inputs(
+        device,
+        m=m,
+        seed=122,
+        route_shift=0,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    changed = _make_inputs(
+        device,
+        m=m,
+        seed=123,
+        route_shift=1,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    initial_reference = _nvfp4_oracle(
+        weights,
+        initial,
+        quant_scale_math="reciprocal_multiply",
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    changed_reference = _nvfp4_oracle(
+        weights,
+        changed,
+        quant_scale_math="reciprocal_multiply",
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        num_topk=topk,
+    )
+    assert case.scratch_plan.launch_plan.implementation == "micro"
+    assert case.binding.implementation == "micro"
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context=f"standard-moe-micro-w2-tail-n{intermediate_size}-m{m}",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
+
+
 def test_standard_moe_dynamic_prefill_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

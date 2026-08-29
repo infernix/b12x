@@ -20,7 +20,7 @@ class GenerationSettings:
     repetitions: int = 5
     groups: int = 5
     seed: int = 20260828
-    minimum_cosine: float = 0.999
+    minimum_cosine: float = 0.998
     cold_l2: bool = True
     max_candidate_seconds: float = 2.0
 

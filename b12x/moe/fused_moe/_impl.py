@@ -6010,8 +6010,13 @@ def _resolve_workspace_layout(
         # than the w4a8 dynamic kernel at m=8/topk=10 (0.076 vs 0.169 ms), so
         # the w4a8 micro band covers all micro-capable m, not just the
         # routed-pairs cutover tuned for nvfp4.
+        micro_routing_supported = not (
+            normalized_quant_mode == "w4a8_nvfp4"
+            and routed_rows > _DIRECT_ROUTING_MAX_ROUTED_ROWS
+        )
         if (
-            band == "micro" or num_tokens <= _MICRO_MAX_TOKENS
+            micro_routing_supported
+            and (band == "micro" or num_tokens <= _MICRO_MAX_TOKENS)
         ) and _band_runs_direct_micro(
             num_tokens=num_tokens,
             k=k,

@@ -817,6 +817,27 @@ def test_moe_decode_heuristic_never_labels_unsupported_micro_shape() -> None:
     assert resolution.config.backend == "dynamic"
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [(4, "micro"), (7, "dynamic")],
+)
+def test_w4a8_nvfp4_micro_respects_direct_routing_capacity(
+    num_tokens: int,
+    expected: str,
+) -> None:
+    implementation, _, _ = fused_moe_impl._resolve_workspace_layout(
+        num_tokens=num_tokens,
+        weight_E=256,
+        num_topk=8,
+        k=6144,
+        n=160,
+        activation="silu",
+        quant_mode="w4a8_nvfp4",
+    )
+
+    assert implementation == expected
+
+
 def test_gb10_qwen38_flash_next_decode_honors_explicit_cutover(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

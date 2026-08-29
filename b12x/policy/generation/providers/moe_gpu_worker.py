@@ -11,7 +11,7 @@ import statistics
 import traceback
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
 
 from b12x.policy.generation.contracts import GenerationContext
@@ -1123,6 +1123,29 @@ def _moe_geometry_worker(
         connection.close()
 
 
+class _MoeRemoteWorkerError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        operation: str,
+        exception_type: str,
+        error: str,
+        remote_traceback: str = "",
+    ) -> None:
+        self.operation = operation
+        self.exception_type = exception_type
+        self.remote_error = error
+        self.remote_traceback = remote_traceback
+        super().__init__(
+            f"MoE GPU worker failed during {operation}: "
+            f"{exception_type}: {error}\n{remote_traceback}"
+        )
+
+    @property
+    def retryable(self) -> bool:
+        return self.exception_type in {"AcceleratorError", "WorkerExit"}
+
+
 class _MoeProcessSession(AbstractContextManager["_MoeProcessSession"]):
     def __init__(
         self,
@@ -1145,8 +1168,10 @@ class _MoeProcessSession(AbstractContextManager["_MoeProcessSession"]):
             response = self._connection.recv()
         except EOFError as exc:
             exitcode = None if self._process is None else self._process.exitcode
-            raise RuntimeError(
-                f"MoE GPU worker exited during {operation}; exitcode={exitcode}"
+            raise _MoeRemoteWorkerError(
+                operation=operation,
+                exception_type="WorkerExit",
+                error=f"exitcode={exitcode}",
             ) from exc
         if not isinstance(response, dict):
             raise TypeError("MoE GPU worker response must be an object")
@@ -1154,9 +1179,11 @@ class _MoeProcessSession(AbstractContextManager["_MoeProcessSession"]):
             remote_type = response.get("exception_type", "Exception")
             error = response.get("error", "unknown worker failure")
             remote_traceback = response.get("traceback", "")
-            raise RuntimeError(
-                f"MoE GPU worker failed during {operation}: "
-                f"{remote_type}: {error}\n{remote_traceback}"
+            raise _MoeRemoteWorkerError(
+                operation=operation,
+                exception_type=str(remote_type),
+                error=str(error),
+                remote_traceback=str(remote_traceback),
             )
         return response
 
@@ -1211,18 +1238,9 @@ class _MoeProcessSession(AbstractContextManager["_MoeProcessSession"]):
             self._process = None
             raise
 
-    def __enter__(self) -> "_MoeProcessSession":
-        return self
-
-    def __exit__(self, exc_type: object, _exc: object, _tb: object) -> None:
-        close_error: Exception | None = None
-        process = self._process
+    def _discard_worker(self) -> None:
         connection = self._connection
-        if process is not None and process.is_alive() and connection is not None:
-            try:
-                self._request("close")
-            except Exception as error:  # noqa: BLE001 - child may have failed
-                close_error = error
+        process = self._process
         if connection is not None:
             connection.close()
         if process is not None:
@@ -1235,6 +1253,20 @@ class _MoeProcessSession(AbstractContextManager["_MoeProcessSession"]):
                 process.join()
         self._connection = None
         self._process = None
+
+    def __enter__(self) -> "_MoeProcessSession":
+        return self
+
+    def __exit__(self, exc_type: object, _exc: object, _tb: object) -> None:
+        close_error: Exception | None = None
+        process = self._process
+        connection = self._connection
+        if process is not None and process.is_alive() and connection is not None:
+            try:
+                self._request("close")
+            except Exception as error:  # noqa: BLE001 - child may have failed
+                close_error = error
+        self._discard_worker()
         if close_error is not None and exc_type is None:
             raise close_error
         return None
@@ -1263,21 +1295,41 @@ class _MoeProcessSession(AbstractContextManager["_MoeProcessSession"]):
         *,
         correctness: bool = False,
     ) -> tuple[MoeMeasurement, ...]:
-        self._start()
-        response = self._request(
-            "measure",
-            case=case,
-            candidate_ids=tuple(
-                candidate.candidate_id for candidate in candidates
-            ),
-            correctness=correctness,
-        )
+        def request_measurement() -> dict[str, object]:
+            self._start()
+            return self._request(
+                "measure",
+                case=case,
+                candidate_ids=tuple(
+                    candidate.candidate_id for candidate in candidates
+                ),
+                correctness=correctness,
+            )
+
+        retried = False
+        try:
+            response = request_measurement()
+        except _MoeRemoteWorkerError as exc:
+            if not exc.retryable:
+                raise
+            self._discard_worker()
+            response = request_measurement()
+            retried = True
         raw_measurements = response.get("measurements")
         if not isinstance(raw_measurements, list):
             raise TypeError("MoE GPU worker measurement response is invalid")
-        return tuple(
+        measurements = tuple(
             MoeMeasurement.from_dict(measurement)
             for measurement in raw_measurements
+        )
+        if not retried:
+            return measurements
+        return tuple(
+            replace(
+                measurement,
+                metrics={**measurement.metrics.to_dict(), "worker_retries": 1},
+            )
+            for measurement in measurements
         )
 
 

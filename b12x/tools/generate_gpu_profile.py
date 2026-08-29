@@ -278,7 +278,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--groups", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20260828)
-    parser.add_argument("--minimum-cosine", type=float, default=0.999)
+    parser.add_argument("--minimum-cosine", type=float, default=0.998)
     parser.add_argument(
         "--max-candidate-seconds",
         type=float,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from b12x.policy import DetectedDevice, EMBEDDED_REGISTRY
 from b12x.policy.generation.attention_corpus import (
     ATTENTION_BENCHMARK_PRESETS,
     GQA_GEOMETRIES,
@@ -142,6 +143,58 @@ def test_embedded_device_can_be_selected_by_product_fragment() -> None:
 
     assert selected.identity.product_name == "nvidia gb10"
     assert selected.identity.sm_count == 48
+
+
+def test_multi_target_profile_id_uses_matching_detected_device(monkeypatch) -> None:
+    profile = EMBEDDED_REGISTRY.get("nvidia.rtx.pro.6000.blackwell")
+    identity = profile.targets[1]
+    monkeypatch.setattr(
+        "b12x.tools.inspect_model_policy.detect_device",
+        lambda device=None: DetectedDevice(ordinal=4, identity=identity),
+    )
+
+    selected = _device_selection(profile.profile_id)
+
+    assert selected.identity == identity
+    assert selected.runtime_device == "cuda:4"
+
+
+def test_auto_device_selects_detected_cuda_device(monkeypatch) -> None:
+    identity = EMBEDDED_REGISTRY.get(
+        "nvidia.rtx.pro.6000.blackwell"
+    ).targets[0]
+    requested: list[object | None] = []
+
+    def detect(device=None):
+        requested.append(device)
+        return DetectedDevice(ordinal=3, identity=identity)
+
+    monkeypatch.setattr("b12x.tools.inspect_model_policy.detect_device", detect)
+
+    selected = _device_selection("auto")
+
+    assert requested == [None]
+    assert selected.identity == identity
+    assert selected.runtime_device == "cuda:3"
+
+
+def test_numeric_device_selects_cuda_ordinal(monkeypatch) -> None:
+    identity = EMBEDDED_REGISTRY.get(
+        "nvidia.rtx.pro.6000.blackwell"
+    ).targets[0]
+    requested: list[object | None] = []
+
+    def detect(device=None):
+        requested.append(device)
+        return DetectedDevice(ordinal=7, identity=identity)
+
+    monkeypatch.setattr("b12x.tools.inspect_model_policy.detect_device", detect)
+
+    selected = _device_selection("7")
+
+    assert requested == ["cuda:7"]
+    assert selected.identity == identity
+    assert selected.runtime_device == "cuda:7"
 
 
 def test_cli_lists_model_presets(capsys) -> None:

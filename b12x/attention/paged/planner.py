@@ -1411,6 +1411,9 @@ def _plan_decode_graph_capacity_heuristic(
         capacity_max_chunks_per_request = _ceil_div(
             analytic_total_work_budget, batch
         )
+        architecture_max_chunks = max(
+            architecture_max_chunks, capacity_max_chunks_per_request
+        )
     else:
         capacity_max_work_items = (
             batch * query_tiles_per_request * max_chunks_per_request

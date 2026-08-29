@@ -1436,6 +1436,52 @@ def test_decode_graph_page128_laguna_gqa6_uses_measured_chunk_budget(
     assert capacity.max_partial_rows == total_work_items
 
 
+@pytest.mark.parametrize(
+    ("graph_ctas_per_sm", "max_request_chunks", "total_work_items"),
+    ((1, 24, 47), (3, 71, 141)),
+)
+def test_decode_graph_page128_laguna_gqa6_preserves_uneven_work_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    graph_ctas_per_sm: int,
+    max_request_chunks: int,
+    total_work_items: int,
+) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            major=12,
+            minor=0,
+            multi_processor_count=188,
+            name="Synthetic SM120",
+        ),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _device: (12, 0),
+    )
+
+    capacity = plan_decode_graph_capacity(
+        device=torch.device("cuda:0"),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        num_q_heads=24,
+        num_kv_heads=4,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        page_size=128,
+        batch=2,
+        max_cache_page_count=128,
+        graph_ctas_per_sm=graph_ctas_per_sm,
+    )
+
+    assert capacity.architecture_max_chunks_per_request == max_request_chunks
+    assert capacity.max_chunks_per_request == max_request_chunks
+    assert capacity.max_work_items == total_work_items
+    assert capacity.max_partial_rows == total_work_items
+
+
 def test_decode_graph_ctas_per_sm_uses_smaller_minimax_bs1_to_bs4_budget() -> None:
     for kv_dtype in (torch.bfloat16, torch.float8_e4m3fn):
         assert (

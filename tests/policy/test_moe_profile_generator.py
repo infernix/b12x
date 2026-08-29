@@ -37,6 +37,7 @@ from b12x.policy.generation.providers.moe_gpu_worker import (
     _measurement_seed,
     _MoeGeometrySession,
     _MoeProcessSession,
+    _MoeRemoteWorkerError,
     _packed_weights,
     _reset_cuda_graphs,
     _trellis_weights,
@@ -609,6 +610,51 @@ def test_production_moe_factory_isolates_each_geometry_process(tmp_path) -> None
     session = MoeGpuBenchmarkFactory()(generator._geometries[0], _context(tmp_path))
 
     assert isinstance(session, _MoeProcessSession)
+
+
+def test_moe_process_session_retries_accelerator_failure_once(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    generator = _generator([])
+    geometry = generator._geometries[0]
+    case = next(case for case in generator._cases if case.geometry == geometry)
+    session = _MoeProcessSession(geometry, _context(tmp_path))
+    candidate = session.candidates[0]
+    measurement = MoeMeasurement(
+        candidate=candidate,
+        latency_us=10.0,
+        cosine=1.0,
+    )
+    requests = []
+    starts = []
+    discards = []
+
+    monkeypatch.setattr(session, "_start", lambda: starts.append("start"))
+
+    def request(operation, **payload):
+        requests.append((operation, payload))
+        if len(requests) == 1:
+            raise _MoeRemoteWorkerError(
+                operation="measure",
+                exception_type="AcceleratorError",
+                error="CUDA illegal address",
+            )
+        return {"measurements": [measurement.to_dict()]}
+
+    monkeypatch.setattr(session, "_request", request)
+    monkeypatch.setattr(
+        session,
+        "_discard_worker",
+        lambda: discards.append("discard"),
+    )
+
+    (result,) = session.measure(case, (candidate,), correctness=True)
+
+    assert len(starts) == 2
+    assert len(requests) == 2
+    assert discards == ["discard"]
+    assert result.metrics["worker_retries"] == 1
 
 
 def test_moe_geometry_worker_binds_device_before_starting_session(
