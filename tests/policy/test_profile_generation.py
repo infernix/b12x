@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from b12x.policy import ComponentPolicy, DeviceIdentity
 from b12x.policy.generation import (
@@ -18,6 +20,7 @@ from b12x.policy.generation import (
     select_measurement_partitions,
     WorkEstimate,
 )
+from b12x.policy.generation import parallel
 from b12x.policy.generation.progress import NullProgressReporter
 from b12x.policy.generation.measured import (
     GpuProbeMeasurement,
@@ -63,6 +66,38 @@ def test_parallel_device_ranges_expand_without_duplicates() -> None:
         _parse_devices("0-2,2")
     with pytest.raises(ValueError, match="ascending"):
         _parse_devices("3-1")
+
+
+def test_parallel_worker_reports_ready_after_initialization(monkeypatch) -> None:
+    events = []
+    device = SimpleNamespace(identity=object(), ordinal=3)
+
+    class DeviceQueue:
+        def get(self):
+            return "cuda:3"
+
+    class ProgressQueue:
+        def put(self, event):
+            events.append(event)
+
+    monkeypatch.setattr(parallel, "detect_device", lambda _spec: device)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _ordinal: None)
+    for name in (
+        "_WORKER_DEVICE",
+        "_WORKER_PROGRESS_QUEUE",
+        "_WORKER_REGISTRY",
+        "_WORKER_STOP_EVENT",
+    ):
+        monkeypatch.setattr(parallel, name, None)
+
+    parallel._initialize_worker(
+        DeviceQueue(),
+        ProgressQueue(),
+        object(),
+        ComponentGeneratorRegistry,
+    )
+
+    assert events == [parallel._WorkerReady(device_ordinal=3)]
 
 
 @dataclass(frozen=True)

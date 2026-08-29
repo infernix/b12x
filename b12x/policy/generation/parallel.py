@@ -72,6 +72,11 @@ class _MeasurementProgress:
     detail: str
 
 
+@dataclass(frozen=True, kw_only=True)
+class _WorkerReady:
+    device_ordinal: int
+
+
 class _WorkerProgressReporter:
     def __init__(self, partition: MeasurementPartition) -> None:
         self._partition = partition
@@ -140,6 +145,7 @@ def _initialize_worker(
     _WORKER_PROGRESS_QUEUE = progress_queue
     _WORKER_REGISTRY = registry_factory()
     _WORKER_STOP_EVENT = stop_event
+    progress_queue.put(_WorkerReady(device_ordinal=detected.ordinal))
 
 
 def _run_task(task: _MeasurementTask) -> _MeasurementResult:
@@ -256,10 +262,35 @@ def run_parallel_measurements(
             progress_task = progress.add_task(
                 "parallel GPU measurements",
                 total=sum(item.work_units for item in partitions),
-                detail=f"{len(partitions)} partitions",
+                detail=f"0/{worker_count} GPUs online · {len(partitions)} partitions",
             )
             reported = {partition: 0 for partition in partitions}
             completed: set[MeasurementPartition] = set()
+            worker_tasks: dict[int, int] = {}
+            worker_completed: dict[int, int] = {}
+
+            def ensure_worker_task(device_ordinal: int) -> int:
+                task = worker_tasks.get(device_ordinal)
+                if task is not None:
+                    return task
+                task = progress.add_task(
+                    f"cuda:{device_ordinal}",
+                    total=None,
+                    detail="ready",
+                )
+                worker_tasks[device_ordinal] = task
+                worker_completed[device_ordinal] = 0
+                return task
+
+            def update_overall(*, advance: int = 0) -> None:
+                progress.update(
+                    progress_task,
+                    advance=advance,
+                    detail=(
+                        f"{len(worker_tasks)}/{worker_count} GPUs online · "
+                        f"{len(completed)}/{len(partitions)} partitions"
+                    ),
+                )
 
             def drain_progress() -> None:
                 while True:
@@ -267,22 +298,27 @@ def run_parallel_measurements(
                         event = progress_queue.get_nowait()
                     except Empty:
                         return
+                    if isinstance(event, _WorkerReady):
+                        ensure_worker_task(event.device_ordinal)
+                        update_overall()
+                        continue
                     if not isinstance(event, _MeasurementProgress):
                         raise TypeError("worker progress event has the wrong type")
                     partition = event.partition
                     if partition in completed:
                         continue
+                    worker_task = ensure_worker_task(event.device_ordinal)
                     remaining = partition.work_units - reported[partition]
                     units = min(max(event.units, 0), remaining)
                     reported[partition] += units
                     progress.update(
-                        progress_task,
-                        advance=units,
+                        worker_task,
                         detail=(
-                            f"cuda:{event.device_ordinal} "
-                            f"{partition.component_id}: {event.detail}"
+                            f"{worker_completed[event.device_ordinal]} done · "
+                            f"{partition.component_id} · {event.detail}"
                         ),
                     )
+                    update_overall(advance=units)
 
             pending = set(futures)
             while pending:
@@ -294,7 +330,15 @@ def run_parallel_measurements(
                 drain_progress()
                 for future in done:
                     partition = futures[future]
-                    result = future.result()
+                    try:
+                        result = future.result()
+                    except Exception:
+                        console.print(
+                            "[bold red]GPU measurement partition failed:[/bold red] "
+                            f"{partition.component_id}/{partition.partition_id}"
+                        )
+                        console.print_exception(show_locals=False)
+                        raise
                     if result.partition != partition:
                         raise RuntimeError(
                             "measurement worker returned the wrong partition"
@@ -303,15 +347,26 @@ def run_parallel_measurements(
                     remaining = partition.work_units - reported[partition]
                     reported[partition] += remaining
                     completed.add(partition)
+                    worker_task = ensure_worker_task(result.device_ordinal)
+                    worker_completed[result.device_ordinal] += 1
                     progress.update(
-                        progress_task,
-                        advance=remaining,
+                        worker_task,
                         detail=(
-                            f"cuda:{result.device_ordinal} completed "
-                            f"{partition.component_id}"
+                            f"{worker_completed[result.device_ordinal]} done · "
+                            f"completed {partition.component_id}"
                         ),
                     )
+                    update_overall(advance=remaining)
             drain_progress()
+            for device_ordinal, worker_task in worker_tasks.items():
+                progress.update(
+                    worker_task,
+                    total=1,
+                    completed=1,
+                    detail=(
+                        f"{worker_completed[device_ordinal]} partitions · complete"
+                    ),
+                )
     except BaseException:
         stop_event.set()
         for future in futures:

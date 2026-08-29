@@ -468,7 +468,14 @@ class MoeDecodeGenerator:
             raw_measurements = cached.get("measurements")
             if not isinstance(raw_measurements, list):
                 raise TypeError("MoE race checkpoint measurements must be an array")
-            return tuple(MoeMeasurement.from_dict(item) for item in raw_measurements)
+            cached_measurements = tuple(
+                MoeMeasurement.from_dict(item) for item in raw_measurements
+            )
+            if any(
+                item.error is None and item.latency_us is not None
+                for item in cached_measurements
+            ):
+                return cached_measurements
 
         measurements = session.measure(
             case,

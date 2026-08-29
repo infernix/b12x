@@ -265,6 +265,62 @@ def test_staged_moe_generator_keeps_regional_winners_and_resumes(tmp_path) -> No
     )
 
 
+def test_moe_resume_retries_checkpoint_when_every_candidate_errored(
+    tmp_path,
+) -> None:
+    calls = []
+    generator = _generator(calls)
+    context = _context(tmp_path)
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    case = next(
+        case
+        for case in generator._cases
+        if case.num_tokens == 4 and case.route_pattern == "balanced"
+    )
+    candidates = _Session([], tunable=True).candidates
+    checkpoints.save(
+        generator.component_id,
+        f"screen-{case.case_id}",
+        {
+            "schema_version": 1,
+            "generation": context.checkpoint_metadata(),
+            "case_id": case.case_id,
+            "query": case.query(),
+            "route_pattern": case.route_pattern,
+            "candidate_ids": [candidate.candidate_id for candidate in candidates],
+            "measurements": [
+                MoeMeasurement(
+                    candidate=candidate,
+                    latency_us=None,
+                    cosine=None,
+                    error="transient worker failure",
+                ).to_dict()
+                for candidate in candidates
+            ],
+        },
+    )
+
+    generator.generate(
+        context,
+        progress=NullProgressReporter(),
+        checkpoints=checkpoints,
+    )
+
+    assert calls[0] == (
+        case.case_id,
+        tuple(candidate.candidate_id for candidate in candidates),
+    )
+    refreshed = checkpoints.load(
+        generator.component_id,
+        f"screen-{case.case_id}",
+    )
+    assert refreshed is not None
+    assert all(
+        measurement["error"] is None
+        for measurement in refreshed["measurements"]
+    )
+
+
 def test_moe_measurement_inputs_are_route_pattern_controlled() -> None:
     cases = _generator([])._cases
     matched = [case for case in cases if case.top_k == 2 and case.num_tokens == 4]
