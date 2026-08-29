@@ -20,6 +20,7 @@ from b12x.policy.generation.moe_corpus import (
     expand_sweep_cases,
 )
 from b12x.policy.generation.progress import NullProgressReporter
+from b12x.policy.generation.providers import moe_gpu_worker
 from b12x.policy.generation.providers.moe import (
     MoeCandidate,
     MoeDecodeGenerator,
@@ -552,6 +553,59 @@ def test_production_moe_factory_isolates_each_geometry_process(tmp_path) -> None
     session = MoeGpuBenchmarkFactory()(generator._geometries[0], _context(tmp_path))
 
     assert isinstance(session, _MoeProcessSession)
+
+
+def test_moe_geometry_worker_binds_device_before_starting_session(
+    monkeypatch,
+) -> None:
+    events = []
+
+    class Connection:
+        def __init__(self) -> None:
+            self.sent = []
+
+        def send(self, message) -> None:
+            self.sent.append(message)
+
+        def recv(self):
+            return {"operation": "close"}
+
+        def close(self) -> None:
+            events.append("connection.close")
+
+    class Session(AbstractContextManager["Session"]):
+        candidates = ()
+
+        def __init__(self, geometry, context) -> None:
+            del geometry, context
+            events.append("session.init")
+
+        def __enter__(self) -> "Session":
+            events.append("session.enter")
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            events.append("session.exit")
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "set_device",
+        lambda ordinal: events.append(("set_device", ordinal)),
+    )
+    monkeypatch.setattr(moe_gpu_worker, "_MoeGeometrySession", Session)
+    connection = Connection()
+
+    moe_gpu_worker._moe_geometry_worker(
+        connection,
+        object(),
+        SimpleNamespace(device_ordinal=7),
+    )
+
+    assert events[:3] == [("set_device", 7), "session.init", "session.enter"]
+    assert connection.sent == [
+        {"ok": True, "candidates": []},
+        {"ok": True, "closed": True},
+    ]
 
 
 def test_production_moe_resume_does_not_start_a_gpu_worker(tmp_path) -> None:

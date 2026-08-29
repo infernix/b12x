@@ -1054,6 +1054,9 @@ def _moe_geometry_worker(
     context: GenerationContext,
 ) -> None:
     try:
+        import torch
+
+        torch.cuda.set_device(context.device_ordinal)
         with _MoeGeometrySession(geometry, context) as session:
             connection.send(
                 {
