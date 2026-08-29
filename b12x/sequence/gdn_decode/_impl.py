@@ -9,6 +9,7 @@ from typing import Literal
 
 import torch
 
+from b12x.policy import PolicyContext, get_auto_policy
 from b12x._lib.scratch import (
     ScratchBufferSpec,
     scratch_buffer_spec,
@@ -20,6 +21,7 @@ from b12x._lib.scratch_layout import (
     dtype_nbytes,
     materialize_scratch_view,
 )
+from ._policy import GDN_POLICY, GdnQuery
 
 
 GateActivation = Literal["silu", "sigmoid"]
@@ -145,6 +147,7 @@ class Plan:
     recurrent_num_warps: int = 1
     norm_block: int = 128
     norm_num_warps: int = 4
+    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -220,11 +223,28 @@ class KdaBinding:
     output: torch.Tensor
 
 
-def plan(caps: Caps) -> Plan:
+def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
     """Plan GDN decode for a fixed serving capacity and state layout."""
 
     if not isinstance(caps, Caps):
         raise TypeError(f"caps must be Caps, got {type(caps)!r}")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        GDN_POLICY,
+        GdnQuery(
+            gate_activation=caps.gate_activation,
+            qk_l2norm=caps.qk_l2norm,
+            state_dtype=str(caps.state_dtype).removeprefix("torch."),
+            key_heads=caps.key_heads,
+            value_heads=caps.value_heads,
+            max_seqs=caps.max_seqs,
+            max_tokens=caps.max_tokens,
+            state_index_columns=caps.state_index_columns,
+        ),
+    )
     error_code_offset_bytes = align_up(0, SCRATCH_ALIGN_BYTES)
     cursor = error_code_offset_bytes + dtype_nbytes(torch.int32)
     duplicate_table_offset_bytes = align_up(cursor, SCRATCH_ALIGN_BYTES)
@@ -241,6 +261,7 @@ def plan(caps: Caps) -> Plan:
         duplicate_table_offset_bytes=duplicate_table_offset_bytes,
         error_code_offset_bytes=error_code_offset_bytes,
         _scratch_specs=(spec,),
+        policy_resolution=resolution,
     )
 
 

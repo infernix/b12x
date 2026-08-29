@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from b12x.attention.paged._policy import GqaConfig
 from b12x.attention.paged.planner import (
     PagedPlanBudget,
     build_decode_chunk_pages_lut,
@@ -17,6 +18,7 @@ from b12x.attention.paged.planner import (
     resolve_decode_graph_ctas_per_sm,
     use_paged_extend_fp8_pv_repack,
 )
+from b12x.policy import FrozenMapping
 from b12x.attention.paged._scratch import (
     B12XPagedAttentionScratchCaps,
     _paged_attention_scratch_layout,
@@ -1495,10 +1497,16 @@ def test_sm12x_h256_decode_uses_one_wave_only_when_it_fills_most_sms(
     sm_count: int,
     expected_chunks: dict[int, int],
 ) -> None:
+    monkeypatch.setenv("B12X_POLICY_MODE", "heuristic-only")
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _device: SimpleNamespace(multi_processor_count=sm_count),
+        lambda _device: SimpleNamespace(
+            major=capability[0],
+            minor=capability[1],
+            multi_processor_count=sm_count,
+            name="Synthetic GPU",
+        ),
     )
     monkeypatch.setattr(
         torch.cuda,
@@ -1552,6 +1560,38 @@ def test_build_decode_chunk_pages_lut_uses_heuristic() -> None:
 
     assert lut[:8] == (1, 1, 1, 1, 1, 1, 1, 1)
     assert lut[8:] == (2, 2, 2, 2, 2, 2, 2, 2)
+
+
+def test_gqa_profile_factors_chunk_lut_losslessly() -> None:
+    max_pages = 2_048
+    max_chunks = 24
+    base_lut = tuple(
+        1 if page_count <= 16 else 6 if page_count <= 256 else 24
+        for page_count in range(1, max_pages + 1)
+    )
+    chunk_pages_lut = tuple(
+        max(base, (page_count + max_chunks - 1) // max_chunks)
+        for page_count, base in enumerate(base_lut, start=1)
+    )
+    capacity = SimpleNamespace(
+        graph_ctas_per_sm=2,
+        cta_tile_q=16,
+        query_tiles_per_request=1,
+        architecture_max_chunks_per_request=96,
+        max_chunks_per_request=max_chunks,
+        max_work_items=max_chunks,
+        max_partial_rows=max_chunks,
+        max_effective_kv_pages=max_pages,
+        worst_page_count=max_pages,
+        chunk_pages_lut=chunk_pages_lut,
+    )
+
+    config = GqaConfig.from_capacity(capacity)
+    round_trip = GqaConfig.from_profile(FrozenMapping(config.profile_dict()))
+
+    assert config.chunk_pages_lut() == chunk_pages_lut
+    assert round_trip == config
+    assert len(config.base_chunk_pages_runs) < 10
 
 
 def test_decode_graph_page128_reuses_page64_lut_policy() -> None:

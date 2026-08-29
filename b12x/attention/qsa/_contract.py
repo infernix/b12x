@@ -9,6 +9,8 @@ from dataclasses import dataclass
 import torch
 
 from ..._lib.scratch import ScratchBufferSpec, scratch_buffer_spec, scratch_tensor
+from ...policy import PolicyContext, PolicyResolution, get_auto_policy
+from ._policy import QSA_POLICY, QsaConfig, QsaQuery
 
 _ALIGN_BYTES = 256
 _SCORE_WORKSPACE_LIMIT_BYTES = 128 * 1024 * 1024
@@ -417,6 +419,7 @@ class Plan:
     score_workspace_width: int
     num_score_chunks: int
     max_split_row_product: int
+    policy_resolution: PolicyResolution[QsaConfig]
     _layout: _ScratchLayout
     _scratch_specs: tuple[ScratchBufferSpec, ...]
 
@@ -682,8 +685,37 @@ def _scratch_layout(
     )
 
 
-def plan(caps: Caps) -> Plan:
+def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
     """Plan QSA policy and one caller-owned scratch allocation."""
+    if not isinstance(caps, Caps):
+        raise TypeError("caps must be qsa.Caps")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        QSA_POLICY,
+        QsaQuery(
+            q_dtype=str(caps.dtype).removeprefix("torch."),
+            kv_dtype=str(caps.kv_dtype).removeprefix("torch."),
+            q_heads=caps.q_heads,
+            kv_heads=caps.kv_heads,
+            head_dim=caps.head_dim,
+            index_heads=caps.index_heads,
+            index_kv_heads=caps.index_kv_heads,
+            index_head_dim=caps.index_head_dim,
+            index_rotary_dim=caps.index_rotary_dim,
+            main_page_size=caps.main_page_size,
+            max_batch=caps.max_batch,
+            max_q_rows=caps.max_q_rows,
+            max_seq_len=caps.max_seq_len,
+            max_speculative_tokens=caps.max_speculative_tokens,
+            compress_ratio=caps.compress_ratio,
+            budget=caps.budget,
+            position_axes=caps.position_axes,
+            mrope_interleaved=caps.mrope_interleaved,
+        ),
+    )
     (
         layout,
         score_chunk_groups,
@@ -699,6 +731,7 @@ def plan(caps: Caps) -> Plan:
         score_workspace_width=score_workspace_width,
         num_score_chunks=num_score_chunks,
         max_split_row_product=max_split_row_product,
+        policy_resolution=resolution,
         _layout=layout,
         _scratch_specs=(
             scratch_buffer_spec(

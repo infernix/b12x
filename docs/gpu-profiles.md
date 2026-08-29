@@ -1,0 +1,143 @@
+# GPU component profiles
+
+GPU profiles replace component-local tuning guesses with generated decisions for
+recognized devices. They are consulted while plans are built; binding and replay
+remain allocation-free and do not perform profile lookup.
+
+## Integrator sequence
+
+Omitting a policy synthesizes the cached AUTO policy for the plan's device:
+
+```python
+from b12x.attention import paged
+
+caps = paged.Caps(...)
+plan = paged.plan(caps)
+binding = paged.bind(plan, ...)
+paged.compile(binding=binding)
+paged.run(binding=binding)
+```
+
+An integrator that constructs several component plans can resolve the device once
+and pass one immutable context through all of them:
+
+```python
+from b12x.moe import fused_moe
+from b12x.policy import get_auto_policy
+from b12x.sequence import gdn_decode
+
+policy = get_auto_policy("cuda")
+gdn_plan = gdn_decode.plan(gdn_caps, policy=policy)
+moe_plan = fused_moe.plan_execution(
+    experts=experts,
+    capacity=fused_moe.ExecutionCapacity(max_tokens=8, top_k=10),
+    policy=policy,
+)
+```
+
+The same contract is used by every planned op: attention, GEMM scratch plans,
+MoE, normalization, quantization, and sequence components. A component owns its
+typed query, profile decoder, heuristic, validation, planning, and execution.
+The generic policy layer owns device matching, precedence, provenance,
+serialization, and registry lookup. Components with only one production
+implementation still resolve a typed backend config so a future implementation
+can be introduced without changing the integration sequence.
+
+`b12x.policy.list_planning_components()` is the authoritative inventory for
+every planned op. All built-in planned ops are `profiled` and own lazy
+runtime-policy and generator registrations. Package loading rejects an embedded
+profile that omits a registered component. The component schema is validated
+before a matching config is returned; invalid matching data fails closed.
+
+## Precedence and overrides
+
+Resolution order is:
+
+1. A call-specific config override.
+2. A component override stored in the `PolicyContext`.
+3. A matching entry in the library-embedded device profile.
+4. The component heuristic when the device, component, or query is not covered.
+
+A matching embedded entry is authoritative: invalid embedded data fails closed
+instead of falling back to a heuristic. Explicit operational modes remain
+available for qualification and emergency rollback:
+
+```python
+from b12x.policy import PolicyContext, PolicyMode
+
+heuristic = PolicyContext.for_device(
+    "cuda",
+    mode=PolicyMode.HEURISTIC_ONLY,
+)
+preplanned = PolicyContext.for_device(
+    "cuda",
+    mode=PolicyMode.PREPLANNED_ONLY,
+)
+```
+
+`B12X_POLICY_MODE=auto|heuristic-only|preplanned-only` selects the default
+context used when an integration omits an explicit policy. Explicit contexts and
+component config overrides still take precedence.
+
+## Inspecting model selections
+
+The model-policy inspector expands a reviewed model preset into its relevant
+component queries and prints the selected kernels, configs, rules, and
+provenance. It performs policy lookup only and does not allocate model weights:
+
+```bash
+./scripts/inspect_model_policy.py --list-models
+./scripts/inspect_model_policy.py qwen3.8-flash-next-180b \
+    --tp 1 --device gb10
+./scripts/inspect_model_policy.py qwen3.8-27b \
+    --tp 2 --device nvidia.gb10.48sm --json
+```
+
+The installed command is `b12x-inspect-model-policy`. Device selection accepts
+`auto`, an embedded profile ID, or an unambiguous product-name fragment. Each
+row reports `preplanned` or `heuristic`, so uncovered shapes are visible rather
+than silently presented as tuned decisions.
+
+## Generation boundary
+
+One top-level command discovers every registered component, prints the complete
+work estimate, runs every provider, reduces measured races into decision trees,
+validates the serialized profile, and optionally embeds the compact runtime
+payload:
+
+```bash
+./scripts/generate_gpu_profile.py --dry-run
+./scripts/generate_gpu_profile.py --overwrite --embed
+```
+
+No `--components` argument is needed for a full device profile; the default is
+all registered components. `--components` exists only for targeted development
+and resume diagnostics. Every completed provider must report at least one real
+production-path GPU measurement. Components with one legal implementation run
+a correctness-gated qualification sweep rather than inventing alternatives or
+serializing an unmeasured heuristic.
+
+Completed MoE geometries resume entirely from checkpoint metadata. Candidate
+enumeration and eligibility run on the host; a CUDA worker and expert weights
+are created lazily only when a race checkpoint is missing.
+
+The built-in measured corpus covers common model geometries and TP sizes 1
+through 16,
+common top-k and decode token counts, multiple route distributions, GDN serving
+shapes, GQA context/page/KV-dtype combinations, and dense and sparse MLA shapes.
+Unaligned low-width MoE shards are padded to their recipe's physical minimum
+instead of being discarded.
+
+MoE measures every token count from 1 through 8 and additional anchors through
+128. Reduction fills the bounded 1--128 serving domain from the nearest valid
+measured anchor. It never extends micro beyond eight tokens or Triton route
+packing beyond 256 routed rows, and it does not extrapolate outside the recorded
+domain. Profile coverage reports measured and synthesized runtime query counts
+separately.
+
+Corpus definitions live in generator code and are not repeated or referenced in
+JSON. The full local artifact retains the device, settings, aggregate winners,
+and source revision. The checkpoint tree retains per-candidate correctness and
+timing results needed to audit a run. Package data under
+`b12x/policy/_profiles/data/` is gzip-compressed and contains only the validated
+runtime planner: no corpus pointers, repeated evidence, coverage, or metadata.
