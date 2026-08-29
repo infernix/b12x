@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from b12x.policy import ComponentPolicy, DeviceIdentity
+from b12x.policy import EMBEDDED_REGISTRY, ComponentPolicy, DeviceIdentity
 from b12x.policy.generation import (
     CheckpointStore,
     ComponentGenerationResult,
@@ -35,6 +35,7 @@ from b12x.tools.generate_gpu_profile import (
     _is_generated_profile_data,
     _parse_devices,
     _parser,
+    _profile_id_for_device,
 )
 
 _DEVICE = DeviceIdentity(
@@ -87,6 +88,14 @@ def test_parallel_device_ranges_expand_without_duplicates() -> None:
         _parse_devices("0-2,2")
     with pytest.raises(ValueError, match="ascending"):
         _parse_devices("3-1")
+
+
+def test_default_profile_id_reuses_embedded_multi_target_profile() -> None:
+    profile = EMBEDDED_REGISTRY.get("nvidia.rtx.pro.6000.blackwell")
+
+    assert {
+        _profile_id_for_device(target) for target in profile.targets
+    } == {profile.profile_id}
 
 
 def test_parallel_worker_reports_ready_after_initialization(monkeypatch) -> None:
@@ -263,6 +272,46 @@ def test_partial_artifact_merge_replaces_only_generated_components(
         "attention.gqa",
         "moe.decode",
     }
+
+
+def test_partial_artifact_merge_preserves_base_target_aliases(tmp_path) -> None:
+    context = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="abc123",
+        settings=GenerationSettings(),
+    )
+    base = generate_profile_artifact(
+        profile_id="nvidia.synthetic.48sm",
+        generators=(_Generator("attention.gqa"), _Generator("moe.decode")),
+        context=context,
+        progress=NullProgressReporter(),
+    )
+    alias = DeviceIdentity(
+        vendor=_DEVICE.vendor,
+        compute_capability=_DEVICE.compute_capability,
+        sm_count=_DEVICE.sm_count,
+        product_name="Synthetic GPU Alias",
+    )
+    base["profile"]["targets"].append(
+        {
+            "vendor": alias.vendor,
+            "compute_capability": list(alias.compute_capability),
+            "sm_count": alias.sm_count,
+            "product_name": alias.product_name,
+        }
+    )
+    update = generate_profile_artifact(
+        profile_id="nvidia.synthetic.48sm",
+        generators=(_Generator("moe.decode"),),
+        context=context,
+        progress=NullProgressReporter(),
+    )
+
+    merged = merge_profile_artifacts(base, update)
+
+    assert len(merged["profile"]["targets"]) == 2
 
 
 def test_source_fingerprint_excludes_generated_profile_payloads() -> None:

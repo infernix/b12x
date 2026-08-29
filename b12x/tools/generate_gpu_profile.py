@@ -16,7 +16,12 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from b12x.policy import DetectedDevice, detect_device
+from b12x.policy import (
+    EMBEDDED_REGISTRY,
+    DetectedDevice,
+    DeviceIdentity,
+    detect_device,
+)
 from b12x.policy.generation import (
     ComponentGenerator,
     ComponentGeneratorRegistry,
@@ -125,6 +130,13 @@ def _source_revision() -> str:
 def _profile_id(product_name: str, sm_count: int) -> str:
     slug = re.sub(r"[^a-z0-9]+", ".", product_name.casefold()).strip(".")
     return f"{slug}.{sm_count}sm"
+
+
+def _profile_id_for_device(device: DeviceIdentity) -> str:
+    embedded = EMBEDDED_REGISTRY.find(device)
+    if embedded is not None:
+        return embedded.profile_id
+    return _profile_id(device.product_name, device.sm_count)
 
 
 def _load_registry() -> ComponentGeneratorRegistry:
@@ -332,10 +344,7 @@ def main(argv: list[str] | None = None) -> int:
     detected = detected_devices[0]
     if detected.identity is None or detected.ordinal is None:
         raise RuntimeError("validated CUDA device lost its identity")
-    profile_id = args.profile_id or _profile_id(
-        detected.identity.product_name,
-        detected.identity.sm_count,
-    )
+    profile_id = args.profile_id or _profile_id_for_device(detected.identity)
     work_dir = (args.work_dir or Path(".b12x-profile-work") / profile_id).resolve()
     output = (
         args.output

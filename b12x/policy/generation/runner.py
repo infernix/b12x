@@ -164,8 +164,11 @@ def merge_profile_artifacts(
     parsed_update = profile_from_dict(update_profile)
     if parsed_base.profile_id != parsed_update.profile_id:
         raise ValueError("cannot merge profiles with different profile IDs")
-    if parsed_base.targets != parsed_update.targets:
-        raise ValueError("cannot merge profiles with different device targets")
+    if not frozenset(parsed_update.targets) <= frozenset(parsed_base.targets):
+        raise ValueError(
+            "cannot merge a profile whose device targets are not owned by "
+            "the base profile"
+        )
 
     components = {
         str(component["component_id"]): component
