@@ -9,6 +9,10 @@ import math
 from contextlib import redirect_stdout
 
 from b12x.policy.generation.contracts import GenerationContext
+from b12x.policy.generation.attention_corpus import (
+    COMMON_PREFILL_TOKEN_CAPACITIES,
+    COMMON_SEQUENCE_CAPACITIES,
+)
 from b12x.policy.generation.measured import (
     GpuProbeMeasurement,
     MeasuredPolicyGenerator,
@@ -139,10 +143,25 @@ class _DsaIndexerProbe:
         ("glm53-pooled-spec6", "decode", 6, 4_096, 32, 512),
         ("glm52-decode-bucket16", "decode", 16, 4_096, 32, 2_048),
         ("glm52-extend", "extend", 1, 4_096, 32, 2_048),
+        *(
+            (
+                f"glm52-extend-m{tokens}",
+                "extend",
+                tokens // 128,
+                16_384,
+                32,
+                2_048,
+            )
+            for tokens in COMMON_PREFILL_TOKEN_CAPACITIES
+        ),
     )
     _MSA_CASES = (
         ("minimax-m3-msa-decode", "decode", 4, 4, 8_192),
         ("minimax-m3-msa-prefill", "prefill", 16, 4, 8_192),
+        *(
+            (f"minimax-m3-msa-prefill-m{tokens}", "prefill", tokens, 4, 8_192)
+            for tokens in COMMON_PREFILL_TOKEN_CAPACITIES
+        ),
     )
 
     @property
@@ -190,6 +209,7 @@ class _DsaIndexerProbe:
         for index, (label, mode, rows, cache_len, heads, top_k) in enumerate(
             self._CASES
         ):
+            query_rows = rows if mode == "decode" else rows * 128
             cfg = GLMNSAConfig(num_heads=heads)
             captured = io.StringIO()
             with redirect_stdout(captured):
@@ -242,7 +262,7 @@ class _DsaIndexerProbe:
                     correct=True,
                     metrics={
                         "mode": mode,
-                        "rows": rows,
+                        "query_rows": query_rows,
                         "num_heads": heads,
                         "top_k": top_k,
                     },
@@ -954,6 +974,41 @@ class DsaIndexerGenerator(MeasuredPolicyGenerator):
         )
         queries += tuple(
             DsaIndexerQuery(
+                source_layout="contiguous",
+                mode="prefill",
+                dtype="bfloat16",
+                kv_dtype="uint8",
+                num_q_heads=32,
+                num_idx_heads=1,
+                max_q_rows=rows,
+                max_k_rows=16_384,
+                top_k=2_048,
+                page_size=64,
+                score_mode="dsa",
+                shared_page_table=False,
+            )
+            for rows in COMMON_PREFILL_TOKEN_CAPACITIES
+            if rows != 4_096
+        )
+        queries += tuple(
+            DsaIndexerQuery(
+                source_layout="contiguous",
+                mode="prefill",
+                dtype="float8_e4m3fn",
+                kv_dtype="uint8",
+                num_q_heads=1,
+                num_idx_heads=4,
+                max_q_rows=rows,
+                max_k_rows=8_192,
+                top_k=16,
+                page_size=64,
+                score_mode="msa",
+                shared_page_table=False,
+            )
+            for rows in COMMON_PREFILL_TOKEN_CAPACITIES
+        )
+        queries += tuple(
+            DsaIndexerQuery(
                 source_layout="paged",
                 mode="decode",
                 dtype="bfloat16",
@@ -1003,7 +1058,7 @@ class SparseMlaGenerator(MeasuredPolicyGenerator):
                 head_major_output=False,
             )
             for heads in (64, 32, 16, 8)
-            for rows in (1, 4, 16)
+            for rows in COMMON_SEQUENCE_CAPACITIES
         )
         glm53_queries = tuple(
             SparseMlaQuery(
@@ -1020,7 +1075,7 @@ class SparseMlaGenerator(MeasuredPolicyGenerator):
                 head_major_output=False,
             )
             for heads in (64, 32, 16, 8)
-            for rows in (1, 6, 16)
+            for rows in COMMON_SEQUENCE_CAPACITIES
         )
         super().__init__(
             policy=SPARSE_MLA_POLICY,

@@ -63,8 +63,10 @@ instead of falling back to a heuristic. Explicit operational modes remain
 available for qualification and emergency rollback:
 
 In AUTO mode, a device, component, or query miss logs a warning once for each
-component/device pair before using the heuristic. Explicit `HEURISTIC_ONLY`
-mode is intentional and does not warn.
+distinct component, device, reason, and encoded query before using the
+heuristic. Replanning the same missing query is quiet, while a different
+uncovered capacity is still reported. Explicit `HEURISTIC_ONLY` mode is
+intentional and does not warn.
 
 ```python
 from b12x.policy import PolicyContext, PolicyMode
@@ -198,6 +200,13 @@ common top-k and decode token counts, multiple route distributions, GDN serving
 shapes, GQA context/page/KV-dtype combinations, and dense and sparse MLA shapes.
 Unaligned low-width MoE shards are padded to their recipe's physical minimum
 instead of being discarded.
+
+Attention serving capacities are dense from one through sixteen sequences and
+then use 32, 64, 128, and 256 as larger anchors. Components with a prefill path
+also capture 1,024, 2,048, 4,096, and 8,192 query-token capacities. GDN
+state-index columns are a physical tensor and loop capacity, independent of
+whether an integrator calls the corresponding multi-token transaction
+speculative verification.
 
 MoE measures every token count from 1 through 8 and additional anchors through
 128. Reduction fills the bounded 1--128 serving domain from the nearest valid

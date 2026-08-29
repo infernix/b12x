@@ -29,7 +29,9 @@ NO_POLICY_OVERRIDE = object()
 _COMPONENT_ID_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _QUERY_SCALAR_TYPES = (str, int, float, bool, type(None))
 _RESOLUTION_CACHE_CAPACITY = 4096
-_HEURISTIC_WARNING_KEYS: set[tuple[str, DeviceIdentity | None]] = set()
+_HEURISTIC_WARNING_KEYS: set[tuple[str, DeviceIdentity | None, str, FrozenMapping]] = (
+    set()
+)
 _HEURISTIC_WARNING_LOCK = threading.Lock()
 logger = logging.getLogger(__name__)
 
@@ -49,17 +51,19 @@ def _warn_heuristic_fallback(
     component_id: str,
     device: DeviceIdentity | None,
     reason: str,
+    query: FrozenMapping,
 ) -> None:
-    key = (component_id, device)
+    key = (component_id, device, reason, query)
     with _HEURISTIC_WARNING_LOCK:
         if key in _HEURISTIC_WARNING_KEYS:
             return
         _HEURISTIC_WARNING_KEYS.add(key)
     logger.warning(
-        "b12x policy fallback: %s is using a heuristic on %s because %s",
+        "b12x policy fallback: %s is using a heuristic on %s because %s; query=%s",
         component_id,
         _device_label(device),
         reason,
+        query.to_dict(),
     )
 
 
@@ -383,6 +387,7 @@ class PolicyContext:
                 component_id=component.component_id,
                 device=self.device,
                 reason=fallback_reason,
+                query=cache_key[1],
             )
         resolution = PolicyResolution(
             config=config,

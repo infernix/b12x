@@ -85,7 +85,11 @@ def _component(
     )
 
 
-def _registry(*, config: dict[str, object] | None = None) -> ProfileRegistry:
+def _registry(
+    *,
+    config: dict[str, object] | None = None,
+    component_id: str = "test.decode",
+) -> ProfileRegistry:
     registry = ProfileRegistry()
     registry.register(
         GpuProfile(
@@ -93,7 +97,7 @@ def _registry(*, config: dict[str, object] | None = None) -> ProfileRegistry:
             targets=(_DEVICE,),
             components=(
                 ComponentProfile(
-                    component_id="test.decode",
+                    component_id=component_id,
                     query_schema_version=1,
                     config_schema_version=1,
                     rules=(
@@ -149,21 +153,27 @@ def test_auto_uses_heuristic_for_uncovered_query_or_device() -> None:
     )
 
 
-def test_auto_warns_once_per_heuristic_fallback(caplog) -> None:
+def test_auto_warns_once_per_missing_profile_query(caplog) -> None:
     component = replace(_component(), component_id="test.warning")
-    context = PolicyContext.for_identity(_DEVICE, registry=_registry())
+    context = PolicyContext.for_identity(
+        _DEVICE,
+        registry=_registry(component_id=component.component_id),
+    )
 
     with caplog.at_level(logging.WARNING, logger="b12x.policy.context"):
-        context.resolve(component, _Query(family="a", rows=5))
+        context.resolve(component, _Query(family="a", rows=8))
         context.resolve(component, _Query(family="b", rows=6))
+        context.resolve(component, _Query(family="a", rows=8))
 
     messages = [
         record.getMessage()
         for record in caplog.records
         if "test.warning is using a heuristic" in record.getMessage()
     ]
-    assert len(messages) == 1
-    assert "has no component entry" in messages[0]
+    assert len(messages) == 2
+    assert all("does not cover the query" in message for message in messages)
+    assert any("'family': 'a'" in message for message in messages)
+    assert any("'family': 'b'" in message for message in messages)
 
 
 def test_heuristic_only_does_not_warn(caplog) -> None:

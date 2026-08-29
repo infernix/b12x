@@ -8,11 +8,14 @@ from dataclasses import asdict, dataclass
 
 from .sweep import SweepCase
 
-COMMON_BATCHES = (1, 2, 4, 8, 12, 16)
+COMMON_SEQUENCE_CAPACITIES = (*range(1, 17), 32, 64, 128, 256)
+COMMON_PREFILL_TOKEN_CAPACITIES = (1_024, 2_048, 4_096, 8_192)
+COMMON_BATCHES = COMMON_SEQUENCE_CAPACITIES
 COMMON_CONTEXT_TOKENS = (128, 16_384, 32_768, 65_536, 131_072)
 COMMON_PAGE_SIZES = (64, 128)
 COMMON_KV_DTYPES = ("bfloat16", "float8_e4m3fn")
-QSA_BATCHES = (1, 4, 16, 64)
+GDN_STATE_INDEX_COLUMNS = tuple(range(1, 9))
+QSA_BATCHES = COMMON_SEQUENCE_CAPACITIES
 QSA_CONTEXT_TOKENS = (2_048, 8_192, 32_768, 65_536, 131_072, 262_144)
 QSA_PAGE_SIZES = (16, 64)
 QSA_SPECULATIVE_CONTEXT_TOKENS = (8_192, 65_536, 131_072)
@@ -42,8 +45,6 @@ class GdnGeometry:
     source: str
     state_dtype: str = "float32"
     decay_recipe: str = "gdn"
-    capacity_seqs: tuple[int, ...] = (1, 4)
-    capacity_columns: int = 4
 
     def __post_init__(self) -> None:
         if not self.model_id or not self.source or not self.query_lengths:
@@ -52,13 +53,9 @@ class GdnGeometry:
             raise ValueError("GDN head counts must be positive")
         if any(length <= 0 for length in self.query_lengths):
             raise ValueError("GDN query lengths must be positive")
-        if not self.capacity_seqs or any(value <= 0 for value in self.capacity_seqs):
-            raise ValueError("GDN sequence capacities must be positive")
-        if len(self.capacity_seqs) != len(set(self.capacity_seqs)):
-            raise ValueError("GDN sequence capacities must be unique")
-        if self.capacity_columns < max(self.query_lengths):
+        if max(GDN_STATE_INDEX_COLUMNS) < max(self.query_lengths):
             raise ValueError("GDN column capacity must cover every query length")
-        if max(self.capacity_seqs) < len(self.query_lengths):
+        if max(COMMON_SEQUENCE_CAPACITIES) < len(self.query_lengths):
             raise ValueError("GDN sequence capacity must cover the live batch")
         if self.decay_recipe not in {"gdn", "kda"}:
             raise ValueError("GDN decay recipe must be 'gdn' or 'kda'")
@@ -157,7 +154,6 @@ GDN_GEOMETRIES = (
             value_heads=64 // tp_size,
             source="GLM-5.3 Flash KDA serving geometry",
             decay_recipe="kda",
-            capacity_columns=6,
         )
         for tp_size in (1, 2, 4, 8, 16)
         for query_lengths in ((1,), (6,))
@@ -540,9 +536,12 @@ ATTENTION_BENCHMARK_PRESETS = (
 
 def gdn_cases() -> tuple[SweepCase, ...]:
     cases = []
+    exercised_queries = set()
+    capacity_edges = {}
     for geometry in GDN_GEOMETRIES:
         lengths = geometry.query_lengths
-        for max_seqs in geometry.capacity_seqs:
+        route_columns = 6 if geometry.decay_recipe == "kda" else 4
+        for max_seqs in (1, 4):
             if max_seqs < len(lengths):
                 continue
             query = {
@@ -552,9 +551,12 @@ def gdn_cases() -> tuple[SweepCase, ...]:
                 "value_heads": geometry.value_heads,
                 "state_dtype": geometry.state_dtype,
                 "max_seqs": max_seqs,
-                "max_tokens": max_seqs * geometry.capacity_columns,
-                "state_index_columns": geometry.capacity_columns,
+                "max_tokens": max_seqs * route_columns,
+                "state_index_columns": route_columns,
             }
+            query_key = tuple(sorted(query.items()))
+            if max(lengths) == route_columns:
+                exercised_queries.add(query_key)
             cases.append(
                 SweepCase.create(
                     group_id=geometry.model_id,
@@ -568,6 +570,41 @@ def gdn_cases() -> tuple[SweepCase, ...]:
                     label=f"{geometry.model_id}-capacity-bs{max_seqs}",
                 )
             )
+
+    for geometry in GDN_GEOMETRIES:
+        for max_seqs in COMMON_SEQUENCE_CAPACITIES:
+            for columns in GDN_STATE_INDEX_COLUMNS:
+                query = {
+                    "gate_activation": "sigmoid",
+                    "qk_l2norm": True,
+                    "key_heads": geometry.key_heads,
+                    "value_heads": geometry.value_heads,
+                    "state_dtype": geometry.state_dtype,
+                    "max_seqs": max_seqs,
+                    "max_tokens": max_seqs * columns,
+                    "state_index_columns": columns,
+                }
+                query_key = tuple(sorted(query.items()))
+                capacity_edges.setdefault(query_key, (geometry, query))
+
+    for query_key, (geometry, query) in capacity_edges.items():
+        if query_key in exercised_queries:
+            continue
+        columns = int(query["state_index_columns"])
+        cases.append(
+            SweepCase.create(
+                group_id=geometry.model_id,
+                query=query,
+                scenario="capacity-edge",
+                metadata={
+                    "decay_recipe": geometry.decay_recipe,
+                    "model_id": geometry.model_id,
+                    "query_lengths": [columns],
+                    "source": geometry.source,
+                },
+                label=f"{geometry.model_id}-columns{columns}-edge",
+            )
+        )
     return tuple(cases)
 
 
@@ -716,13 +753,34 @@ def qsa_cases() -> tuple[SweepCase, ...]:
                                 label_suffix="speculative",
                             )
                         )
+                for max_batch in QSA_BATCHES:
+                    for max_q_rows in COMMON_PREFILL_TOKEN_CAPACITIES:
+                        for max_speculative_tokens in (0, 3):
+                            query = _qsa_query(
+                                geometry=geometry,
+                                kv_dtype=kv_dtype,
+                                main_page_size=main_page_size,
+                                max_batch=max_batch,
+                                max_q_rows=max_q_rows,
+                                max_seq_len=131_072,
+                                max_speculative_tokens=max_speculative_tokens,
+                                position_axes=3,
+                                mrope_interleaved=True,
+                            )
+                            cases.append(
+                                _qsa_case(
+                                    geometry=geometry,
+                                    query=query,
+                                    label_suffix=f"prefill-{max_q_rows}",
+                                )
+                            )
     return tuple(cases)
 
 
 def mla_cases() -> tuple[SweepCase, ...]:
     cases = []
-    decode_rows = (1, 2, 4, 8, 16)
-    extend_rows = (128, 2_048, 16_384)
+    decode_rows = COMMON_SEQUENCE_CAPACITIES
+    extend_rows = (128, *COMMON_PREFILL_TOKEN_CAPACITIES, 16_384)
     cache_tokens = (1_024, 32_768, 65_536, 131_072)
     for geometry in MLA_GEOMETRIES:
         for kv_dtype in COMMON_KV_DTYPES:
@@ -767,7 +825,10 @@ def mla_cases() -> tuple[SweepCase, ...]:
 def sparse_mla_cases() -> tuple[SweepCase, ...]:
     cases = []
     for geometry in SPARSE_MLA_GEOMETRIES:
-        for rows in (1, 4, 16, 64, 256, 4_096):
+        for rows in (
+            *COMMON_SEQUENCE_CAPACITIES,
+            *COMMON_PREFILL_TOKEN_CAPACITIES,
+        ):
             query = {
                 "layout": geometry.layout,
                 "mode": "decode" if rows <= 256 else "extend",
@@ -803,6 +864,8 @@ def _manifest_payload(component: str) -> dict[str, object]:
         "common_context_tokens": list(COMMON_CONTEXT_TOKENS),
         "common_kv_dtypes": list(COMMON_KV_DTYPES),
         "common_page_sizes": list(COMMON_PAGE_SIZES),
+        "common_prefill_token_capacities": list(COMMON_PREFILL_TOKEN_CAPACITIES),
+        "common_sequence_capacities": list(COMMON_SEQUENCE_CAPACITIES),
     }
     if component == "gdn":
         shared["geometries"] = [asdict(item) for item in GDN_GEOMETRIES]
@@ -840,7 +903,10 @@ __all__ = [
     "COMMON_CONTEXT_TOKENS",
     "COMMON_KV_DTYPES",
     "COMMON_PAGE_SIZES",
+    "COMMON_PREFILL_TOKEN_CAPACITIES",
+    "COMMON_SEQUENCE_CAPACITIES",
     "GDN_GEOMETRIES",
+    "GDN_STATE_INDEX_COLUMNS",
     "GQA_GEOMETRIES",
     "MLA_GEOMETRIES",
     "QSA_GEOMETRIES",

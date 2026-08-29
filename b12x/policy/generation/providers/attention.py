@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from b12x.policy.components import (
     COMPRESSED_SPARSE_MLA_ATTENTION,
@@ -11,7 +11,10 @@ from b12x.policy.components import (
     MLA_ATTENTION,
 )
 from b12x.policy.generation.attention_corpus import (
+    COMMON_PREFILL_TOKEN_CAPACITIES,
+    COMMON_SEQUENCE_CAPACITIES,
     GDN_GEOMETRIES,
+    GDN_STATE_INDEX_COLUMNS,
     GQA_GEOMETRIES,
     MLA_GEOMETRIES,
     SPARSE_MLA_GEOMETRIES,
@@ -67,6 +70,7 @@ class _AttentionGenerator(DiscreteSweepGenerator):
         benchmark_factory: SweepBenchmarkFactory | None,
         query_schema_version: int = 1,
         config_schema_version: int = 1,
+        nearest_range_bounds: Mapping[str, tuple[int, int]] | None = None,
     ) -> None:
         del corpus_name
         super().__init__(
@@ -84,6 +88,7 @@ class _AttentionGenerator(DiscreteSweepGenerator):
             coverage={
                 "model_geometries": geometry_count,
             },
+            nearest_range_bounds=nearest_range_bounds,
         )
 
 
@@ -120,6 +125,14 @@ class GdnAttentionGenerator(_AttentionGenerator):
             geometry_count=len(GDN_GEOMETRIES),
             benchmark_factory=benchmark_factory or GdnBenchmarkFactory(),
             config_schema_version=2,
+            nearest_range_bounds={
+                "max_seqs": (1, max(COMMON_SEQUENCE_CAPACITIES)),
+                "max_tokens": (
+                    1,
+                    max(COMMON_SEQUENCE_CAPACITIES) * max(GDN_STATE_INDEX_COLUMNS),
+                ),
+                "state_index_columns": (1, max(GDN_STATE_INDEX_COLUMNS)),
+            },
         )
 
 
@@ -163,12 +176,18 @@ class GqaAttentionGenerator(_AttentionGenerator):
 
 class _QsaProbe:
     _CASES = (
-        ("tp1", 1, 2_048, "bf16"),
-        ("tp1", 4, 8_192, "fp8_e4m3"),
-        ("tp2", 1, 8_192, "fp8_e4m3"),
-        ("tp2", 4, 2_048, "bf16"),
-        ("tp4", 1, 2_048, "fp8_e4m3"),
-        ("tp4", 4, 8_192, "bf16"),
+        ("tp1", 1, 2_048, "bf16", "throughput"),
+        ("tp1", 4, 8_192, "fp8_e4m3", "throughput"),
+        ("tp2", 1, 8_192, "fp8_e4m3", "throughput"),
+        ("tp2", 4, 2_048, "bf16", "throughput"),
+        ("tp4", 1, 2_048, "fp8_e4m3", "throughput"),
+        ("tp4", 4, 8_192, "bf16", "throughput"),
+        *(
+            (profile, rows, 8_192, kv_dtype, "prefill")
+            for profile in ("tp1", "tp2", "tp4")
+            for rows in COMMON_PREFILL_TOKEN_CAPACITIES
+            for kv_dtype in ("bf16", "fp8_e4m3")
+        ),
     )
 
     @property
@@ -180,8 +199,11 @@ class _QsaProbe:
         from benchmarks.benchmark_qsa import BenchmarkCase, PROFILES
 
         return tuple(
-            BenchmarkCase(PROFILES[profile], rows, sequence).name
-            for profile, rows, sequence, _kv_dtype in self._CASES
+            (
+                f"{BenchmarkCase(PROFILES[profile], rows, sequence, kind=kind).name}"
+                f"-{kv_dtype}"
+            )
+            for profile, rows, sequence, kv_dtype, kind in self._CASES
         )
 
     @property
@@ -198,15 +220,18 @@ class _QsaProbe:
         import torch
 
         from benchmarks.benchmark_qsa import BenchmarkCase, PROFILES, _run_case
+        from b12x.policy import PolicyContext, PolicyMode
 
         from .gpu_workers import _l2_flush_fn
 
         device = torch.device("cuda", context.device_ordinal)
         settings = context.settings
         flush = _l2_flush_fn(device, enabled=settings.cold_l2)
+        policy = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
         measurements = []
-        for index, (profile, rows, sequence, kv_dtype) in enumerate(self._CASES):
-            case = BenchmarkCase(PROFILES[profile], rows, sequence)
+        for index, (profile, rows, sequence, kv_dtype, kind) in enumerate(self._CASES):
+            case = BenchmarkCase(PROFILES[profile], rows, sequence, kind=kind)
+            label = f"{case.name}-{kv_dtype}"
             args = argparse.Namespace(
                 seed=settings.seed,
                 main_cache_layout="interleaved",
@@ -221,6 +246,7 @@ class _QsaProbe:
                 device=device,
                 l2_flush=flush,
                 case_index=index,
+                policy=policy,
             )
             timing = result["timing"]
             if not isinstance(timing, Mapping):
@@ -236,7 +262,7 @@ class _QsaProbe:
                 raise TypeError("QSA correctness must be an object")
             measurements.append(
                 GpuProbeMeasurement(
-                    label=case.name,
+                    label=label,
                     latency_us=float(summary["median_us"]),
                     correct=bool(
                         correctness["graph_finite"]
@@ -244,7 +270,9 @@ class _QsaProbe:
                         and correctness["eager_graph_exact"]
                     ),
                     metrics={
+                        "kind": kind,
                         "kv_dtype": kv_dtype,
+                        "rows": rows,
                         "tp_size": PROFILES[profile].tensor_parallel_size,
                     },
                 )

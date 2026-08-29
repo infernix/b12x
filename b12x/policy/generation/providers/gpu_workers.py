@@ -80,7 +80,8 @@ def _build_gdn_buffers(
         raise ValueError("GDN live shape exceeds the profiled capacity")
     if max_tokens != max_sequences * columns:
         raise ValueError("GDN token capacity must equal sequences times columns")
-    state_slots = max_tokens + 1
+    active_state_cells = live_sequences * columns
+    state_slots = max(active_state_cells, live_tokens) + 1
     caps = gdn.Caps(
         device=device,
         max_tokens=max_tokens,
