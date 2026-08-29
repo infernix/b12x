@@ -141,7 +141,10 @@ payload:
 
 No `--components` argument is needed for a full device profile; the default is
 all registered components. `--components` exists only for targeted development
-and resume diagnostics. Every completed provider must report at least one real
+and resume diagnostics. A subset run automatically merges into an existing
+output profile, retaining every unselected component; `--merge-from` selects an
+explicit base when the output does not already exist. Every completed provider
+must report at least one real
 production-path GPU measurement. Components with one legal implementation run
 a correctness-gated qualification sweep rather than inventing alternatives or
 serializing an unmeasured heuristic.

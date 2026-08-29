@@ -29,7 +29,7 @@ def _hyperconnection_cases() -> tuple[SweepCase, ...]:
                 "lowrank": 320,
             },
         )
-        for tokens in (1, 4, 16, 64)
+        for tokens in (1, 4, 16, 64, 128)
     )
 
 
@@ -44,7 +44,7 @@ def _mtp_feedback_cases() -> tuple[SweepCase, ...]:
                 "streams": 4,
             },
         )
-        for tokens in (1, 4, 16, 64)
+        for tokens in (1, 4, 16, 64, 128)
     )
 
 
@@ -276,6 +276,7 @@ class HyperConnectionGenerator(DiscreteSweepGenerator):
             cases=_hyperconnection_cases() if cases is None else cases,
             benchmark_factory=_OneCaseFactory(_HyperConnectionSession),
             coverage={},
+            nearest_range_bounds={"max_tokens": (1, 128)},
         )
 
 
@@ -292,6 +293,7 @@ class MtpFeedbackGenerator(DiscreteSweepGenerator):
             cases=_mtp_feedback_cases() if cases is None else cases,
             benchmark_factory=_OneCaseFactory(_MtpFeedbackSession),
             coverage={},
+            nearest_range_bounds={"max_tokens": (1, 128)},
         )
 
 

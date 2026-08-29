@@ -10,6 +10,7 @@ from .catalog import (
     list_profiled_components,
 )
 from .components import (
+    BF16_VOCAB_PROJECTION,
     BLOCK_FP8_LINEAR,
     COMPRESSED_SPARSE_MLA_ATTENTION,
     DSA_INDEXER,
@@ -65,6 +66,7 @@ EMBEDDED_REGISTRY.freeze()
 
 
 __all__ = [
+    "BF16_VOCAB_PROJECTION",
     "BLOCK_FP8_LINEAR",
     "BackendConfig",
     "COMPRESSED_SPARSE_MLA_ATTENTION",

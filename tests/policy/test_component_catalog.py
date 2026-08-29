@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import b12x
 from b12x.attention.qsa._policy import QSA_POLICY, QsaQuery
+from b12x.gemm.bf16_vocab_projection._policy import (
+    BF16_VOCAB_PROJECTION_POLICY,
+    Bf16VocabProjectionQuery,
+)
 from b12x.policy import (
     EMBEDDED_REGISTRY,
     PlanningPolicyMode,
@@ -83,6 +87,69 @@ def test_qwen_flash_next_qsa_serving_shape_resolves_from_gb10_profile() -> None:
     assert resolution.source is PolicySource.PREPLANNED
     assert resolution.rule_name == "measured-production-implementation"
     assert resolution.config.backend == "cutedsl"
+
+
+def test_qwen_flash_next_vocab_projection_resolves_from_gb10_profile() -> None:
+    profile = EMBEDDED_REGISTRY.get("nvidia.gb10.48sm")
+    context = PolicyContext.for_identity(
+        profile.targets[0],
+        mode=PolicyMode.PREPLANNED_ONLY,
+    )
+
+    resolution = context.resolve(
+        BF16_VOCAB_PROJECTION_POLICY,
+        Bf16VocabProjectionQuery(
+            dtype="bfloat16",
+            max_tokens=1,
+            in_features=2_560,
+            out_features=248_320,
+        ),
+    )
+
+    assert resolution.source is PolicySource.PREPLANNED
+    assert resolution.config.backend == "triton"
+    assert resolution.config.algorithm == "row"
+    assert resolution.config.num_warps == 8
+
+
+def test_qwen_flash_next_128_token_components_resolve_from_gb10_profile() -> None:
+    from b12x.norm.hyperconnection._policy import (
+        HYPERCONNECTION_POLICY,
+        HyperConnectionQuery,
+    )
+    from b12x.sequence.mtp_feedback._policy import (
+        MTP_FEEDBACK_POLICY,
+        MtpFeedbackQuery,
+    )
+
+    profile = EMBEDDED_REGISTRY.get("nvidia.gb10.48sm")
+    context = PolicyContext.for_identity(
+        profile.targets[0],
+        mode=PolicyMode.PREPLANNED_ONLY,
+    )
+
+    hyperconnection = context.resolve(
+        HYPERCONNECTION_POLICY,
+        HyperConnectionQuery(
+            dtype="bfloat16",
+            max_tokens=128,
+            hidden_size=2_560,
+            streams=4,
+            lowrank=320,
+        ),
+    )
+    mtp_feedback = context.resolve(
+        MTP_FEEDBACK_POLICY,
+        MtpFeedbackQuery(
+            dtype="bfloat16",
+            max_tokens=128,
+            hidden_size=2_560,
+            streams=4,
+        ),
+    )
+
+    assert hyperconnection.source is PolicySource.PREPLANNED
+    assert mtp_feedback.source is PolicySource.PREPLANNED
 
 
 def test_qwen_flash_next_planners_are_profile_backed() -> None:

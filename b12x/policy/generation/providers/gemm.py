@@ -7,7 +7,7 @@ import statistics
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
 
-from b12x.policy.components import BLOCK_FP8_LINEAR
+from b12x.policy.components import BF16_VOCAB_PROJECTION, BLOCK_FP8_LINEAR
 from b12x.policy.generation.contracts import GenerationContext
 from b12x.policy.generation.measured import (
     GpuProbeMeasurement,
@@ -37,6 +37,253 @@ _BLOCK_FP8_TILES = (
     (128, 64),
     (128, 128),
 )
+
+_VOCAB_PROJECTION_GEOMETRIES = (
+    ("qwen3.8-flash-next-180b", 2_560, (248_320,)),
+    ("qwen3.8-27b", 5_120, (248_320,)),
+    ("glm-5.3-flash", 4_096, (163_840, 163_968)),
+    ("glm-5.2", 6_144, (163_840, 163_968)),
+)
+_VOCAB_PROJECTION_TP_SIZES = (1, 2, 4, 8, 16)
+
+
+def _bf16_vocab_projection_cases() -> tuple[SweepCase, ...]:
+    cases = []
+    for model_id, in_features, global_vocab_sizes in _VOCAB_PROJECTION_GEOMETRIES:
+        for global_vocab_size in global_vocab_sizes:
+            for tp_size in _VOCAB_PROJECTION_TP_SIZES:
+                if global_vocab_size % tp_size:
+                    continue
+                out_features = global_vocab_size // tp_size
+                cases.append(
+                    SweepCase.create(
+                        group_id=(f"{model_id}-v{global_vocab_size}-tp{tp_size}"),
+                        query={
+                            "dtype": "bfloat16",
+                            "max_tokens": 1,
+                            "in_features": in_features,
+                            "out_features": out_features,
+                        },
+                        scenario=f"{model_id}-tp{tp_size}",
+                        metadata={
+                            "model_id": model_id,
+                            "global_vocab_size": global_vocab_size,
+                            "tp_size": tp_size,
+                        },
+                    )
+                )
+    return tuple(cases)
+
+
+class _Bf16VocabProjectionSession(
+    AbstractContextManager["_Bf16VocabProjectionSession"]
+):
+    def __init__(self, context) -> None:
+        self._context = context
+
+    def __enter__(self) -> "_Bf16VocabProjectionSession":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        import torch
+
+        gc.collect()
+        torch.cuda.synchronize(self._context.device_ordinal)
+        torch.cuda.empty_cache()
+        return None
+
+    def candidates(self, case: SweepCase) -> tuple[SweepCandidate, ...]:
+        in_features = int(case.query["in_features"])
+        direct_block = 1 << (in_features - 1).bit_length()
+        configs = [
+            {
+                "backend": "torch",
+                "algorithm": "torch",
+                "block_k": 0,
+                "num_warps": 0,
+            }
+        ]
+        configs.extend(
+            {
+                "backend": "triton",
+                "algorithm": "row",
+                "block_k": direct_block,
+                "num_warps": num_warps,
+            }
+            for num_warps in (1, 2, 4, 8)
+        )
+        configs.extend(
+            {
+                "backend": "triton",
+                "algorithm": "loop",
+                "block_k": block_k,
+                "num_warps": num_warps,
+            }
+            for block_k in (256, 512, 1_024)
+            for num_warps in (4, 8)
+        )
+        return tuple(SweepCandidate.create(config) for config in configs)
+
+    def measure(
+        self,
+        case: SweepCase,
+        candidates: tuple[SweepCandidate, ...],
+    ) -> tuple[SweepMeasurement, ...]:
+        import torch
+        import torch.nn.functional as torch_functional
+
+        from b12x.gemm import bf16_vocab_projection as projection
+        from b12x.gemm.bf16_vocab_projection._policy import (
+            Bf16VocabProjectionConfig,
+        )
+        from b12x.policy import PolicyContext, PolicyMode
+
+        settings = self._context.settings
+        device = torch.device("cuda", self._context.device_ordinal)
+        in_features = int(case.query["in_features"])
+        out_features = int(case.query["out_features"])
+        generator = torch.Generator(device=device).manual_seed(
+            settings.seed + int(case.case_id[-8:], 16)
+        )
+        with torch.cuda.device(self._context.device_ordinal):
+            source = torch.randn(
+                (1, in_features),
+                dtype=torch.bfloat16,
+                device=device,
+                generator=generator,
+            ).mul_(0.25)
+            weight = torch.randn(
+                (out_features, in_features),
+                dtype=torch.bfloat16,
+                device=device,
+                generator=generator,
+            ).mul_(0.125)
+            expected = torch_functional.linear(source, weight)
+            flush = _l2_flush_fn(device, enabled=settings.cold_l2)
+            base_policy = PolicyContext.for_device(
+                device,
+                mode=PolicyMode.HEURISTIC_ONLY,
+            )
+            measurements = []
+            for candidate in candidates:
+                try:
+                    config = Bf16VocabProjectionConfig.from_profile(candidate.config)
+                    policy = base_policy.with_override(
+                        BF16_VOCAB_PROJECTION,
+                        config,
+                    )
+                    planned = projection.plan(
+                        projection.Caps(
+                            device=device,
+                            max_tokens=1,
+                            in_features=in_features,
+                            out_features=out_features,
+                        ),
+                        policy=policy,
+                    )
+                    binding = projection.bind(
+                        planned,
+                        source=source,
+                        weight=weight,
+                    )
+
+                    def run():
+                        return projection.run(binding)
+
+                    for _ in range(settings.warmup):
+                        run()
+                    torch.cuda.synchronize(device)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        actual = run()
+                    actual.fill_(float("nan"))
+                    graph.replay()
+                    torch.cuda.synchronize(device)
+                    cosine = float(
+                        torch_functional.cosine_similarity(
+                            actual.float(),
+                            expected.float(),
+                        ).item()
+                    )
+                    finite = bool(torch.isfinite(actual).all().item())
+                    allocated_before = torch.cuda.memory_allocated(device)
+                    samples = _cuda_event_samples_us(
+                        graph.replay,
+                        count=settings.groups * settings.repetitions,
+                        device=device,
+                        flush=flush,
+                    )
+                    allocated_after = torch.cuda.memory_allocated(device)
+                    latency_us = _median_of_group_medians(
+                        samples,
+                        groups=settings.groups,
+                        repetitions=settings.repetitions,
+                    )
+                    transferred_bytes = 2 * (
+                        out_features * in_features + in_features + out_features
+                    )
+                    measurements.append(
+                        SweepMeasurement(
+                            candidate=candidate,
+                            latency_us=latency_us,
+                            correct=(
+                                finite
+                                and cosine >= settings.minimum_cosine
+                                and allocated_after <= allocated_before
+                            ),
+                            metrics={
+                                "cosine": cosine,
+                                "finite": finite,
+                                "replay_allocation_bytes": (
+                                    allocated_after - allocated_before
+                                ),
+                                "effective_bandwidth_gbps": (
+                                    transferred_bytes / latency_us / 1_000.0
+                                ),
+                            },
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 - failed configs survive
+                    measurements.append(
+                        SweepMeasurement(
+                            candidate=candidate,
+                            latency_us=None,
+                            correct=False,
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                    )
+            return tuple(measurements)
+
+
+class _Bf16VocabProjectionFactory:
+    def __call__(self, group_id, cases, context):
+        del group_id
+        if len(cases) != 1:
+            raise ValueError("vocabulary projection allocation groups contain one case")
+        return _Bf16VocabProjectionSession(context)
+
+
+class Bf16VocabProjectionGenerator(DiscreteSweepGenerator):
+    """Race production BF16 vocabulary projection paths over common models."""
+
+    def __init__(self, *, cases: Sequence[SweepCase] | None = None) -> None:
+        super().__init__(
+            component_id=BF16_VOCAB_PROJECTION,
+            query_schema_version=1,
+            config_schema_version=1,
+            query_fields=(
+                "dtype",
+                "max_tokens",
+                "in_features",
+                "out_features",
+            ),
+            range_fields=frozenset({"out_features"}),
+            cases=(_bf16_vocab_projection_cases() if cases is None else cases),
+            benchmark_factory=_Bf16VocabProjectionFactory(),
+            coverage={},
+            candidate_contract_version=1,
+            nearest_range_bounds={"out_features": (1, 248_320)},
+        )
 
 
 def _block_fp8_cases() -> tuple[SweepCase, ...]:
@@ -364,4 +611,8 @@ class WoProjectionGenerator(MeasuredPolicyGenerator):
         )
 
 
-__all__ = ["BlockFp8LinearGenerator", "WoProjectionGenerator"]
+__all__ = [
+    "Bf16VocabProjectionGenerator",
+    "BlockFp8LinearGenerator",
+    "WoProjectionGenerator",
+]

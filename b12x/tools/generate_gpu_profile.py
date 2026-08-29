@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -25,6 +27,7 @@ from b12x.policy.generation.progress import RichProgressReporter
 from b12x.policy.generation.runner import (
     estimate_generators,
     generate_profile_artifact,
+    merge_profile_artifacts,
     runtime_profile_payload,
     write_artifact_atomic,
 )
@@ -179,6 +182,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--components", default="all")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--work-dir", type=Path)
+    parser.add_argument(
+        "--merge-from",
+        type=Path,
+        help="base full profile whose unselected components are retained",
+    )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--groups", type=int, default=5)
@@ -245,6 +253,17 @@ def main(argv: list[str] | None = None) -> int:
         / "data"
         / f"{profile_id}.json.gz"
     ).resolve()
+    merge_from = None if args.merge_from is None else args.merge_from.resolve()
+    if selected_ids is not None and merge_from is None:
+        if output.exists():
+            merge_from = output
+        elif args.embed and embedded_output.exists():
+            merge_from = embedded_output
+    if args.embed and selected_ids is not None and merge_from is None:
+        raise SystemExit(
+            "embedding a component subset requires an existing output profile "
+            "or --merge-from"
+        )
     if not args.dry_run and output.exists() and not args.overwrite:
         raise SystemExit(
             f"refusing to overwrite existing profile {output}; "
@@ -281,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:
         f"({detected.identity.product_name}, {detected.identity.sm_count} SMs)"
     )
     console.print(f"Checkpoint directory: {work_dir}")
+    if merge_from is not None:
+        console.print(f"Merge base: {merge_from}")
     _render_estimates(console, generators, context)
     if args.dry_run:
         return 0
@@ -300,6 +321,14 @@ def main(argv: list[str] | None = None) -> int:
             f"rerun with the same --work-dir {work_dir} to resume."
         )
         return 130
+    if merge_from is not None:
+        raw = merge_from.read_bytes()
+        if merge_from.suffix == ".gz":
+            raw = gzip.decompress(raw)
+        base_artifact = json.loads(raw)
+        if not isinstance(base_artifact, Mapping):
+            raise TypeError("merge base must contain a JSON object")
+        artifact = merge_profile_artifacts(base_artifact, artifact)
     profile = artifact["profile"]
     if not isinstance(profile, Mapping):
         raise TypeError("generated artifact profile must be an object")

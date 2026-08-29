@@ -8,6 +8,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from .components import (
+    BF16_VOCAB_PROJECTION,
     BLOCK_FP8_LINEAR,
     COMPRESSED_SPARSE_MLA_ATTENTION,
     DSA_INDEXER,
@@ -184,6 +185,19 @@ PLANNING_COMPONENTS = (
         policy_ref="b12x.attention.varlen._policy:VARLEN_ATTENTION_POLICY",
         generator_ref=(
             "b12x.policy.generation.providers.tunable:VarlenAttentionGenerator"
+        ),
+    ),
+    PlanningComponentRegistration(
+        op_qualname="gemm.bf16_vocab_projection",
+        mode=PlanningPolicyMode.PROFILED,
+        component_id=BF16_VOCAB_PROJECTION,
+        policy_ref=(
+            "b12x.gemm.bf16_vocab_projection._policy:"
+            "BF16_VOCAB_PROJECTION_POLICY"
+        ),
+        generator_ref=(
+            "b12x.policy.generation.providers.gemm:"
+            "Bf16VocabProjectionGenerator"
         ),
     ),
     PlanningComponentRegistration(

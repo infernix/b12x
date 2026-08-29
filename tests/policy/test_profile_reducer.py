@@ -138,8 +138,8 @@ def test_integer_axis_coverage_uses_nearest_valid_anchor() -> None:
         field="rows",
         minimum=1,
         maximum=4,
-        config_is_valid=lambda query, config: not (
-            config["backend"] == "micro" and query["rows"] > 2
+        config_is_valid=lambda query, config: (
+            not (config["backend"] == "micro" and query["rows"] > 2)
         ),
     )
     tree = build_axis_tree(
@@ -151,3 +151,25 @@ def test_integer_axis_coverage_uses_nearest_valid_anchor() -> None:
 
     assert tree.lookup({"family": "a", "rows": 2}).config["backend"] == "micro"
     assert tree.lookup({"family": "a", "rows": 3}).config["backend"] == "dynamic"
+
+
+def test_nearest_range_bounds_cover_gaps_and_coalesce_equal_configs() -> None:
+    records = (
+        DecisionRecord.create(query={"tokens": 1}, config={"backend": "a"}),
+        DecisionRecord.create(query={"tokens": 4}, config={"backend": "a"}),
+        DecisionRecord.create(query={"tokens": 16}, config={"backend": "b"}),
+    )
+
+    tree = build_axis_tree(
+        records,
+        field_order=("tokens",),
+        range_fields=frozenset({"tokens"}),
+        nearest_range_bounds={"tokens": (1, 32)},
+    )
+
+    assert tree.lookup({"tokens": 1}).config["backend"] == "a"
+    assert tree.lookup({"tokens": 9}).config["backend"] == "a"
+    assert tree.lookup({"tokens": 10}).config["backend"] == "a"
+    assert tree.lookup({"tokens": 11}).config["backend"] == "b"
+    assert tree.lookup({"tokens": 32}).config["backend"] == "b"
+    assert tree.lookup({"tokens": 33}) is None

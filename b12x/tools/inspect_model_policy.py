@@ -146,6 +146,33 @@ def _sliced_gqa_query(
     )
 
 
+def _vocab_projection_query(
+    *,
+    model: str,
+    tp_size: int,
+    hidden_size: int,
+    global_vocab_size: int,
+) -> KernelQuery:
+    from b12x.gemm.bf16_vocab_projection._policy import (
+        BF16_VOCAB_PROJECTION_POLICY,
+        Bf16VocabProjectionQuery,
+    )
+
+    if global_vocab_size % tp_size:
+        raise ValueError(f"{model} vocabulary is not sliceable at TP {tp_size}")
+    return KernelQuery(
+        scenario="vocab-projection-m1",
+        kernel_family="bf16-vocab-projection",
+        policy=BF16_VOCAB_PROJECTION_POLICY,
+        query=Bf16VocabProjectionQuery(
+            dtype="bfloat16",
+            max_tokens=1,
+            in_features=hidden_size,
+            out_features=global_vocab_size // tp_size,
+        ),
+    )
+
+
 def _qwen_flash_next_queries(
     tp_size: int,
     *,
@@ -189,6 +216,12 @@ def _qwen_flash_next_queries(
     gdn_value_heads = 48 // tp_size
     intermediate = ((640 + tp_size - 1) // tp_size + 15) // 16 * 16
     queries = [
+        _vocab_projection_query(
+            model="qwen3.8-flash-next-180b",
+            tp_size=tp_size,
+            hidden_size=2_560,
+            global_vocab_size=248_320,
+        ),
         KernelQuery(
             scenario="full-attention-decode",
             kernel_family="paged-gqa",
@@ -396,6 +429,12 @@ def _qwen_dense_queries(
         page_size=128,
     )
     return (
+        _vocab_projection_query(
+            model="qwen3.8-27b",
+            tp_size=tp_size,
+            hidden_size=5_120,
+            global_vocab_size=248_320,
+        ),
         attention,
         KernelQuery(
             scenario="nvfp4-activation-block",
@@ -750,6 +789,12 @@ def _glm52_queries(
     local_heads = 64 // tp_size
     intermediate = ((2_048 + tp_size - 1) // tp_size + 31) // 32 * 32
     queries = [
+        _vocab_projection_query(
+            model="glm-5.2",
+            tp_size=tp_size,
+            hidden_size=6_144,
+            global_vocab_size=163_840 if tp_size == 8 else 163_968,
+        ),
         KernelQuery(
             scenario="dsa-decode-spec4",
             kernel_family="dsa-indexer",
@@ -846,6 +891,12 @@ def _glm53_flash_queries(
     local_heads = 64 // tp_size
     intermediate = ((2_048 + tp_size - 1) // tp_size + 15) // 16 * 16
     queries = [
+        _vocab_projection_query(
+            model="glm-5.3-flash",
+            tp_size=tp_size,
+            hidden_size=4_096,
+            global_vocab_size=163_840 if tp_size == 8 else 163_968,
+        ),
         KernelQuery(
             scenario="kda-spec6",
             kernel_family="kda",

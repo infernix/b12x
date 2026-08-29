@@ -207,6 +207,7 @@ class DiscreteSweepGenerator:
         benchmark_factory: SweepBenchmarkFactory,
         coverage: Mapping[str, object],
         candidate_contract_version: int = 1,
+        nearest_range_bounds: Mapping[str, tuple[int, int]] | None = None,
     ) -> None:
         self.component_id = component_id
         self.query_schema_version = int(query_schema_version)
@@ -217,6 +218,7 @@ class DiscreteSweepGenerator:
         self._benchmark_factory = benchmark_factory
         self._coverage = FrozenMapping(coverage)
         self._candidate_contract_version = int(candidate_contract_version)
+        self._nearest_range_bounds = dict(nearest_range_bounds or {})
         if not self._cases:
             raise ValueError(f"{component_id} requires at least one sweep case")
         if not self._query_fields or len(self._query_fields) != len(
@@ -232,6 +234,8 @@ class DiscreteSweepGenerator:
             raise ValueError("sweep case IDs must be unique")
         if self._candidate_contract_version <= 0:
             raise ValueError("candidate_contract_version must be positive")
+        if not frozenset(self._nearest_range_bounds) <= self._range_fields:
+            raise ValueError("nearest range fields must also be range_fields")
 
     def estimate(self, context: GenerationContext) -> WorkEstimate:
         del context
@@ -546,6 +550,7 @@ class DiscreteSweepGenerator:
             records,
             field_order=self._query_fields,
             range_fields=self._range_fields,
+            nearest_range_bounds=self._nearest_range_bounds,
         )
         coverage = self._coverage.to_dict()
         coverage.update(

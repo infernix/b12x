@@ -36,11 +36,13 @@ def test_qwen_flash_next_preset_slices_rank_local_tp_geometry() -> None:
     qsa = selections["qsa-spec4"].query
     gdn = selections["gdn-spec4"].query
     moe = selections["moe-m4"].query
+    vocab = selections["vocab-projection-m1"].query
     assert (qsa.q_heads, qsa.kv_heads) == (6, 1)
     assert (gdn.key_heads, gdn.value_heads) == (4, 12)
     assert (gdn.max_seqs, gdn.max_tokens, gdn.state_index_columns) == (4, 16, 4)
     assert moe.intermediate_size == 160
     assert moe.routed_rows == 40
+    assert (vocab.in_features, vocab.out_features) == (2_560, 62_080)
 
 
 def test_qwen_flash_next_preset_rejects_unprofiled_qsa_tp() -> None:
@@ -173,6 +175,7 @@ def test_glm52_preset_uses_benchmark_attention_and_moe_contracts() -> None:
     indexer = selections["dsa-decode-spec4"].query
     sparse_mla = selections["sparse-mla-spec4"].query
     moe = selections["moe-m4"].query
+    vocab = selections["vocab-projection-m1"].query
     assert (indexer.num_q_heads, indexer.top_k) == (32, 2_048)
     assert (sparse_mla.num_q_heads, sparse_mla.qk_head_dim) == (8, 576)
     assert (moe.quant_mode, moe.intermediate_size, moe.top_k) == (
@@ -180,6 +183,7 @@ def test_glm52_preset_uses_benchmark_attention_and_moe_contracts() -> None:
         256,
         8,
     )
+    assert (vocab.in_features, vocab.out_features) == (6_144, 20_480)
 
 
 def test_glm53_flash_preset_composes_kda_sparse_mla_mhc_and_moe() -> None:
@@ -193,6 +197,7 @@ def test_glm53_flash_preset_composes_kda_sparse_mla_mhc_and_moe() -> None:
     sparse_mla = selections["sparse-mla-spec6"].query
     mhc = selections["mhc-spec6"].query
     moe = selections["moe-m4"].query
+    vocab = selections["vocab-projection-m1"].query
     assert (kda.key_heads, kda.value_heads) == (16, 16)
     assert (kda.max_seqs, kda.max_tokens, kda.state_index_columns) == (4, 24, 6)
     assert (indexer.num_q_heads, indexer.top_k) == (32, 512)
@@ -204,6 +209,7 @@ def test_glm53_flash_preset_composes_kda_sparse_mla_mhc_and_moe() -> None:
         512,
         8,
     )
+    assert (vocab.in_features, vocab.out_features) == (4_096, 40_992)
 
 
 def test_deepseek_v4_flash_preset_composes_indexer_sparse_mla_and_moe() -> None:

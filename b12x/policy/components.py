@@ -10,6 +10,7 @@ QSA_ATTENTION = "attention.qsa"
 SPARSE_MLA_ATTENTION = "attention.sparse_mla"
 VARLEN_ATTENTION = "attention.varlen"
 BLOCK_FP8_LINEAR = "gemm.block_fp8_linear"
+BF16_VOCAB_PROJECTION = "gemm.bf16_vocab_projection"
 WO_PROJECTION = "gemm.wo_projection"
 EP_MOE = "moe.ep_moe"
 HYPERCONNECTION = "norm.hyperconnection"
@@ -22,6 +23,7 @@ PLE_HASH = "sequence.ple_hash"
 
 __all__ = [
     "BLOCK_FP8_LINEAR",
+    "BF16_VOCAB_PROJECTION",
     "COMPRESSED_SPARSE_MLA_ATTENTION",
     "DSA_INDEXER",
     "EP_MOE",

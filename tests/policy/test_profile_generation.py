@@ -21,6 +21,7 @@ from b12x.policy.generation.measured import (
 )
 from b12x.policy.generation.runner import (
     generate_profile_artifact,
+    merge_profile_artifacts,
     write_artifact_atomic,
 )
 from b12x.tools.generate_gpu_profile import _is_generated_profile_data, _parser
@@ -128,6 +129,40 @@ def test_compact_profile_writer_round_trips_runtime_payload(tmp_path) -> None:
     assert path.read_text().count("\n") == 1
 
 
+def test_partial_artifact_merge_replaces_only_generated_components(
+    tmp_path,
+) -> None:
+    context = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="abc123",
+        settings=GenerationSettings(),
+    )
+    base = generate_profile_artifact(
+        profile_id="nvidia.synthetic.48sm",
+        generators=(_Generator("attention.gqa"), _Generator("moe.decode")),
+        context=context,
+        progress=NullProgressReporter(),
+    )
+    update = generate_profile_artifact(
+        profile_id="nvidia.synthetic.48sm",
+        generators=(_Generator("moe.decode"),),
+        context=context,
+        progress=NullProgressReporter(),
+    )
+
+    merged = merge_profile_artifacts(base, update)
+
+    assert [
+        component["component_id"] for component in merged["profile"]["components"]
+    ] == ["attention.gqa", "moe.decode"]
+    assert set(merged["evidence"]["components"]) == {
+        "attention.gqa",
+        "moe.decode",
+    }
+
+
 def test_source_fingerprint_excludes_generated_profile_payloads() -> None:
     assert _is_generated_profile_data(
         Path("b12x/policy/_profiles/data/nvidia.gb10.48sm.json")
@@ -181,9 +216,7 @@ def _measured_generator(*, backend: str, probe: _Probe):
         query_fields=frozenset({"rows"}),
         config_fields=frozenset({"backend"}),
         encode_query=lambda query: {"rows": query.rows},
-        decode_profile=lambda payload: _MeasuredConfig(
-            backend=str(payload["backend"])
-        ),
+        decode_profile=lambda payload: _MeasuredConfig(backend=str(payload["backend"])),
         heuristic=lambda _query, _device: _MeasuredConfig(backend=backend),
         validate_config=lambda _query, _config, _device: None,
     )

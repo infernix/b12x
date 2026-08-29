@@ -57,6 +57,7 @@ def _build_node(
     *,
     fields: tuple[str, ...],
     range_fields: frozenset[str],
+    nearest_range_bounds: Mapping[str, MatchRange],
     evidence: str | None,
 ) -> DecisionNode:
     if not fields:
@@ -76,6 +77,7 @@ def _build_node(
             group,
             fields=tuple(remaining),
             range_fields=range_fields,
+            nearest_range_bounds=nearest_range_bounds,
             evidence=evidence,
         )
         for value, group in grouped.items()
@@ -87,6 +89,36 @@ def _build_node(
     if field in range_fields and not integer_axis:
         raise TypeError(f"range field {field!r} must contain only integers")
     if integer_axis:
+        nearest_bounds = nearest_range_bounds.get(field)
+        if nearest_bounds is not None:
+            ordered = sorted(int(value) for value in values)
+            if (
+                ordered[0] < nearest_bounds.minimum
+                or ordered[-1] > nearest_bounds.maximum
+            ):
+                raise ValueError(
+                    f"nearest range field {field!r} has anchors outside "
+                    f"[{nearest_bounds.minimum}, {nearest_bounds.maximum}]"
+                )
+            ranges: list[tuple[MatchRange, DecisionNode]] = []
+            minimum = nearest_bounds.minimum
+            for index, value in enumerate(ordered):
+                maximum = (
+                    nearest_bounds.maximum
+                    if index + 1 == len(ordered)
+                    else (value + ordered[index + 1]) // 2
+                )
+                child = children[value]
+                if ranges and ranges[-1][1] == child:
+                    previous, _ = ranges[-1]
+                    ranges[-1] = (
+                        MatchRange(previous.minimum, maximum),
+                        child,
+                    )
+                else:
+                    ranges.append((MatchRange(minimum, maximum), child))
+                minimum = maximum + 1
+            return RangeDecisionNode(field=field, branches=tuple(ranges))
         ranges: list[tuple[MatchRange, DecisionNode]] = []
         for value in sorted(values):
             child = children[value]
@@ -116,6 +148,7 @@ def build_axis_tree(
     *,
     field_order: tuple[str, ...],
     range_fields: frozenset[str] = frozenset(),
+    nearest_range_bounds: Mapping[str, tuple[int, int] | MatchRange] | None = None,
     evidence: str | None = None,
 ) -> DecisionNode:
     """Build a deterministic tree without extrapolating across unswept gaps."""
@@ -127,6 +160,12 @@ def build_axis_tree(
         raise ValueError("field_order must be non-empty and unique")
     if not range_fields <= frozenset(field_order):
         raise ValueError("range_fields must be present in field_order")
+    normalized_nearest_bounds = {
+        field: bounds if isinstance(bounds, MatchRange) else MatchRange(*bounds)
+        for field, bounds in (nearest_range_bounds or {}).items()
+    }
+    if not frozenset(normalized_nearest_bounds) <= range_fields:
+        raise ValueError("nearest range fields must also be range_fields")
     expected = frozenset(field_order)
     seen_queries: set[FrozenMapping] = set()
     for record in records:
@@ -144,6 +183,7 @@ def build_axis_tree(
         records,
         fields=field_order,
         range_fields=range_fields,
+        nearest_range_bounds=normalized_nearest_bounds,
         evidence=evidence,
     )
 

@@ -146,6 +146,67 @@ def runtime_profile_payload(profile: Mapping[str, object]) -> dict[str, object]:
     return payload
 
 
+def merge_profile_artifacts(
+    base: Mapping[str, object],
+    update: Mapping[str, object],
+) -> dict[str, object]:
+    """Replace generated components in an existing full profile artifact."""
+
+    def profile_payload(artifact: Mapping[str, object]) -> Mapping[str, object]:
+        value = artifact.get("profile", artifact)
+        if not isinstance(value, Mapping):
+            raise TypeError("profile artifact must contain a profile object")
+        return value
+
+    base_profile = profile_payload(base)
+    update_profile = profile_payload(update)
+    parsed_base = profile_from_dict(base_profile)
+    parsed_update = profile_from_dict(update_profile)
+    if parsed_base.profile_id != parsed_update.profile_id:
+        raise ValueError("cannot merge profiles with different profile IDs")
+    if parsed_base.targets != parsed_update.targets:
+        raise ValueError("cannot merge profiles with different device targets")
+
+    components = {
+        str(component["component_id"]): component
+        for component in base_profile["components"]
+    }
+    components.update(
+        {
+            str(component["component_id"]): component
+            for component in update_profile["components"]
+        }
+    )
+    metadata = dict(base_profile.get("metadata", {}))
+    metadata.update(update_profile.get("metadata", {}))
+    merged_profile: dict[str, object] = {
+        "profile_id": parsed_base.profile_id,
+        "targets": list(base_profile["targets"]),
+        "components": [components[key] for key in sorted(components)],
+    }
+    if metadata:
+        merged_profile["metadata"] = metadata
+    profile_from_dict(merged_profile)
+
+    evidence = dict(base.get("evidence", {}))
+    update_evidence = update.get("evidence", {})
+    if not isinstance(update_evidence, Mapping):
+        raise TypeError("generated artifact evidence must be an object")
+    base_components = evidence.get("components", {})
+    update_components = update_evidence.get("components", {})
+    if not isinstance(base_components, Mapping) or not isinstance(
+        update_components, Mapping
+    ):
+        raise TypeError("artifact component evidence must be an object")
+    evidence.update(update_evidence)
+    evidence["components"] = {**base_components, **update_components}
+    return {
+        "schema_version": int(update.get("schema_version", 1)),
+        "profile": merged_profile,
+        "evidence": evidence,
+    }
+
+
 def write_artifact_atomic(
     path: Path,
     artifact: Mapping[str, object],
@@ -183,6 +244,7 @@ def write_artifact_atomic(
 __all__ = [
     "estimate_generators",
     "generate_profile_artifact",
+    "merge_profile_artifacts",
     "runtime_profile_payload",
     "write_artifact_atomic",
 ]
