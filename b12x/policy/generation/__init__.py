@@ -5,6 +5,8 @@ from .contracts import (
     ComponentGenerator,
     GenerationContext,
     GenerationSettings,
+    MeasurementPartition,
+    PartitionableComponentGenerator,
     ProgressReporter,
     WorkEstimate,
 )
@@ -15,6 +17,7 @@ from .reducer import (
     synthesize_integer_axis_coverage,
 )
 from .registry import ComponentGeneratorRegistry
+from .sharding import measurement_partitions, select_measurement_partitions
 from .store import CheckpointStore
 from .sweep import (
     DiscreteSweepGenerator,
@@ -34,6 +37,8 @@ __all__ = [
     "DiscreteSweepGenerator",
     "GenerationContext",
     "GenerationSettings",
+    "MeasurementPartition",
+    "PartitionableComponentGenerator",
     "ProgressReporter",
     "SweepBenchmarkFactory",
     "SweepCandidate",
@@ -43,5 +48,7 @@ __all__ = [
     "WorkEstimate",
     "build_axis_tree",
     "decision_node_to_dict",
+    "measurement_partitions",
+    "select_measurement_partitions",
     "synthesize_integer_axis_coverage",
 ]

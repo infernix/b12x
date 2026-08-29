@@ -7,6 +7,7 @@ import json
 import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from copy import copy
 from dataclasses import dataclass
 from typing import ContextManager, Protocol, cast
 
@@ -15,6 +16,7 @@ from b12x.policy.types import FrozenMapping
 from .contracts import (
     ComponentGenerationResult,
     GenerationContext,
+    MeasurementPartition,
     ProgressReporter,
     WorkEstimate,
 )
@@ -257,6 +259,49 @@ class DiscreteSweepGenerator:
                 "runtime_queries": query_count,
             },
         )
+
+    def measurement_partitions(
+        self,
+        context: GenerationContext,
+    ) -> tuple[MeasurementPartition, ...]:
+        del context
+        cases_by_group: dict[str, list[SweepCase]] = defaultdict(list)
+        for case in self._cases:
+            cases_by_group[case.group_id].append(case)
+        partitions = []
+        for group_id in sorted(cases_by_group):
+            cases = tuple(cases_by_group[group_id])
+            query_count = len(
+                {_query_key(case, self._query_fields) for case in cases}
+            )
+            partitions.append(
+                MeasurementPartition(
+                    component_id=self.component_id,
+                    partition_id=group_id,
+                    work_units=len(cases) + query_count,
+                    case_count=len(cases),
+                    description=f"allocation group {group_id}",
+                )
+            )
+        return tuple(partitions)
+
+    def select_measurement_partitions(
+        self,
+        partition_ids: tuple[str, ...],
+    ) -> "DiscreteSweepGenerator":
+        selected = frozenset(partition_ids)
+        available = frozenset(case.group_id for case in self._cases)
+        unknown = selected - available
+        if not selected or unknown:
+            raise ValueError(
+                f"invalid {self.component_id} measurement partitions: "
+                f"{sorted(unknown) if unknown else 'empty selection'}"
+            )
+        restricted = copy(self)
+        restricted._cases = tuple(
+            case for case in self._cases if case.group_id in selected
+        )
+        return restricted
 
     def _measure_case(
         self,

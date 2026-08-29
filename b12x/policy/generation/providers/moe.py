@@ -7,6 +7,7 @@ import json
 import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from copy import copy
 from dataclasses import dataclass, field
 from typing import ContextManager, Protocol
 
@@ -14,6 +15,7 @@ from b12x.policy.components import MOE_DECODE
 from b12x.policy.generation.contracts import (
     ComponentGenerationResult,
     GenerationContext,
+    MeasurementPartition,
     ProgressReporter,
     WorkEstimate,
 )
@@ -172,6 +174,11 @@ def _query_key(case: MoeSweepCase) -> tuple[object, ...]:
 def _query_dict(case: MoeSweepCase) -> dict[str, object]:
     query = case.query()
     return {field: query[field] for field in _QUERY_FIELDS}
+
+
+def _geometry_partition_id(geometry: MoePhysicalGeometry) -> str:
+    encoded = json.dumps(geometry.key, separators=(",", ":"))
+    return f"geometry-{hashlib.sha256(encoded.encode()).hexdigest()[:16]}"
 
 
 def _config_covers_query(
@@ -344,8 +351,8 @@ class MoeDecodeGenerator:
 
     def estimate(self, context: GenerationContext) -> WorkEstimate:
         del context
-        cases_by_geometry: dict[tuple[object, ...], list[MoeSweepCase]] = (
-            defaultdict(list)
+        cases_by_geometry: dict[tuple[object, ...], list[MoeSweepCase]] = defaultdict(
+            list
         )
         for case in self._cases:
             cases_by_geometry[case.geometry.key].append(case)
@@ -380,6 +387,63 @@ class MoeDecodeGenerator:
                 "coarse_cases": len(coarse),
             },
         )
+
+    def measurement_partitions(
+        self,
+        context: GenerationContext,
+    ) -> tuple[MeasurementPartition, ...]:
+        del context
+        cases_by_geometry: dict[tuple[object, ...], list[MoeSweepCase]] = (
+            defaultdict(list)
+        )
+        for case in self._cases:
+            cases_by_geometry[case.geometry.key].append(case)
+        partitions = []
+        for geometry in self._geometries:
+            cases = tuple(cases_by_geometry[geometry.key])
+            measured = _measurement_cases(cases)
+            coarse = _coarse_cases(cases) if _has_tunable_backend(geometry) else ()
+            query_count = len({_query_key(case) for case in cases})
+            partitions.append(
+                MeasurementPartition(
+                    component_id=self.component_id,
+                    partition_id=_geometry_partition_id(geometry),
+                    work_units=1 + len(coarse) + len(measured) + query_count,
+                    case_count=len(measured),
+                    description=(
+                        f"{geometry.recipe.recipe_id} E={geometry.num_experts} "
+                        f"K={geometry.hidden_size} N={geometry.intermediate_size}"
+                    ),
+                )
+            )
+        return tuple(partitions)
+
+    def select_measurement_partitions(
+        self,
+        partition_ids: tuple[str, ...],
+    ) -> "MoeDecodeGenerator":
+        selected = frozenset(partition_ids)
+        by_id = {
+            _geometry_partition_id(geometry): geometry for geometry in self._geometries
+        }
+        unknown = selected - frozenset(by_id)
+        if not selected or unknown:
+            raise ValueError(
+                "invalid MoE measurement partitions: "
+                f"{sorted(unknown) if unknown else 'empty selection'}"
+            )
+        geometries = tuple(
+            geometry
+            for geometry in self._geometries
+            if _geometry_partition_id(geometry) in selected
+        )
+        geometry_keys = frozenset(geometry.key for geometry in geometries)
+        restricted = copy(self)
+        restricted._geometries = geometries
+        restricted._cases = tuple(
+            case for case in self._cases if case.geometry.key in geometry_keys
+        )
+        return restricted
 
     def _race(
         self,

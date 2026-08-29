@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from b12x.policy import ComponentPolicy, DeviceIdentity
 from b12x.policy.generation import (
     CheckpointStore,
@@ -11,7 +13,9 @@ from b12x.policy.generation import (
     ComponentGeneratorRegistry,
     GenerationContext,
     GenerationSettings,
+    measurement_partitions,
     ProgressReporter,
+    select_measurement_partitions,
     WorkEstimate,
 )
 from b12x.policy.generation.progress import NullProgressReporter
@@ -24,7 +28,11 @@ from b12x.policy.generation.runner import (
     merge_profile_artifacts,
     write_artifact_atomic,
 )
-from b12x.tools.generate_gpu_profile import _is_generated_profile_data, _parser
+from b12x.tools.generate_gpu_profile import (
+    _is_generated_profile_data,
+    _parse_devices,
+    _parser,
+)
 
 _DEVICE = DeviceIdentity(
     vendor="nvidia",
@@ -40,6 +48,21 @@ def test_default_measurement_protocol_is_two_warmups_and_five_by_five() -> None:
 
     assert (settings.warmup, settings.groups, settings.repetitions) == (2, 5, 5)
     assert (args.warmup, args.groups, args.repetitions) == (2, 5, 5)
+
+
+def test_parallel_device_ranges_expand_without_duplicates() -> None:
+    assert _parse_devices("0-3,5,cuda:7") == (
+        "cuda:0",
+        "cuda:1",
+        "cuda:2",
+        "cuda:3",
+        "cuda:5",
+        "cuda:7",
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        _parse_devices("0-2,2")
+    with pytest.raises(ValueError, match="ascending"):
+        _parse_devices("3-1")
 
 
 @dataclass(frozen=True)
@@ -86,6 +109,29 @@ class _Generator:
             evidence={"gpu_measurement_cases": 1},
             completed_work_units=1,
         )
+
+
+def test_nonpartitionable_generator_is_one_parallel_work_item(tmp_path) -> None:
+    generator = _Generator("attention.gqa")
+    context = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="abc123",
+        settings=GenerationSettings(),
+    )
+
+    partitions = measurement_partitions((generator,), context)
+
+    assert len(partitions) == 1
+    assert partitions[0].partition_id == "full-component"
+    assert (
+        select_measurement_partitions(
+            generator,
+            (partitions[0].partition_id,),
+        )
+        is generator
+    )
 
 
 def test_registry_and_runner_assemble_all_components(tmp_path) -> None:

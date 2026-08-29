@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 
+import pytest
+
 from b12x.policy import DeviceIdentity
 from b12x.policy.generation import (
     CheckpointStore,
@@ -92,6 +94,54 @@ def _cases():
         for rows in (1, 4)
         for scenario in ("contiguous", "strided")
     )
+
+
+def test_discrete_sweep_partitions_preserve_allocation_groups(tmp_path) -> None:
+    calls = []
+    candidate_calls = []
+    session_calls = []
+    cases = (
+        SweepCase.create(
+            group_id="geometry-a",
+            query={"family": "a", "rows": 1},
+        ),
+        SweepCase.create(
+            group_id="geometry-a",
+            query={"family": "a", "rows": 4},
+        ),
+        SweepCase.create(
+            group_id="geometry-b",
+            query={"family": "b", "rows": 1},
+        ),
+    )
+    generator = DiscreteSweepGenerator(
+        component_id="test.attention",
+        query_schema_version=1,
+        config_schema_version=1,
+        query_fields=("family", "rows"),
+        range_fields=frozenset({"rows"}),
+        cases=cases,
+        benchmark_factory=_Factory(calls, candidate_calls, session_calls),
+        coverage={},
+    )
+    context = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="abc123",
+        settings=GenerationSettings(),
+    )
+
+    partitions = generator.measurement_partitions(context)
+    restricted = generator.select_measurement_partitions(("geometry-a",))
+
+    assert [(item.partition_id, item.case_count) for item in partitions] == [
+        ("geometry-a", 2),
+        ("geometry-b", 1),
+    ]
+    assert restricted.estimate(context).case_count == 2
+    with pytest.raises(ValueError, match="missing"):
+        generator.select_measurement_partitions(("missing",))
 
 
 def test_discrete_sweep_reduces_scenarios_and_resumes(tmp_path) -> None:

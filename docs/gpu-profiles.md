@@ -139,6 +139,30 @@ payload:
 ./scripts/generate_gpu_profile.py --overwrite --embed
 ```
 
+Identical GPUs can measure one profile concurrently. CUDA ordinals are relative
+to `CUDA_VISIBLE_DEVICES`; `all` selects every visible GPU:
+
+```bash
+./scripts/generate_gpu_profile.py --devices 0-11 --dry-run
+./scripts/generate_gpu_profile.py --devices 0-11 --overwrite --embed
+# Equivalent when the tuning node exposes only the intended GPUs:
+./scripts/generate_gpu_profile.py --devices all --overwrite --embed
+```
+
+The parent uses spawned worker processes, pins one process to each selected GPU,
+and dynamically schedules checkpoint-disjoint measurement partitions. Discrete
+sweeps keep each allocation group together; MoE keeps every screen, coarse race,
+and route distribution for one physical geometry together. Fixed-backend
+qualifications stay whole. A single parent process performs the final reduction
+and writes the artifact after every worker succeeds, so concurrent workers never
+write competing profile files.
+
+Every selected GPU must report the same product name, compute capability, and SM
+count. Completed cases use the same shared checkpoint directory as a single-GPU
+run. After an interruption, rerun the command with the same `--work-dir`; the
+number or ordinals of identical GPUs may change without invalidating completed
+measurements.
+
 No `--components` argument is needed for a full device profile; the default is
 all registered components. `--components` exists only for targeted development
 and resume diagnostics. A subset run automatically merges into an existing

@@ -122,6 +122,23 @@ class WorkEstimate:
 
 
 @dataclass(frozen=True, kw_only=True)
+class MeasurementPartition:
+    """An independently measurable, checkpoint-disjoint unit of GPU work."""
+
+    component_id: str
+    partition_id: str
+    work_units: int
+    case_count: int
+    description: str
+
+    def __post_init__(self) -> None:
+        if not self.component_id or not self.partition_id:
+            raise ValueError("measurement partition identifiers must be non-empty")
+        if self.work_units <= 0 or self.case_count <= 0:
+            raise ValueError("measurement partitions must contain positive work")
+
+
+@dataclass(frozen=True, kw_only=True)
 class ComponentGenerationResult:
     """One generated component planner and its reproducibility evidence."""
 
@@ -178,6 +195,23 @@ class ComponentGenerator(Protocol):
     ) -> ComponentGenerationResult: ...
 
 
+@runtime_checkable
+class PartitionableComponentGenerator(Protocol):
+    """A generator whose independent measurement work can run concurrently."""
+
+    component_id: str
+
+    def measurement_partitions(
+        self,
+        context: GenerationContext,
+    ) -> tuple[MeasurementPartition, ...]: ...
+
+    def select_measurement_partitions(
+        self,
+        partition_ids: tuple[str, ...],
+    ) -> ComponentGenerator: ...
+
+
 from .store import CheckpointStore  # noqa: E402
 
 __all__ = [
@@ -186,6 +220,8 @@ __all__ = [
     "GenerationContext",
     "GenerationSettings",
     "JsonObject",
+    "MeasurementPartition",
+    "PartitionableComponentGenerator",
     "ProgressReporter",
     "WorkEstimate",
 ]

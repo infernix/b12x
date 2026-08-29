@@ -131,7 +131,12 @@ class _Factory:
         )
 
 
-def _generator(calls, *, quant_mode: str = "nvfp4"):
+def _generator(
+    calls,
+    *,
+    quant_mode: str = "nvfp4",
+    tp_sizes: tuple[int, ...] = (1,),
+):
     recipe = MoeRecipe(
         recipe_id=f"test-{quant_mode}",
         quant_mode=quant_mode,
@@ -148,7 +153,7 @@ def _generator(calls, *, quant_mode: str = "nvfp4"):
         activation="silu",
         recipe_ids=(recipe.recipe_id,),
         source="test",
-        tp_sizes=(1,),
+        tp_sizes=tp_sizes,
     )
     geometries = expand_physical_geometries(
         models=(model,),
@@ -175,6 +180,23 @@ def _context(tmp_path):
         source_revision="abc123",
         settings=GenerationSettings(),
     )
+
+
+def test_moe_measurement_partition_keeps_one_physical_geometry(tmp_path) -> None:
+    generator = _generator([], tp_sizes=(1, 2))
+    context = _context(tmp_path)
+
+    partitions = generator.measurement_partitions(context)
+    restricted = generator.select_measurement_partitions(
+        (partitions[0].partition_id,)
+    )
+
+    assert len(partitions) == 2
+    assert partitions[0].component_id == "moe.decode"
+    assert restricted.estimate(context).case_count == partitions[0].case_count
+    assert restricted.estimate(context).case_count < generator.estimate(
+        context
+    ).case_count
 
 
 def test_staged_moe_generator_keeps_regional_winners_and_resumes(tmp_path) -> None:

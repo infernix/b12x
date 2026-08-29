@@ -16,13 +16,16 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from b12x.policy import detect_device
+from b12x.policy import DetectedDevice, detect_device
 from b12x.policy.generation import (
     ComponentGenerator,
     ComponentGeneratorRegistry,
     GenerationContext,
     GenerationSettings,
+    MeasurementPartition,
+    measurement_partitions,
 )
+from b12x.policy.generation.parallel import run_parallel_measurements
 from b12x.policy.generation.progress import RichProgressReporter
 from b12x.policy.generation.runner import (
     estimate_generators,
@@ -147,6 +150,63 @@ def _parse_components(raw: str | None) -> tuple[str, ...] | None:
     return values
 
 
+def _parse_devices(raw: str) -> tuple[str, ...]:
+    value = raw.strip().casefold()
+    if value == "all":
+        import torch
+
+        count = torch.cuda.device_count()
+        if count <= 0:
+            raise ValueError("--devices all found no visible CUDA GPUs")
+        return tuple(f"cuda:{ordinal}" for ordinal in range(count))
+
+    ordinals: list[int] = []
+    for item in (part.strip().casefold() for part in raw.split(",")):
+        if not item:
+            continue
+        if item.startswith("cuda:"):
+            item = item.removeprefix("cuda:")
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", item)
+        if match is None:
+            raise ValueError("--devices must be 'all' or a list such as 0-3,5,7")
+        first = int(match.group(1))
+        last = first if match.group(2) is None else int(match.group(2))
+        if last < first:
+            raise ValueError("--devices ranges must be ascending")
+        ordinals.extend(range(first, last + 1))
+    if not ordinals:
+        raise ValueError("--devices must select at least one CUDA GPU")
+    if len(ordinals) != len(set(ordinals)):
+        raise ValueError("--devices contains duplicate CUDA ordinals")
+    return tuple(f"cuda:{ordinal}" for ordinal in ordinals)
+
+
+def _detect_devices(device_specs: tuple[str, ...]) -> tuple[DetectedDevice, ...]:
+    if not device_specs:
+        raise ValueError("at least one CUDA device is required")
+    detected_devices = tuple(detect_device(spec) for spec in device_specs)
+    if any(
+        detected.identity is None or detected.ordinal is None
+        for detected in detected_devices
+    ):
+        unresolved = [
+            spec
+            for spec, detected in zip(device_specs, detected_devices, strict=True)
+            if detected.identity is None or detected.ordinal is None
+        ]
+        raise ValueError(f"CUDA devices did not resolve: {', '.join(unresolved)}")
+    identity = detected_devices[0].identity
+    if any(detected.identity != identity for detected in detected_devices[1:]):
+        descriptions = ", ".join(
+            f"{spec}={detected.identity}"
+            for spec, detected in zip(device_specs, detected_devices, strict=True)
+        )
+        raise ValueError(
+            "parallel profile generation requires identical GPUs; " + descriptions
+        )
+    return detected_devices
+
+
 def _render_estimates(
     console: Console,
     generators: tuple[ComponentGenerator, ...],
@@ -175,9 +235,36 @@ def _render_estimates(
     console.print(table)
 
 
+def _render_parallel_plan(
+    console: Console,
+    partitions: tuple[MeasurementPartition, ...],
+    worker_count: int,
+) -> None:
+    table = Table(title="Parallel measurement plan")
+    table.add_column("GPU workers", justify="right")
+    table.add_column("Partitions", justify="right")
+    table.add_column("Measurement cases", justify="right")
+    table.add_column("Largest partition", justify="right")
+    table.add_row(
+        f"{worker_count:,}",
+        f"{len(partitions):,}",
+        f"{sum(item.case_count for item in partitions):,}",
+        f"{max(item.case_count for item in partitions):,}",
+    )
+    console.print(table)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", default="cuda")
+    device_group = parser.add_mutually_exclusive_group()
+    device_group.add_argument(
+        "--device",
+        help="single CUDA device (default: current device)",
+    )
+    device_group.add_argument(
+        "--devices",
+        help="parallel CUDA ordinals, for example 0-11,13 or all",
+    )
     parser.add_argument("--profile-id")
     parser.add_argument("--components", default="all")
     parser.add_argument("--output", type=Path)
@@ -233,9 +320,18 @@ def main(argv: list[str] | None = None) -> int:
             f"register providers through {_ENTRY_POINT_GROUP!r}"
         )
 
-    detected = detect_device(args.device)
+    try:
+        device_specs = (
+            _parse_devices(args.devices)
+            if args.devices is not None
+            else (args.device or "cuda",)
+        )
+        detected_devices = _detect_devices(device_specs)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    detected = detected_devices[0]
     if detected.identity is None or detected.ordinal is None:
-        raise SystemExit(f"{args.device!r} did not resolve to an available CUDA GPU")
+        raise RuntimeError("validated CUDA device lost its identity")
     profile_id = args.profile_id or _profile_id(
         detected.identity.product_name,
         detected.identity.sm_count,
@@ -295,19 +391,37 @@ def main(argv: list[str] | None = None) -> int:
             max_candidate_seconds=args.max_candidate_seconds,
         ),
     )
+    device_labels = ", ".join(f"cuda:{item.ordinal}" for item in detected_devices)
     console.print(
-        f"[bold]{profile_id}[/bold] on cuda:{detected.ordinal} "
+        f"[bold]{profile_id}[/bold] on {device_labels} "
         f"({detected.identity.product_name}, {detected.identity.sm_count} SMs)"
     )
     console.print(f"Checkpoint directory: {work_dir}")
     if merge_from is not None:
         console.print(f"Merge base: {merge_from}")
     _render_estimates(console, generators, context)
+    partitions = measurement_partitions(generators, context)
+    if len(detected_devices) > 1:
+        _render_parallel_plan(
+            console,
+            partitions,
+            min(len(detected_devices), len(partitions)),
+        )
     if args.dry_run:
         return 0
 
     estimates = estimate_generators(generators, context)
+    parallel_summary = None
     try:
+        if len(detected_devices) > 1:
+            parallel_summary = run_parallel_measurements(
+                console=console,
+                device_specs=device_specs,
+                generators=generators,
+                context=context,
+                registry_factory=_load_registry,
+            )
+            console.print("Parallel measurements complete; assembling profile.")
         with RichProgressReporter(estimates) as progress:
             artifact = generate_profile_artifact(
                 profile_id=profile_id,
@@ -321,6 +435,15 @@ def main(argv: list[str] | None = None) -> int:
             f"rerun with the same --work-dir {work_dir} to resume."
         )
         return 130
+    if parallel_summary is not None:
+        evidence = artifact.get("evidence")
+        if not isinstance(evidence, dict):
+            raise TypeError("generated artifact evidence must be mutable")
+        evidence["parallel_measurement"] = {
+            "device_ordinals": list(parallel_summary.device_ordinals),
+            "partition_count": parallel_summary.partition_count,
+            "worker_count": parallel_summary.worker_count,
+        }
     if merge_from is not None:
         raw = merge_from.read_bytes()
         if merge_from.suffix == ".gz":
