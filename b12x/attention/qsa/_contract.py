@@ -17,7 +17,6 @@ _SCORE_WORKSPACE_LIMIT_BYTES = 128 * 1024 * 1024
 _MIN_TOPK_WORKSPACE_BYTES = 1024 * 1024
 _STABLE_TOPK_BLOCK = 512
 _MAX_SCORE_CHUNK_GROUPS = 65536
-_MIN_WORKSPACE_Q_ROWS = 128
 
 
 def _align_up(value: int, alignment: int = _ALIGN_BYTES) -> int:
@@ -545,13 +544,7 @@ def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
 def _scratch_layout(
     caps: Caps,
 ) -> tuple[_ScratchLayout, int, int, int, int, int]:
-    workspace_q_rows = min(
-        int(caps.max_q_rows),
-        max(
-            _MIN_WORKSPACE_Q_ROWS,
-            int(caps.max_batch) * (int(caps.max_speculative_tokens) + 1),
-        ),
-    )
+    workspace_q_rows = int(caps.max_q_rows)
     score_width_limit = max(
         1,
         _SCORE_WORKSPACE_LIMIT_BYTES // (workspace_q_rows * torch.float32.itemsize),
@@ -578,7 +571,9 @@ def _scratch_layout(
         * torch.bfloat16.itemsize
     )
     score_nbytes = workspace_q_rows * score_workspace_width * torch.float32.itemsize
-    max_split_row_product = workspace_q_rows * _target_splits(caps, 1)[1]
+    max_split_row_product = max(
+        rows * _target_splits(caps, rows)[1] for rows in range(1, workspace_q_rows + 1)
+    )
     partial_output_nbytes = (
         max_split_row_product
         * int(caps.q_heads)
