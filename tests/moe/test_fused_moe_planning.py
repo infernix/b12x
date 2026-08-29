@@ -11,6 +11,7 @@ from b12x.moe import fused_moe
 from b12x.policy import (
     DeviceIdentity,
     PolicyContext,
+    PolicyResolution,
     PolicySource,
 )
 
@@ -815,6 +816,55 @@ def test_moe_decode_heuristic_never_labels_unsupported_micro_shape() -> None:
 
     assert resolution.source is PolicySource.HEURISTIC
     assert resolution.config.backend == "dynamic"
+
+
+def test_tp_moe_plan_retains_one_policy_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolution = PolicyResolution(
+        config=fused_moe_impl.MoeDecodeConfig(
+            backend="dynamic",
+            route_planner="triton",
+            max_active_clusters=12,
+        ),
+        source=PolicySource.PREPLANNED,
+        component_id="moe.decode",
+        device=None,
+        profile_id="synthetic",
+        rule_name="synthetic-rule",
+    )
+    calls = 0
+
+    def resolve(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return resolution
+
+    monkeypatch.setattr(fused_moe_impl, "_resolve_moe_decode_policy", resolve)
+    weight_plan = fused_moe.plan_weights(
+        quant_modes="nvfp4",
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=8,
+        hidden_size=256,
+        intermediate_size=128,
+        w13_layout="w31",
+    )
+
+    plan = fused_moe_impl.plan_tp_moe_execution(
+        num_tokens=4,
+        num_topk=2,
+        device="cpu",
+        weight_plan=weight_plan,
+        quant_mode="nvfp4",
+        deterministic_output=False,
+        policy_context=PolicyContext.for_identity(None),
+    )
+
+    assert calls == 1
+    assert plan.policy_resolution is resolution
+    assert plan.implementation == "dynamic"
 
 
 @pytest.mark.parametrize(

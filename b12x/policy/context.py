@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import threading
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -27,6 +28,7 @@ ConfigT = TypeVar("ConfigT")
 NO_POLICY_OVERRIDE = object()
 _COMPONENT_ID_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _QUERY_SCALAR_TYPES = (str, int, float, bool, type(None))
+_RESOLUTION_CACHE_CAPACITY = 4096
 _HEURISTIC_WARNING_KEYS: set[tuple[str, DeviceIdentity | None]] = set()
 _HEURISTIC_WARNING_LOCK = threading.Lock()
 logger = logging.getLogger(__name__)
@@ -160,6 +162,12 @@ class PolicyContext:
             if not _COMPONENT_ID_RE.fullmatch(component_id):
                 raise ValueError(f"invalid component ID {component_id!r}")
         self._overrides = MappingProxyType(normalized_overrides)
+        self._resolution_cache: OrderedDict[
+            tuple[ComponentPolicy[object, object], FrozenMapping],
+            PolicyResolution[object],
+        ] = OrderedDict()
+        self._validated_profile_contracts: set[ComponentPolicy[object, object]] = set()
+        self._cache_lock = threading.RLock()
 
     @classmethod
     def for_device(
@@ -227,6 +235,42 @@ class PolicyContext:
                 f"cuda:{self.device_ordinal}, requested cuda:{detected.ordinal}"
             )
 
+    def _cached_resolution(
+        self,
+        key: tuple[ComponentPolicy[object, object], FrozenMapping],
+    ) -> PolicyResolution[object] | None:
+        with self._cache_lock:
+            resolution = self._resolution_cache.get(key)
+            if resolution is not None:
+                self._resolution_cache.move_to_end(key)
+            return resolution
+
+    def _cache_resolution(
+        self,
+        key: tuple[ComponentPolicy[object, object], FrozenMapping],
+        resolution: PolicyResolution[object],
+    ) -> PolicyResolution[object]:
+        with self._cache_lock:
+            existing = self._resolution_cache.get(key)
+            if existing is not None:
+                self._resolution_cache.move_to_end(key)
+                return existing
+            self._resolution_cache[key] = resolution
+            if len(self._resolution_cache) > _RESOLUTION_CACHE_CAPACITY:
+                self._resolution_cache.popitem(last=False)
+            return resolution
+
+    def _validate_profile_contract_once(
+        self,
+        component: ComponentPolicy[object, object],
+        profile: ComponentProfile,
+    ) -> None:
+        with self._cache_lock:
+            if component in self._validated_profile_contracts:
+                return
+            validate_component_profile_contract(component, profile)
+            self._validated_profile_contracts.add(component)
+
     def resolve(
         self,
         component: ComponentPolicy[QueryT, ConfigT],
@@ -256,6 +300,14 @@ class PolicyContext:
                 device=self.device,
             )
 
+        cache_key = (
+            cast(ComponentPolicy[object, object], component),
+            FrozenMapping(fields),
+        )
+        cached = self._cached_resolution(cache_key)
+        if cached is not None:
+            return cast(PolicyResolution[ConfigT], cached)
+
         configured_override = self._overrides.get(
             component.component_id,
             NO_POLICY_OVERRIDE,
@@ -263,11 +315,15 @@ class PolicyContext:
         if configured_override is not NO_POLICY_OVERRIDE:
             config = cast(ConfigT, configured_override)
             component.validate_config(query, config, self.device)
-            return PolicyResolution(
+            resolution = PolicyResolution(
                 config=config,
                 source=PolicySource.OVERRIDE,
                 component_id=component.component_id,
                 device=self.device,
+            )
+            return cast(
+                PolicyResolution[ConfigT],
+                self._cache_resolution(cache_key, resolution),
             )
 
         fallback_reason = "no embedded profile matches the device"
@@ -278,7 +334,7 @@ class PolicyContext:
                     f"profile {self._profile.profile_id!r} does not cover the query"
                 )
                 try:
-                    validate_component_profile_contract(
+                    self._validate_profile_contract_once(
                         cast(ComponentPolicy[object, object], component),
                         component_profile,
                     )
@@ -290,7 +346,7 @@ class PolicyContext:
                     if hit is not None:
                         config = component.decode_profile(hit.config)
                         component.validate_config(query, config, self.device)
-                        return PolicyResolution(
+                        resolution = PolicyResolution(
                             config=config,
                             source=PolicySource.PREPLANNED,
                             component_id=component.component_id,
@@ -298,6 +354,10 @@ class PolicyContext:
                             profile_id=hit.profile_id,
                             rule_name=hit.rule_name,
                             evidence=hit.evidence,
+                        )
+                        return cast(
+                            PolicyResolution[ConfigT],
+                            self._cache_resolution(cache_key, resolution),
                         )
                 except InvalidPreplannedPolicyError:
                     raise
@@ -324,11 +384,15 @@ class PolicyContext:
                 device=self.device,
                 reason=fallback_reason,
             )
-        return PolicyResolution(
+        resolution = PolicyResolution(
             config=config,
             source=PolicySource.HEURISTIC,
             component_id=component.component_id,
             device=self.device,
+        )
+        return cast(
+            PolicyResolution[ConfigT],
+            self._cache_resolution(cache_key, resolution),
         )
 
 

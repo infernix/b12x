@@ -755,6 +755,7 @@ class TPMoEPlan:
     max_tokens_per_launch: int
     dynamic_physical_tiles: int | None = None
     dynamic_task_capacity: int | None = None
+    policy_resolution: PolicyResolution[MoeDecodeConfig] | None = None
 
     @property
     def deterministic_output(self) -> bool:
@@ -985,6 +986,7 @@ class TPMoEScratchPlan:
             fast_math = self.caps.w4a16_fast_math
         return _build_tp_moe_fp4_binding_from_views(
             plan=self._core_workspace_plan,
+            execution_plan=self.launch_plan,
             tensors=tensors,
             a=a,
             experts=experts,
@@ -1024,6 +1026,7 @@ class TPMoEFP4Binding:
     num_topk: int
     device: torch.device
     dtype: torch.dtype
+    execution_plan: TPMoEPlan | None = None
     apply_router_weight_on_input: bool = False
     output: torch.Tensor | None = None
     output_cast_target: torch.Tensor | None = None
@@ -2386,6 +2389,7 @@ def _finalize_workspace_views(workspace: TPMoEWorkspace) -> None:
 def _build_tp_moe_fp4_binding_from_views(
     *,
     plan: _TPCoreWorkspacePlan,
+    execution_plan: TPMoEPlan,
     tensors: Dict[str, torch.Tensor],
     a: torch.Tensor,
     experts: B12XFP4ExpertWeights,
@@ -2566,6 +2570,7 @@ def _build_tp_moe_fp4_binding_from_views(
         num_topk=plan.num_topk,
         device=plan.device,
         dtype=plan.dtype,
+        execution_plan=execution_plan,
         apply_router_weight_on_input=bool(apply_router_weight_on_input),
         output=output,
         output_cast_target=output_cast_target,
@@ -4993,12 +4998,8 @@ def _get_weight_views(
                 logical_n=n,
                 is_gated=activation_spec.is_gated,
             )
-            views.w13_fp4 = dynamic_w13_storage.permute(1, 2, 0).view(
-                torch.uint8
-            )
-            w13_mx, w13_residual = _derive_w4a8_weight_grids(
-                bs_u8, w1_n, k
-            )
+            views.w13_fp4 = dynamic_w13_storage.permute(1, 2, 0).view(torch.uint8)
+            w13_mx, w13_residual = _derive_w4a8_weight_grids(bs_u8, w1_n, k)
             down_mx, down_residual = _derive_w4a8_weight_grids(
                 w2_blockscale.view(torch.uint8), k, n
             )
@@ -5934,6 +5935,7 @@ def _resolve_workspace_layout(
     source_format: str = "modelopt_nvfp4",
     weight_layout: str | None = None,
     policy_context: PolicyContext | None = None,
+    policy_resolution: PolicyResolution[MoeDecodeConfig] | None = None,
 ) -> tuple[str, int, int]:
     routed_rows = num_tokens * num_topk
     if _normalize_quant_mode(quant_mode) == "w4a16":
@@ -6035,17 +6037,19 @@ def _resolve_workspace_layout(
             activation=activation,
         )
         return "dynamic", weight_E, align_up(routed_rows, tile_m)
-    decode_policy = _resolve_moe_decode_policy(
-        num_tokens=num_tokens,
-        num_topk=num_topk,
-        num_experts=weight_E,
-        k=k,
-        n=n,
-        activation=activation,
-        quant_mode=quant_mode,
-        source_format=source_format,
-        context=policy_context,
-    )
+    decode_policy = policy_resolution
+    if decode_policy is None:
+        decode_policy = _resolve_moe_decode_policy(
+            num_tokens=num_tokens,
+            num_topk=num_topk,
+            num_experts=weight_E,
+            k=k,
+            n=n,
+            activation=activation,
+            quant_mode=quant_mode,
+            source_format=source_format,
+            context=policy_context,
+        )
     implementation = decode_policy.config.backend
     if implementation == "micro":
         return implementation, max(1, routed_rows), max(1, routed_rows)
@@ -6118,6 +6122,19 @@ def plan_tp_moe_execution(
         ).activation
     w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     routed_rows = num_tokens * num_topk
+    policy_resolution = None
+    if quant_mode == "nvfp4":
+        policy_resolution = _resolve_moe_decode_policy(
+            num_tokens=num_tokens,
+            num_topk=num_topk,
+            num_experts=weight_E,
+            k=k,
+            n=n,
+            activation=activation,
+            quant_mode=quant_mode,
+            source_format=source_format,
+            context=policy_context,
+        )
     implementation, state_E, max_rows = _resolve_workspace_layout(
         num_tokens=num_tokens,
         weight_E=weight_E,
@@ -6129,6 +6146,7 @@ def plan_tp_moe_execution(
         source_format=source_format,
         weight_layout=weight_plan.w4a8_weight_layout,
         policy_context=policy_context,
+        policy_resolution=policy_resolution,
     )
     dynamic_physical_tiles = None
     dynamic_task_capacity = None
@@ -6259,6 +6277,7 @@ def plan_tp_moe_execution(
         max_tokens_per_launch=max_tokens_per_launch,
         dynamic_physical_tiles=dynamic_physical_tiles,
         dynamic_task_capacity=dynamic_task_capacity,
+        policy_resolution=policy_resolution,
     )
 
 
@@ -7506,6 +7525,7 @@ def _bind_projection_mixed_trellis_from_views(
         num_topk=core_plan.num_topk,
         device=core_plan.device,
         dtype=core_plan.dtype,
+        execution_plan=scratch_plan.launch_plan,
         output=output_tensor,
         output_cast_target=output_cast_target,
         input_scales_static=bool(input_scales_static),
@@ -8384,8 +8404,24 @@ def build_tp_moe_fp4_binding(
         quant_mode=quant_mode,
         device=a.device,
     )
+    plan = None
     deterministic_output = False
+    if isinstance(workspace, TPMoEWorkspacePool) or quant_mode != "w4a16":
+        plan = plan_tp_moe_execution(
+            num_tokens=m,
+            num_topk=num_topk,
+            device=a.device,
+            weight_plan=experts.plan,
+            quant_mode=quant_mode,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            deterministic_output=requested_deterministic_output,
+        )
+        deterministic_output = plan.deterministic_output
     if isinstance(workspace, TPMoEWorkspacePool):
+        assert plan is not None
         weight_layout = "packed"
         scale_format = "e4m3_k16"
         if quant_mode == "w4a16":
@@ -8401,19 +8437,6 @@ def build_tp_moe_fp4_binding(
             else:
                 weight_layout = _w4a16_weight_layout_for_source(source_format)
                 scale_format = _w4a16_scale_format_for_source(source_format)
-        plan = plan_tp_moe_execution(
-            num_tokens=m,
-            num_topk=num_topk,
-            device=a.device,
-            weight_plan=experts.plan,
-            quant_mode=quant_mode,
-            swiglu_limit=swiglu_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            deterministic_output=requested_deterministic_output,
-        )
-        deterministic_output = plan.deterministic_output
         workspace = _resolve_workspace(
             workspace,
             plan=plan,
@@ -8447,6 +8470,7 @@ def build_tp_moe_fp4_binding(
         input_scales_static=bool(input_scales_static),
         fast_math=fast_math,
         quant_mode=quant_mode,
+        execution_plan=plan,
         deterministic_output=deterministic_output,
         unit_scale_contract=unit_scale_contract,
         swiglu_limit=swiglu_limit,
@@ -9339,9 +9363,7 @@ class _DynamicMoEW4A8Launch:
         down_residual_columns = self._n // 16
         if cutlass.const_expr(self._kernel.w4a8_residual):
             padded_n = align_up(self._n, _LEVEL_TILE_N)
-            w13_grid_rows = (
-                2 * padded_n if self._kernel.is_gated else padded_n
-            )
+            w13_grid_rows = 2 * padded_n if self._kernel.is_gated else padded_n
             down_mx_columns = padded_n // 32
             down_residual_columns = padded_n // 16
         sfb_w13_mx = cute.make_tensor(
@@ -11688,19 +11710,12 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         )
         return _finalize_trellis_output(binding, result)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
-    plan = plan_tp_moe_execution(
-        num_tokens=m,
-        num_topk=num_topk,
-        device=device,
-        weight_plan=experts.plan,
-        quant_mode=quant_mode,
-        swiglu_limit=swiglu_limit,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        deterministic_output=bool(binding.deterministic_output),
-        policy_context=binding.policy_context,
-    )
+    plan = binding.execution_plan
+    if plan is None:
+        raise RuntimeError(
+            "TP MoE binding is missing its execution plan; construct bindings "
+            "with TPMoEScratchPlan.bind() or build_tp_moe_fp4_binding()"
+        )
 
     impl = plan.implementation
     max_rows = plan.max_rows
@@ -11832,17 +11847,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             max_active_clusters=None,
         )
         if quant_mode == "nvfp4":
-            decode_config = _resolve_moe_decode_policy(
-                num_tokens=m,
-                num_topk=num_topk,
-                num_experts=weight_E,
-                k=k,
-                n=n,
-                activation=activation,
-                quant_mode=quant_mode,
-                source_format=source_format,
-                context=binding.policy_context,
-            ).config
+            if plan.policy_resolution is None:
+                raise RuntimeError("NVFP4 MoE plan is missing its policy resolution")
+            decode_config = plan.policy_resolution.config
         dense_w4a8_candidate = _w4a8_dynamic_dense_candidate(
             quant_mode=quant_mode,
             activation=activation,

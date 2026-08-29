@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 
 import pytest
 
+import b12x.policy.context as policy_context_impl
 from b12x.policy import (
     EMBEDDED_REGISTRY,
     ComponentPolicy,
@@ -210,6 +211,97 @@ def test_context_override_precedes_profile_and_is_immutable() -> None:
     assert original_result.source is PolicySource.PREPLANNED
     assert configured_result.source is PolicySource.OVERRIDE
     assert configured_result.config is override
+
+
+def test_repeated_preplanned_resolution_is_cached() -> None:
+    base = _component()
+    decode_calls = 0
+    validate_calls = 0
+
+    def decode(payload: FrozenMapping) -> _Config:
+        nonlocal decode_calls
+        decode_calls += 1
+        return base.decode_profile(payload)
+
+    def validate(
+        query: _Query,
+        config: _Config,
+        device: DeviceIdentity | None,
+    ) -> None:
+        nonlocal validate_calls
+        validate_calls += 1
+        base.validate_config(query, config, device)
+
+    component = replace(
+        base,
+        decode_profile=decode,
+        validate_config=validate,
+    )
+    context = PolicyContext.for_identity(_DEVICE, registry=_registry())
+
+    first = context.resolve(component, _Query(family="a", rows=5))
+    second = context.resolve(component, _Query(family="a", rows=5))
+
+    assert second is first
+    assert decode_calls == 1
+    assert validate_calls == 1
+
+
+def test_repeated_heuristic_resolution_is_cached() -> None:
+    base = replace(_component(), component_id="test.cached_heuristic")
+    heuristic_calls = 0
+
+    def heuristic(query: _Query, device: DeviceIdentity | None) -> _Config:
+        nonlocal heuristic_calls
+        heuristic_calls += 1
+        return base.heuristic(query, device)
+
+    component = replace(base, heuristic=heuristic)
+    context = PolicyContext.for_identity(_DEVICE, registry=_registry())
+
+    first = context.resolve(component, _Query(family="b", rows=5))
+    second = context.resolve(component, _Query(family="b", rows=5))
+
+    assert second is first
+    assert heuristic_calls == 1
+
+
+def test_call_override_bypasses_resolution_cache() -> None:
+    context = PolicyContext.for_identity(_DEVICE, registry=_registry())
+    query = _Query(family="a", rows=5)
+    first_config = _Config(backend="first", workers=1)
+    second_config = _Config(backend="second", workers=2)
+
+    first = context.resolve(_component(), query, override=first_config)
+    second = context.resolve(_component(), query, override=second_config)
+
+    assert first.config is first_config
+    assert second.config is second_config
+
+
+def test_profile_contract_is_validated_once_per_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = policy_context_impl.validate_component_profile_contract
+
+    def validate_contract(component, profile) -> None:
+        nonlocal calls
+        calls += 1
+        original(component, profile)
+
+    monkeypatch.setattr(
+        policy_context_impl,
+        "validate_component_profile_contract",
+        validate_contract,
+    )
+    context = PolicyContext.for_identity(_DEVICE, registry=_registry())
+    component = _component()
+
+    context.resolve(component, _Query(family="a", rows=4))
+    context.resolve(component, _Query(family="a", rows=7))
+
+    assert calls == 1
 
 
 def test_call_override_precedes_context_override() -> None:
