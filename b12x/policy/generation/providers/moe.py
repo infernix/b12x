@@ -20,6 +20,7 @@ from b12x.policy.generation.contracts import (
     WorkEstimate,
 )
 from b12x.policy.generation.moe_corpus import (
+    COMMON_PREFILL_TOKEN_CAPACITIES,
     MoePhysicalGeometry,
     MoeSweepCase,
     expand_physical_geometries,
@@ -29,7 +30,6 @@ from b12x.policy.generation.reducer import (
     DecisionRecord,
     build_axis_tree,
     decision_node_to_dict,
-    synthesize_integer_axis_coverage,
 )
 from b12x.policy.generation.store import CheckpointStore
 from b12x.policy.types import FrozenMapping
@@ -49,7 +49,7 @@ _COARSE_PATTERNS = frozenset({"balanced", "hot"})
 _COARSE_TARGET_RATIO = 1.01
 _MICRO_MAX_TOKENS = 8
 _TRITON_ROUTE_MAX_ROWS = 256
-_PROFILE_MAX_TOKENS = 8_192
+_NVFP4_CAPACITY_TOKENS = frozenset(COMMON_PREFILL_TOKEN_CAPACITIES)
 _QUALIFICATION_TOKENS = frozenset({1, 4, 7, 32, 128})
 _QUALIFICATION_PATTERNS = frozenset({"balanced", "hot"})
 
@@ -199,43 +199,84 @@ def _config_covers_query(
     return True
 
 
-def _extend_prefill_token_coverage(
+def _synthesize_token_capacity_coverage(
     records: Sequence[DecisionRecord],
     *,
-    measured_maximum: int,
+    minimum: int,
+    maximum: int,
 ) -> tuple[DecisionRecord, ...]:
+    """Represent nearest valid token anchors with compact transition points."""
+
+    if minimum > maximum:
+        raise ValueError("token coverage minimum cannot exceed maximum")
     grouped: dict[FrozenMapping, list[DecisionRecord]] = defaultdict(list)
     for record in records:
+        value = record.query.get("num_tokens")
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("num_tokens decision fields must be integers")
+        if not minimum <= value <= maximum:
+            raise ValueError(f"num_tokens={value} is outside [{minimum}, {maximum}]")
         group = FrozenMapping(
             {key: value for key, value in record.query.items() if key != "num_tokens"}
         )
         grouped[group].append(record)
 
-    extended = list(records)
-    for group, anchors in grouped.items():
-        endpoint_query = {**group.to_dict(), "num_tokens": _PROFILE_MAX_TOKENS}
-        winner = next(
-            (
-                anchor.config
-                for anchor in sorted(
-                    anchors,
-                    key=lambda item: int(item.query["num_tokens"]),
-                    reverse=True,
-                )
-                if _config_covers_query(endpoint_query, anchor.config)
-            ),
-            FrozenMapping(
-                {
-                    "backend": "dynamic",
-                    "route_planner": "internal",
-                    "max_active_clusters": None,
-                }
-            ),
+    synthesized: list[DecisionRecord] = []
+    for group in sorted(grouped, key=repr):
+        anchors = sorted(
+            grouped[group],
+            key=lambda item: int(item.query["num_tokens"]),
         )
-        for num_tokens in (measured_maximum + 1, _PROFILE_MAX_TOKENS):
+        anchor_values = tuple(int(item.query["num_tokens"]) for item in anchors)
+        if len(anchor_values) != len(set(anchor_values)):
+            raise ValueError("token capacity anchors must be unique per query")
+        for anchor in anchors:
+            if not _config_covers_query(anchor.query, anchor.config):
+                raise ValueError(
+                    "measured MoE config is invalid at "
+                    f"num_tokens={anchor.query['num_tokens']}"
+                )
+
+        transition_points = {minimum, maximum, *anchor_values}
+        for index, left in enumerate(anchor_values):
+            for right in anchor_values[index + 1 :]:
+                midpoint = (left + right) // 2
+                transition_points.update((midpoint, midpoint + 1))
+        top_k = int(group["top_k"])
+        triton_limit = _TRITON_ROUTE_MAX_ROWS // top_k
+        transition_points.update(
+            (
+                _MICRO_MAX_TOKENS,
+                _MICRO_MAX_TOKENS + 1,
+                triton_limit,
+                triton_limit + 1,
+            )
+        )
+
+        for num_tokens in sorted(
+            value for value in transition_points if minimum <= value <= maximum
+        ):
             query = {**group.to_dict(), "num_tokens": num_tokens}
-            extended.append(DecisionRecord(query=FrozenMapping(query), config=winner))
-    return tuple(extended)
+            winner = next(
+                (
+                    anchor
+                    for anchor in sorted(
+                        anchors,
+                        key=lambda item: (
+                            abs(int(item.query["num_tokens"]) - num_tokens),
+                            int(item.query["num_tokens"]),
+                        ),
+                    )
+                    if _config_covers_query(query, anchor.config)
+                ),
+                None,
+            )
+            if winner is None:
+                raise ValueError(
+                    f"no measured MoE config covers num_tokens={num_tokens} for {group}"
+                )
+            synthesized.append(DecisionRecord.create(query=query, config=winner.config))
+    return tuple(synthesized)
 
 
 def _coarse_cases(cases: Sequence[MoeSweepCase]) -> tuple[MoeSweepCase, ...]:
@@ -259,7 +300,15 @@ def _measurement_cases(
     if not cases:
         return ()
     if _has_tunable_backend(cases[0].geometry):
-        return cases
+        return tuple(
+            case
+            for case in cases
+            if case.num_tokens not in _NVFP4_CAPACITY_TOKENS
+            or (
+                case.is_model_native_top_k
+                and case.route_pattern in _QUALIFICATION_PATTERNS
+            )
+        )
     return tuple(
         case
         for case in cases
@@ -300,9 +349,7 @@ def _select_coarse_candidates(
         kept.add(
             max(
                 explicit_triton,
-                key=lambda candidate: int(
-                    candidate.config["max_active_clusters"]
-                ),
+                key=lambda candidate: int(candidate.config["max_active_clusters"]),
             ).candidate_id
         )
 
@@ -327,9 +374,7 @@ def _select_coarse_candidates(
         if not uncovered:
             break
         available = [
-            candidate
-            for candidate in candidates
-            if candidate.candidate_id not in kept
+            candidate for candidate in candidates if candidate.candidate_id not in kept
         ]
         if not available:
             raise RuntimeError("coarse candidate coverage is incomplete")
@@ -408,9 +453,7 @@ class MoeDecodeGenerator:
             for case in _measurement_cases(cases_by_geometry[geometry.key])
         )
         query_count = len({_query_key(case) for case in self._cases})
-        work_units = (
-            len(self._geometries) + len(coarse) + len(measured) + query_count
-        )
+        work_units = len(self._geometries) + len(coarse) + len(measured) + query_count
         return WorkEstimate(
             component_id=self.component_id,
             work_units=work_units,
@@ -433,8 +476,8 @@ class MoeDecodeGenerator:
         context: GenerationContext,
     ) -> tuple[MeasurementPartition, ...]:
         del context
-        cases_by_geometry: dict[tuple[object, ...], list[MoeSweepCase]] = (
-            defaultdict(list)
+        cases_by_geometry: dict[tuple[object, ...], list[MoeSweepCase]] = defaultdict(
+            list
         )
         for case in self._cases:
             cases_by_geometry[case.geometry.key].append(case)
@@ -642,6 +685,7 @@ class MoeDecodeGenerator:
             cases_by_geometry[case.geometry.key].append(case)
         full_results: list[tuple[MoeSweepCase, tuple[MoeMeasurement, ...]]] = []
         fixed_configs: dict[tuple[object, ...], FrozenMapping] = {}
+        capacity_configs: dict[tuple[object, ...], FrozenMapping] = {}
         single_candidate_route_cases = 0
         coarse_measurement_cases = 0
         for geometry_index, geometry in enumerate(self._geometries, start=1):
@@ -689,9 +733,7 @@ class MoeDecodeGenerator:
                         "coarse candidate race"
                     ),
                     total=(
-                        len(_coarse_cases(geometry_cases))
-                        if len(candidates) > 1
-                        else 0
+                        len(_coarse_cases(geometry_cases)) if len(candidates) > 1 else 0
                     ),
                 )
                 if len(candidates) > 1:
@@ -704,6 +746,24 @@ class MoeDecodeGenerator:
                     progress=progress,
                     checkpoints=checkpoints,
                 )
+                if _has_tunable_backend(geometry):
+                    for case in geometry_cases:
+                        if case.num_tokens not in _NVFP4_CAPACITY_TOKENS:
+                            continue
+                        eligible = session.eligible_candidates(case, candidates)
+                        if len(eligible) != 1:
+                            raise RuntimeError(
+                                "prefill capacity planning requires exactly one "
+                                f"eligible MoE candidate for {case.case_id}"
+                            )
+                        key = _query_key(case)
+                        config = eligible[0].config
+                        previous = capacity_configs.setdefault(key, config)
+                        if previous != config:
+                            raise RuntimeError(
+                                "prefill capacity routes disagree on the forced "
+                                f"MoE config for {_query_dict(case)}"
+                            )
                 progress.start_stage(
                     self.component_id,
                     stage=(
@@ -790,9 +850,25 @@ class MoeDecodeGenerator:
             )
 
         measured_query_keys = {record.query for record in records}
+        qualified_capacity_pairs = {
+            (case.geometry.key, case.num_tokens)
+            for case, _measurements in full_results
+            if case.num_tokens in _NVFP4_CAPACITY_TOKENS
+        }
         qualified_fixed_query_points = 0
+        qualified_capacity_query_points = 0
         for case in self._cases:
             config = fixed_configs.get(case.geometry.key)
+            is_capacity_config = False
+            if config is None and case.num_tokens in _NVFP4_CAPACITY_TOKENS:
+                qualification_key = (case.geometry.key, case.num_tokens)
+                if qualification_key not in qualified_capacity_pairs:
+                    raise RuntimeError(
+                        "missing GPU qualification for MoE prefill capacity "
+                        f"{case.num_tokens} and geometry {case.geometry.key}"
+                    )
+                config = capacity_configs.get(_query_key(case))
+                is_capacity_config = True
             if config is None:
                 continue
             query = FrozenMapping(_query_dict(case))
@@ -800,23 +876,18 @@ class MoeDecodeGenerator:
                 continue
             records.append(DecisionRecord(query=query, config=config))
             measured_query_keys.add(query)
-            qualified_fixed_query_points += 1
+            if is_capacity_config:
+                qualified_capacity_query_points += 1
+            else:
+                qualified_fixed_query_points += 1
 
         measured_records = tuple(records)
         token_values = {case.num_tokens for case in self._cases}
         records = list(
-            synthesize_integer_axis_coverage(
+            _synthesize_token_capacity_coverage(
                 measured_records,
-                field="num_tokens",
                 minimum=min(token_values),
                 maximum=max(token_values),
-                config_is_valid=_config_covers_query,
-            )
-        )
-        records = list(
-            _extend_prefill_token_coverage(
-                records,
-                measured_maximum=max(token_values),
             )
         )
         planner = build_axis_tree(
@@ -824,7 +895,7 @@ class MoeDecodeGenerator:
             field_order=_QUERY_FIELDS,
             range_fields=frozenset({"num_tokens"}),
             nearest_range_bounds={
-                "num_tokens": (min(token_values), _PROFILE_MAX_TOKENS),
+                "num_tokens": (min(token_values), max(token_values)),
             },
         )
         component = {
@@ -834,6 +905,7 @@ class MoeDecodeGenerator:
             "coverage": {
                 "physical_geometries": len(self._geometries),
                 "measured_query_points": len(results_by_query),
+                "qualified_capacity_query_points": qualified_capacity_query_points,
                 "qualified_fixed_query_points": qualified_fixed_query_points,
                 "runtime_query_points": len(records),
             },
@@ -844,22 +916,17 @@ class MoeDecodeGenerator:
             component=component,
             evidence={
                 "coarse_target_ratio": _COARSE_TARGET_RATIO,
-                "measurement_process_scope": (
-                    "one_cuda_process_per_physical_geometry"
-                ),
+                "measurement_process_scope": "one_cuda_process_per_physical_geometry",
                 "winner_query_counts": dict(sorted(winner_counts.items())),
                 "route_measurements": len(full_results),
                 "single_candidate_route_cases": single_candidate_route_cases,
                 "gpu_measurement_cases": (
-                    len(self._geometries)
-                    + coarse_measurement_cases
-                    + len(full_results)
+                    len(self._geometries) + coarse_measurement_cases + len(full_results)
                 ),
-                "fixed_backend_qualification_tokens": sorted(
-                    _QUALIFICATION_TOKENS
-                ),
-                "fixed_backend_qualification_patterns": sorted(
-                    _QUALIFICATION_PATTERNS
+                "fixed_backend_qualification_tokens": sorted(_QUALIFICATION_TOKENS),
+                "fixed_backend_qualification_patterns": sorted(_QUALIFICATION_PATTERNS),
+                "prefill_token_capacities": sorted(
+                    token_values & _NVFP4_CAPACITY_TOKENS
                 ),
             },
             completed_work_units=estimate.work_units,

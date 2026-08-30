@@ -6,6 +6,7 @@ from b12x.gemm.bf16_vocab_projection._policy import (
     BF16_VOCAB_PROJECTION_POLICY,
     Bf16VocabProjectionQuery,
 )
+from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
 from b12x.policy import (
     EMBEDDED_REGISTRY,
     PlanningPolicyMode,
@@ -17,6 +18,7 @@ from b12x.policy import (
     validate_component_profile_contract,
 )
 from b12x.policy.generation import ComponentGeneratorRegistry
+from b12x.policy.generation.moe_corpus import COMMON_PREFILL_TOKEN_CAPACITIES
 from b12x.policy.generation.providers import register_builtin_generators
 
 
@@ -110,6 +112,38 @@ def test_qwen_flash_next_vocab_projection_resolves_from_gb10_profile() -> None:
     assert resolution.config.backend == "triton"
     assert resolution.config.algorithm == "row"
     assert resolution.config.num_warps == 8
+
+
+def test_qwen_flash_next_prefill_moe_resolves_from_embedded_profiles() -> None:
+    for profile_id in (
+        "nvidia.gb10.48sm",
+        "nvidia.rtx.pro.6000.blackwell",
+    ):
+        profile = EMBEDDED_REGISTRY.get(profile_id)
+        context = PolicyContext.for_identity(
+            profile.targets[0],
+            mode=PolicyMode.PREPLANNED_ONLY,
+        )
+
+        for num_tokens in COMMON_PREFILL_TOKEN_CAPACITIES:
+            resolution = context.resolve(
+                MOE_DECODE_POLICY,
+                MoeDecodeQuery(
+                    activation="silu",
+                    hidden_size=2_560,
+                    intermediate_size=640,
+                    num_experts=512,
+                    num_tokens=num_tokens,
+                    quant_mode="nvfp4",
+                    routed_rows=num_tokens * 10,
+                    source_format="modelopt_nvfp4",
+                    top_k=10,
+                ),
+            )
+
+            assert resolution.source is PolicySource.PREPLANNED
+            assert resolution.config.backend == "dynamic"
+            assert resolution.config.route_planner == "internal"
 
 
 def test_qwen_flash_next_128_token_components_resolve_from_gb10_profile() -> None:

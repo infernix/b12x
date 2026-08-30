@@ -9,6 +9,11 @@ from dataclasses import asdict, dataclass
 COMMON_TP_SIZES = tuple(range(1, 17))
 COMMON_TOP_K = (1, 2, 4, 6, 8, 10, 12, 16)
 COMMON_DECODE_TOKENS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128)
+COMMON_PREFILL_TOKEN_CAPACITIES = (512, 1_024, 2_048, 4_096, 8_192)
+COMMON_PLAN_TOKEN_COUNTS = (
+    *COMMON_DECODE_TOKENS,
+    *COMMON_PREFILL_TOKEN_CAPACITIES,
+)
 COMMON_ROUTE_PATTERNS = ("balanced", "hot", "zipf", "disjoint")
 
 
@@ -571,8 +576,7 @@ def _case_id(
     )
     digest = hashlib.sha256(repr(key).encode("utf-8")).hexdigest()[:12]
     geometry_id = (
-        f"e{geometry.num_experts}-k{geometry.hidden_size}"
-        f"-n{geometry.intermediate_size}"
+        f"e{geometry.num_experts}-k{geometry.hidden_size}-n{geometry.intermediate_size}"
     )
     return f"{geometry_id}-tk{top_k}-m{num_tokens}-{route_pattern}-{digest}"
 
@@ -581,7 +585,7 @@ def expand_sweep_cases(
     *,
     geometries: tuple[MoePhysicalGeometry, ...] | None = None,
     top_ks: tuple[int, ...] = COMMON_TOP_K,
-    token_counts: tuple[int, ...] = COMMON_DECODE_TOKENS,
+    token_counts: tuple[int, ...] = COMMON_PLAN_TOKEN_COUNTS,
     route_patterns: tuple[str, ...] = COMMON_ROUTE_PATTERNS,
 ) -> tuple[MoeSweepCase, ...]:
     """Cross deduplicated physical shapes with common runtime axes."""
@@ -623,6 +627,7 @@ def corpus_manifest() -> dict[str, object]:
         "tp_sizes": list(COMMON_TP_SIZES),
         "top_k": list(COMMON_TOP_K),
         "decode_tokens": list(COMMON_DECODE_TOKENS),
+        "prefill_token_capacities": list(COMMON_PREFILL_TOKEN_CAPACITIES),
         "route_patterns": list(COMMON_ROUTE_PATTERNS),
         "recipes": [asdict(recipe) for recipe in MOE_RECIPES],
         "models": [asdict(model) for model in COMMON_MOE_MODELS],
@@ -636,6 +641,8 @@ def corpus_manifest() -> dict[str, object]:
 __all__ = [
     "COMMON_DECODE_TOKENS",
     "COMMON_MOE_MODELS",
+    "COMMON_PLAN_TOKEN_COUNTS",
+    "COMMON_PREFILL_TOKEN_CAPACITIES",
     "COMMON_ROUTE_PATTERNS",
     "COMMON_TOP_K",
     "COMMON_TP_SIZES",

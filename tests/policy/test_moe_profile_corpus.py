@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from benchmarks.benchmark_moe import MODEL_PROFILES
 from b12x.policy.generation.moe_corpus import (
+    COMMON_DECODE_TOKENS,
     COMMON_MOE_MODELS,
+    COMMON_PLAN_TOKEN_COUNTS,
+    COMMON_PREFILL_TOKEN_CAPACITIES,
     COMMON_ROUTE_PATTERNS,
     COMMON_TP_SIZES,
     MOE_BENCHMARK_PRESETS,
@@ -181,10 +184,23 @@ def test_default_sweep_has_stable_complete_cross_product() -> None:
     cases = expand_sweep_cases(geometries=geometries)
 
     assert len(geometries) == 253
-    assert len(cases) == 97_872
+    assert len(cases) == 138_652
+    assert {case.num_tokens for case in cases} == set(COMMON_PLAN_TOKEN_COUNTS)
     assert {case.route_pattern for case in cases} == set(COMMON_ROUTE_PATTERNS)
     assert len({case.case_id for case in cases}) == len(cases)
     assert len(corpus_manifest()["corpus_sha256"]) == 64
+
+
+def test_moe_token_axis_separates_decode_and_prefill_capacities() -> None:
+    assert COMMON_DECODE_TOKENS == (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128)
+    assert COMMON_PREFILL_TOKEN_CAPACITIES == (512, 1_024, 2_048, 4_096, 8_192)
+    assert (
+        *COMMON_DECODE_TOKENS,
+        *COMMON_PREFILL_TOKEN_CAPACITIES,
+    ) == COMMON_PLAN_TOKEN_COUNTS
+    assert corpus_manifest()["prefill_token_capacities"] == list(
+        COMMON_PREFILL_TOKEN_CAPACITIES
+    )
 
 
 def test_glm_benchmark_recipes_expand_across_all_profiled_tp_sizes() -> None:

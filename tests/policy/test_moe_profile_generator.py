@@ -22,9 +22,17 @@ from b12x.policy.generation.moe_corpus import (
 from b12x.policy.generation.progress import NullProgressReporter
 from b12x.policy.generation.providers import moe_gpu_worker
 from b12x.policy.generation.providers.moe import (
+    _config_covers_query,
+    _synthesize_token_capacity_coverage,
     MoeCandidate,
     MoeDecodeGenerator,
     MoeMeasurement,
+)
+from b12x.policy.generation.reducer import (
+    DecisionRecord,
+    build_axis_tree,
+    decision_node_to_dict,
+    synthesize_integer_axis_coverage,
 )
 from b12x.policy.generation.providers.moe_gpu_worker import (
     MoeGpuBenchmarkFactory,
@@ -93,8 +101,11 @@ class _Session(AbstractContextManager["_Session"]):
         return None
 
     def eligible_candidates(self, case, candidates):
-        del case
-        return candidates
+        return tuple(
+            candidate
+            for candidate in candidates
+            if not (candidate.config["backend"] == "micro" and case.num_tokens > 8)
+        )
 
     def measure(self, case, candidates, *, correctness=False):
         del correctness
@@ -138,6 +149,8 @@ def _generator(
     *,
     quant_mode: str = "nvfp4",
     tp_sizes: tuple[int, ...] = (1,),
+    token_counts: tuple[int, ...] = (1, 4),
+    top_ks: tuple[int, ...] = (2,),
 ):
     recipe = MoeRecipe(
         recipe_id=f"test-{quant_mode}",
@@ -163,8 +176,8 @@ def _generator(
     )
     cases = expand_sweep_cases(
         geometries=geometries,
-        top_ks=(2,),
-        token_counts=(1, 4),
+        top_ks=top_ks,
+        token_counts=token_counts,
         route_patterns=("balanced", "hot"),
     )
     return MoeDecodeGenerator(
@@ -189,16 +202,14 @@ def test_moe_measurement_partition_keeps_one_physical_geometry(tmp_path) -> None
     context = _context(tmp_path)
 
     partitions = generator.measurement_partitions(context)
-    restricted = generator.select_measurement_partitions(
-        (partitions[0].partition_id,)
-    )
+    restricted = generator.select_measurement_partitions((partitions[0].partition_id,))
 
     assert len(partitions) == 2
     assert partitions[0].component_id == "moe.decode"
     assert restricted.estimate(context).case_count == partitions[0].case_count
-    assert restricted.estimate(context).case_count < generator.estimate(
-        context
-    ).case_count
+    assert (
+        restricted.estimate(context).case_count < generator.estimate(context).case_count
+    )
 
 
 def test_staged_moe_generator_keeps_regional_winners_and_resumes(tmp_path) -> None:
@@ -257,13 +268,177 @@ def test_staged_moe_generator_keeps_regional_winners_and_resumes(tmp_path) -> No
         component.lookup({**base_query, "num_tokens": 4}).config["backend"] == "dynamic"
     )
     assert (
-        component.lookup({**base_query, "num_tokens": 2}).config["backend"]
-        == "micro"
+        component.lookup({**base_query, "num_tokens": 2}).config["backend"] == "micro"
     )
     assert (
-        component.lookup({**base_query, "num_tokens": 3}).config["backend"]
-        == "dynamic"
+        component.lookup({**base_query, "num_tokens": 3}).config["backend"] == "dynamic"
     )
+    assert component.lookup({**base_query, "num_tokens": 2_048}) is None
+
+
+def test_prefill_capacities_are_qualified_once_per_geometry(
+    tmp_path,
+) -> None:
+    calls = []
+    generator = _generator(
+        calls,
+        token_counts=(1, 512, 1_024),
+        top_ks=(1, 2),
+    )
+
+    result = generator.generate(
+        _context(tmp_path),
+        progress=NullProgressReporter(),
+        checkpoints=CheckpointStore(tmp_path / "checkpoints"),
+    )
+
+    cases_by_id = {case.case_id: case for case in generator._cases}
+    capacity_calls = [
+        cases_by_id[case_id]
+        for case_id, _candidate_ids in calls
+        if cases_by_id[case_id].num_tokens >= 512
+    ]
+    assert {(case.num_tokens, case.top_k) for case in capacity_calls} == {
+        (512, 2),
+        (1_024, 2),
+    }
+    assert result.component["coverage"]["qualified_capacity_query_points"] == 2
+
+    profile = profile_from_dict(
+        {
+            "profile_id": "nvidia.synthetic.48sm",
+            "targets": [
+                {
+                    "vendor": "nvidia",
+                    "compute_capability": [12, 1],
+                    "sm_count": 48,
+                    "product_name": "Synthetic GPU",
+                }
+            ],
+            "components": [result.component],
+        }
+    )
+    component = profile.component("moe.decode")
+    assert component is not None
+    for num_tokens in (512, 1_024):
+        for top_k in (1, 2):
+            hit = component.lookup(
+                {
+                    "quant_mode": "nvfp4",
+                    "source_format": "modelopt_nvfp4",
+                    "activation": "silu",
+                    "num_experts": 16,
+                    "hidden_size": 256,
+                    "intermediate_size": 64,
+                    "top_k": top_k,
+                    "num_tokens": num_tokens,
+                }
+            )
+            assert hit is not None
+            assert hit.config["backend"] == "dynamic"
+
+
+@pytest.mark.parametrize("top_k", (1, 10, 16))
+def test_sparse_token_capacity_coverage_matches_dense_reference(top_k: int) -> None:
+    base_query = {
+        "quant_mode": "nvfp4",
+        "source_format": "modelopt_nvfp4",
+        "activation": "silu",
+        "num_experts": 16,
+        "hidden_size": 256,
+        "intermediate_size": 64,
+        "top_k": top_k,
+    }
+    configs = {
+        "micro": {
+            "backend": "micro",
+            "route_planner": "internal",
+            "max_active_clusters": None,
+        },
+        "triton": {
+            "backend": "dynamic",
+            "route_planner": "triton",
+            "max_active_clusters": 24,
+        },
+        "dynamic": {
+            "backend": "dynamic",
+            "route_planner": "internal",
+            "max_active_clusters": None,
+        },
+    }
+    measured = tuple(
+        DecisionRecord.create(
+            query={**base_query, "num_tokens": num_tokens},
+            config=configs[config],
+        )
+        for num_tokens, config in (
+            (1, "micro"),
+            (min(128, 256 // top_k), "triton"),
+            (512, "dynamic"),
+            (1_024, "dynamic"),
+        )
+    )
+    dense = synthesize_integer_axis_coverage(
+        measured,
+        field="num_tokens",
+        minimum=1,
+        maximum=1_024,
+        config_is_valid=_config_covers_query,
+    )
+    sparse = _synthesize_token_capacity_coverage(
+        measured,
+        minimum=1,
+        maximum=1_024,
+    )
+    assert len(sparse) < len(dense) // 10
+
+    field_order = (*base_query, "num_tokens")
+    dense_tree = build_axis_tree(
+        dense,
+        field_order=field_order,
+        range_fields=frozenset({"num_tokens"}),
+    )
+    sparse_tree = build_axis_tree(
+        sparse,
+        field_order=field_order,
+        range_fields=frozenset({"num_tokens"}),
+        nearest_range_bounds={"num_tokens": (1, 1_024)},
+    )
+
+    def component(planner):
+        profile = profile_from_dict(
+            {
+                "profile_id": "nvidia.synthetic.48sm",
+                "targets": [
+                    {
+                        "vendor": "nvidia",
+                        "compute_capability": [12, 1],
+                        "sm_count": 48,
+                        "product_name": "Synthetic GPU",
+                    }
+                ],
+                "components": [
+                    {
+                        "component_id": "moe.decode",
+                        "query_schema_version": 2,
+                        "config_schema_version": 1,
+                        "planner": decision_node_to_dict(planner),
+                    }
+                ],
+            }
+        )
+        return profile.component("moe.decode")
+
+    dense_component = component(dense_tree)
+    sparse_component = component(sparse_tree)
+    assert dense_component is not None
+    assert sparse_component is not None
+    for num_tokens in range(1, 1_025):
+        query = {**base_query, "num_tokens": num_tokens}
+        assert (
+            sparse_component.lookup(query).config
+            == dense_component.lookup(query).config
+        )
 
 
 def test_moe_resume_retries_checkpoint_when_every_candidate_errored(
@@ -317,8 +492,7 @@ def test_moe_resume_retries_checkpoint_when_every_candidate_errored(
     )
     assert refreshed is not None
     assert all(
-        measurement["error"] is None
-        for measurement in refreshed["measurements"]
+        measurement["error"] is None for measurement in refreshed["measurements"]
     )
 
 
@@ -602,6 +776,28 @@ def test_single_backend_geometries_are_gpu_qualified_before_profile_coverage(
     assert "precomputed_cases" not in result.evidence
     assert result.component["coverage"]["measured_query_points"] == 2
     assert result.component["coverage"]["runtime_query_points"] == 4
+
+
+def test_single_backend_does_not_repeat_qualification_at_capacity(tmp_path) -> None:
+    calls = []
+    generator = _generator(
+        calls,
+        quant_mode="w4a16",
+        token_counts=(1, 512, 1_024),
+    )
+
+    result = generator.generate(
+        _context(tmp_path),
+        progress=NullProgressReporter(),
+        checkpoints=CheckpointStore(tmp_path / "checkpoints"),
+    )
+
+    cases_by_id = {case.case_id: case for case in generator._cases}
+    measured_tokens = {
+        cases_by_id[case_id].num_tokens for case_id, _candidate_ids in calls
+    }
+    assert measured_tokens == {1}
+    assert result.component["coverage"]["qualified_capacity_query_points"] == 0
 
 
 def test_production_moe_factory_isolates_each_geometry_process(tmp_path) -> None:
