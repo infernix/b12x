@@ -49,6 +49,7 @@ _COARSE_PATTERNS = frozenset({"balanced", "hot"})
 _COARSE_TARGET_RATIO = 1.01
 _MICRO_MAX_TOKENS = 8
 _TRITON_ROUTE_MAX_ROWS = 256
+_PROFILE_MAX_TOKENS = 8_192
 _QUALIFICATION_TOKENS = frozenset({1, 4, 7, 32, 128})
 _QUALIFICATION_PATTERNS = frozenset({"balanced", "hot"})
 
@@ -196,6 +197,45 @@ def _config_covers_query(
             and num_tokens * top_k <= _TRITON_ROUTE_MAX_ROWS
         )
     return True
+
+
+def _extend_prefill_token_coverage(
+    records: Sequence[DecisionRecord],
+    *,
+    measured_maximum: int,
+) -> tuple[DecisionRecord, ...]:
+    grouped: dict[FrozenMapping, list[DecisionRecord]] = defaultdict(list)
+    for record in records:
+        group = FrozenMapping(
+            {key: value for key, value in record.query.items() if key != "num_tokens"}
+        )
+        grouped[group].append(record)
+
+    extended = list(records)
+    for group, anchors in grouped.items():
+        endpoint_query = {**group.to_dict(), "num_tokens": _PROFILE_MAX_TOKENS}
+        winner = next(
+            (
+                anchor.config
+                for anchor in sorted(
+                    anchors,
+                    key=lambda item: int(item.query["num_tokens"]),
+                    reverse=True,
+                )
+                if _config_covers_query(endpoint_query, anchor.config)
+            ),
+            FrozenMapping(
+                {
+                    "backend": "dynamic",
+                    "route_planner": "internal",
+                    "max_active_clusters": None,
+                }
+            ),
+        )
+        for num_tokens in (measured_maximum + 1, _PROFILE_MAX_TOKENS):
+            query = {**group.to_dict(), "num_tokens": num_tokens}
+            extended.append(DecisionRecord(query=FrozenMapping(query), config=winner))
+    return tuple(extended)
 
 
 def _coarse_cases(cases: Sequence[MoeSweepCase]) -> tuple[MoeSweepCase, ...]:
@@ -773,10 +813,19 @@ class MoeDecodeGenerator:
                 config_is_valid=_config_covers_query,
             )
         )
+        records = list(
+            _extend_prefill_token_coverage(
+                records,
+                measured_maximum=max(token_values),
+            )
+        )
         planner = build_axis_tree(
             records,
             field_order=_QUERY_FIELDS,
             range_fields=frozenset({"num_tokens"}),
+            nearest_range_bounds={
+                "num_tokens": (min(token_values), _PROFILE_MAX_TOKENS),
+            },
         )
         component = {
             "component_id": self.component_id,
