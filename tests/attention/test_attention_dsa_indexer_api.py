@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.attention.dsa_indexer import tiled_topk as tiled_topk_module
 from b12x.attention.dsa_indexer.kernel import (
     PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT,
     _split_index_k_cache_runtime_views,
@@ -46,6 +47,41 @@ from b12x._lib.compiler import clear_compile_cache, compile_cache_info
 
 
 _FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+
+
+def test_topk_candidate_capacity_is_cached_by_device_and_topk(monkeypatch) -> None:
+    capability_calls: list[int] = []
+
+    def fake_get_device_capability(device_index: int) -> tuple[int, int]:
+        capability_calls.append(device_index)
+        return (12, 0) if device_index == 3 else (9, 0)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", fake_get_device_capability)
+    tiled_topk_module.clear_tiled_topk_kernel_cache()
+
+    sm120 = torch.device("cuda:3")
+    sm90 = torch.device("cuda:4")
+    assert (
+        tiled_topk_module._resolve_smem_candidate_capacity(topk=512, device=sm120)
+        == 1024
+    )
+    assert (
+        tiled_topk_module._resolve_smem_candidate_capacity(topk=512, device=sm120)
+        == 1024
+    )
+    assert (
+        tiled_topk_module._resolve_smem_candidate_capacity(topk=1024, device=sm120)
+        == 8192
+    )
+    assert (
+        tiled_topk_module._resolve_smem_candidate_capacity(topk=512, device=sm90)
+        == 8192
+    )
+    assert capability_calls == [3, 3, 4]
+
+    tiled_topk_module.clear_tiled_topk_kernel_cache()
+    tiled_topk_module._resolve_smem_candidate_capacity(topk=512, device=sm120)
+    assert capability_calls == [3, 3, 4, 3]
 
 
 def _make_real_page_table(
