@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
+from types import SimpleNamespace
 
 from benchmarks.benchmark_gdn_decode import QWEN38_GDN_CASES
 from benchmarks.benchmark_paged_attention import BENCHMARK_PROFILES
@@ -39,8 +40,12 @@ from b12x.policy.generation.providers.gpu_workers import GdnBenchmarkFactory
 from b12x.policy.generation.providers.qualification import (
     _DsaIndexerProbe,
     DsaIndexerGenerator,
-    MhcGenerator,
     SparseMlaGenerator,
+)
+from b12x.policy.generation.providers.norm_sequence import (
+    MhcGenerator,
+    _MhcSession,
+    _mhc_cases,
 )
 from b12x.policy.generation.registry import ComponentGeneratorRegistry
 from b12x.sequence.gdn_decode._policy import GDN_POLICY, GdnQuery
@@ -297,7 +302,36 @@ def test_attention_corpus_manifests_are_content_addressed() -> None:
         assert len(manifest["corpus_sha256"]) == 64
 
 
-def test_glm_fixed_backend_qualification_envelope_matches_presets() -> None:
+def test_mhc_tuner_races_the_medium_prefill_plan() -> None:
+    case = next(
+        case
+        for case in _mhc_cases()
+        if case.query["hidden_size"] == 4_096
+        and case.query["max_tokens"] == 3_072
+    )
+    configs = tuple(
+        candidate.config.to_dict()
+        for candidate in _MhcSession(SimpleNamespace(device=None)).candidates(case)
+    )
+
+    assert any(config["backend"] == "native" for config in configs)
+    assert any(
+        config
+        == {
+            "backend": "tf32_tma",
+            "projection_tile_m": 64,
+            "projection_tile_n": 24,
+            "projection_tile_k": 64,
+            "projection_num_stages": 2,
+            "projection_num_m_warps": 4,
+            "projection_num_n_warps": 1,
+            "projection_k_splits": 8,
+        }
+        for config in configs
+    )
+
+
+def test_glm_profile_generation_envelope_matches_presets() -> None:
     dsa_queries = DsaIndexerGenerator().reviewed_queries()
     sparse_queries = SparseMlaGenerator().reviewed_queries()
     mhc_queries = MhcGenerator().reviewed_queries()
@@ -320,6 +354,13 @@ def test_glm_fixed_backend_qualification_envelope_matches_presets() -> None:
         and query.split_k == 64
         for query in mhc_queries
     )
+    assert {4_096, 7_168} == {query.hidden_size for query in mhc_queries}
+    assert set(COMMON_PREFILL_TOKEN_CAPACITIES) <= {
+        query.max_tokens for query in mhc_queries
+    }
+    assert {2_304, 3_072, 3_584} <= {
+        query.max_tokens for query in mhc_queries
+    }
     assert {query.score_mode for query in dsa_queries} == {"dsa", "msa"}
     assert set(COMMON_PREFILL_TOKEN_CAPACITIES) <= {
         query.max_q_rows for query in dsa_queries if query.mode == "prefill"
