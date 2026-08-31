@@ -24,6 +24,12 @@ from .gpu_workers import (
     _median_of_group_medians,
 )
 
+_NORM_SEQUENCE_TOKEN_CAPACITIES = (
+    *COMMON_SEQUENCE_CAPACITIES,
+    512,
+    *COMMON_PREFILL_TOKEN_CAPACITIES,
+)
+
 
 def _hyperconnection_cases() -> tuple[SweepCase, ...]:
     return tuple(
@@ -37,7 +43,7 @@ def _hyperconnection_cases() -> tuple[SweepCase, ...]:
                 "lowrank": 320,
             },
         )
-        for tokens in (1, 4, 16, 64, 128)
+        for tokens in _NORM_SEQUENCE_TOKEN_CAPACITIES
     )
 
 
@@ -52,7 +58,7 @@ def _mtp_feedback_cases() -> tuple[SweepCase, ...]:
                 "streams": 4,
             },
         )
-        for tokens in (1, 4, 16, 64, 128)
+        for tokens in _NORM_SEQUENCE_TOKEN_CAPACITIES
     )
 
 
@@ -643,8 +649,10 @@ class HyperConnectionGenerator(DiscreteSweepGenerator):
             range_fields=frozenset({"max_tokens"}),
             cases=_hyperconnection_cases() if cases is None else cases,
             benchmark_factory=_OneCaseFactory(_HyperConnectionSession),
-            coverage={},
-            nearest_range_bounds={"max_tokens": (1, 128)},
+            coverage={
+                "token_capacities": list(_NORM_SEQUENCE_TOKEN_CAPACITIES),
+            },
+            nearest_range_bounds={"max_tokens": (1, 8_192)},
         )
 
 
@@ -660,8 +668,10 @@ class MtpFeedbackGenerator(DiscreteSweepGenerator):
             range_fields=frozenset({"max_tokens"}),
             cases=_mtp_feedback_cases() if cases is None else cases,
             benchmark_factory=_OneCaseFactory(_MtpFeedbackSession),
-            coverage={},
-            nearest_range_bounds={"max_tokens": (1, 128)},
+            coverage={
+                "token_capacities": list(_NORM_SEQUENCE_TOKEN_CAPACITIES),
+            },
+            nearest_range_bounds={"max_tokens": (1, 8_192)},
         )
 
 
