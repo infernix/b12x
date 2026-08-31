@@ -863,6 +863,7 @@ def load_expert_weights(
         "nano35_w4a16_shape",
         "dsv4f_shape",
         "dsv4f_nvfp4_shape",
+        "glm53_flash_shape",
         "laguna_s21_shape",
         "minimax_m3_shape",
         "qwen38_flash_next_shape",
