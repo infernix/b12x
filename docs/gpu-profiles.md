@@ -101,6 +101,8 @@ provenance. It performs policy lookup only and does not allocate model weights:
     --tp 4 --device gb10
 ./scripts/inspect_model_policy.py glm-5.2 \
     --tp 8 --device gb10
+./scripts/inspect_model_policy.py glm-5.3 \
+    --tp 8 --device nvidia.rtx.pro.6000.blackwell
 ./scripts/inspect_model_policy.py glm-5.3-flash \
     --tp 4 --device gb10
 ./scripts/inspect_model_policy.py qwen3.8-27b \
@@ -200,6 +202,12 @@ common top-k and decode token counts, multiple route distributions, GDN serving
 shapes, GQA context/page/KV-dtype combinations, and dense and sparse MLA shapes.
 Unaligned low-width MoE shards are padded to their recipe's physical minimum
 instead of being discarded.
+
+MoE model entries declare compatible checkpoint-format families rather than a
+single benchmark recipe. Generation crosses each geometry with every recipe in
+that family that supports the model activation, so ModelOpt NVFP4, W4A16, and
+W4A8 variants share geometry coverage without pretending unsupported
+activation/recipe pairs are runnable.
 
 Attention serving capacities are dense from one through sixteen sequences and
 then use 32, 64, 128, and 256 as larger anchors. Components with a prefill path

@@ -27,6 +27,7 @@ from b12x.policy.generation.progress import NullProgressReporter
 from b12x.policy.generation.providers import moe_gpu_worker
 from b12x.policy.generation.providers.moe import (
     _config_covers_query,
+    _correctness_anchor_rank,
     _synthesize_token_capacity_coverage,
     MoeCandidate,
     MoeDecodeGenerator,
@@ -51,6 +52,7 @@ from b12x.policy.generation.providers.moe_gpu_worker import (
     _finite_float_or_none,
     _is_fatal_accelerator_error,
     _measurement_seed,
+    _maximum_relative_norm_error,
     _MoeGeometrySession,
     _MoeProcessSession,
     _MoeRemoteWorkerError,
@@ -705,7 +707,25 @@ def test_w4a8_tuner_filters_dynamic_specializations_by_real_support(
         for config in large_configs
     )
     if quant_mode == "w4a8_nvfp4":
-        assert any(config["backend"] == "micro" for config in large_configs)
+        assert not any(config["backend"] == "micro" for config in large_configs)
+
+
+def test_nvfp4_relu2_tuner_excludes_oversized_dynamic_tiles() -> None:
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.quant_mode == "nvfp4"
+        and geometry.activation == "relu2"
+    )
+
+    candidates = _candidates_for_geometry(geometry, sm_count=48)
+    tile_ms = {
+        candidate.config["dynamic_tile_m"]
+        for candidate in candidates
+        if candidate.config["backend"] == "dynamic"
+    }
+
+    assert tile_ms == {64, 128}
 
 
 def test_w4a8_tuner_does_not_treat_gb10_micro_preference_as_support() -> None:
@@ -877,10 +897,12 @@ def _generator(
 ):
     recipe = MoeRecipe(
         recipe_id=f"test-{quant_mode}",
+        family_id="test",
         quant_mode=quant_mode,
         source_format="modelopt_nvfp4",
         intermediate_alignment=16,
         minimum_intermediate_size=16,
+        compatible_activations=("silu",),
     )
     model = MoeModelGeometry(
         model_id="test-model",
@@ -889,7 +911,7 @@ def _generator(
         num_experts=16,
         native_top_k=2,
         activation="silu",
-        recipe_ids=(recipe.recipe_id,),
+        recipe_families=(recipe.family_id,),
         source="test",
         tp_sizes=tp_sizes,
     )
@@ -999,6 +1021,38 @@ def test_staged_moe_generator_keeps_regional_winners_and_resumes(tmp_path) -> No
     assert component.lookup({**base_query, "num_tokens": 2_048}) is None
 
 
+def test_moe_resume_reuses_a_cached_candidate_superset(tmp_path) -> None:
+    calls = []
+    generator = _generator(calls)
+    context = _context(tmp_path)
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    case = generator._cases[0]
+    session = _Session(calls, quant_mode="nvfp4")
+
+    generator._race(
+        stage="full",
+        case=case,
+        candidates=session.candidates,
+        session=session,
+        context=context,
+        checkpoints=checkpoints,
+    )
+    calls.clear()
+    requested = session.candidates[1:]
+
+    resumed = generator._race(
+        stage="full",
+        case=case,
+        candidates=requested,
+        session=session,
+        context=context,
+        checkpoints=checkpoints,
+    )
+
+    assert calls == []
+    assert tuple(item.candidate for item in resumed) == requested
+
+
 def test_correctness_screen_uses_an_eligible_anchor_per_candidate(tmp_path) -> None:
     calls = []
     generator = _generator(calls, token_counts=(1, 4))
@@ -1044,6 +1098,29 @@ def test_correctness_screen_uses_an_eligible_anchor_per_candidate(tmp_path) -> N
         ).config["backend"]
         == "micro"
     )
+
+
+def test_dynamic_correctness_screen_targets_its_route_tile() -> None:
+    generator = _generator([], token_counts=(4, 8, 16), top_ks=(6,))
+    cases = tuple(
+        case
+        for case in generator._cases
+        if case.route_pattern == "balanced" and case.top_k == 6
+    )
+    candidate = MoeCandidate.create(
+        {
+            "backend": "dynamic",
+            "dynamic_route_mode": "grouped",
+            "dynamic_tile_m": 64,
+            "route_planner": "internal",
+            "max_active_clusters": None,
+            "w4a16_route_mode": None,
+        }
+    )
+
+    anchor = min(cases, key=lambda case: _correctness_anchor_rank(case, candidate))
+
+    assert anchor.num_tokens == 8
 
 
 def test_prefill_capacities_are_measured_for_each_top_k(
@@ -1346,6 +1423,22 @@ def test_moe_measurement_inputs_are_route_pattern_controlled() -> None:
     assert len({_measurement_seed(case, base_seed=17) for case in matched}) == 1
 
 
+def test_w4a8_screening_allows_expected_quantized_norm_error() -> None:
+    w4a8 = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.quant_mode == "w4a8_nvfp4"
+    )
+    nvfp4 = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.quant_mode == "nvfp4"
+    )
+
+    assert _maximum_relative_norm_error(w4a8) == 0.12
+    assert _maximum_relative_norm_error(nvfp4) == 0.1
+
+
 def test_moe_zero_outputs_have_defined_correctness_cosine() -> None:
     zeros = torch.zeros(8)
 
@@ -1443,10 +1536,12 @@ def test_independent_nvfp4_oracle_matches_kernel_scale_math(monkeypatch) -> None
 def test_modelopt_profile_weights_pad_and_swizzle_scale_atoms() -> None:
     recipe = MoeRecipe(
         recipe_id="modelopt-nvfp4-test",
+        family_id="test",
         quant_mode="nvfp4",
         source_format="modelopt_nvfp4",
         intermediate_alignment=16,
         minimum_intermediate_size=16,
+        compatible_activations=("silu",),
     )
     model = MoeModelGeometry(
         model_id="low-width-test",
@@ -1455,7 +1550,7 @@ def test_modelopt_profile_weights_pad_and_swizzle_scale_atoms() -> None:
         num_experts=1,
         native_top_k=1,
         activation="silu",
-        recipe_ids=(recipe.recipe_id,),
+        recipe_families=(recipe.family_id,),
         source="test",
         tp_sizes=(1,),
     )
@@ -1487,10 +1582,12 @@ def test_trellis_profile_worker_uses_serving_dtype(
 
     recipe = MoeRecipe(
         recipe_id="trellis-test",
+        family_id="test",
         quant_mode="w4a16",
         source_format="b12x_trellis",
         intermediate_alignment=128,
         minimum_intermediate_size=128,
+        compatible_activations=(activation,),
         trellis_variant=variant,
     )
     model = MoeModelGeometry(
@@ -1500,7 +1597,7 @@ def test_trellis_profile_worker_uses_serving_dtype(
         num_experts=3,
         native_top_k=1,
         activation=activation,
-        recipe_ids=(recipe.recipe_id,),
+        recipe_families=(recipe.family_id,),
         source="test",
         tp_sizes=(1,),
     )
@@ -1541,10 +1638,12 @@ def test_projection_mixed_bind_initializes_grid_barrier_workspace() -> None:
 
     recipe = MoeRecipe(
         recipe_id="trellis-bind-test",
+        family_id="test",
         quant_mode="w4a16",
         source_format="b12x_trellis",
         intermediate_alignment=128,
         minimum_intermediate_size=128,
+        compatible_activations=("silu",),
         trellis_variant="glm-mcg-projection-tiered",
     )
     model = MoeModelGeometry(
@@ -1554,7 +1653,7 @@ def test_projection_mixed_bind_initializes_grid_barrier_workspace() -> None:
         num_experts=3,
         native_top_k=1,
         activation="silu",
-        recipe_ids=(recipe.recipe_id,),
+        recipe_families=(recipe.family_id,),
         source="test",
         tp_sizes=(1,),
     )

@@ -107,6 +107,175 @@ def _glm_next_dense_physical_reference(
     ).to(torch.bfloat16)
 
 
+def _pooled_selection_reference(
+    pool_indices: torch.Tensor,
+    positions: torch.Tensor,
+    request_ids: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    pool_size: int,
+    block_size: int,
+    block_stride_rows: int,
+    num_cache_blocks: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, pool_topk = pool_indices.shape
+    output_width = pool_topk * pool_size + pool_size - 1
+    logical = torch.full(
+        (rows, output_width), -1, dtype=torch.int64, device=pool_indices.device
+    )
+    for pool_offset in range(pool_size):
+        logical[:, pool_offset : pool_topk * pool_size : pool_size] = torch.where(
+            pool_indices >= 0,
+            pool_indices.to(torch.int64) * pool_size + pool_offset,
+            -1,
+        )
+    sequence_lengths = positions + 1
+    complete_pools = torch.div(sequence_lengths, pool_size, rounding_mode="floor")
+    tail_counts = sequence_lengths - complete_pools * pool_size
+    for tail_offset in range(pool_size - 1):
+        logical[:, pool_topk * pool_size + tail_offset] = torch.where(
+            tail_offset < tail_counts,
+            complete_pools * pool_size + tail_offset,
+            -1,
+        )
+
+    safe_logical = logical.clamp_min(0)
+    block_ids = torch.div(safe_logical, block_size, rounding_mode="floor")
+    valid = (logical >= 0) & (block_ids < block_table.shape[1])
+    safe_blocks = block_ids.clamp_max(block_table.shape[1] - 1)
+    pages = block_table[request_ids.to(torch.int64).unsqueeze(1), safe_blocks]
+    valid &= (pages >= 0) & (pages < num_cache_blocks)
+    physical = pages.to(torch.int64) * block_stride_rows + safe_logical % block_size
+    output = torch.where(valid, physical, -1).to(torch.int32)
+    active_counts = (
+        torch.minimum(complete_pools, torch.full_like(complete_pools, pool_topk))
+        * pool_size
+        + tail_counts
+    ).to(torch.int32)
+    return output, active_counts
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("rows", [1, 7, 32])
+def test_pooled_topk_expands_to_physical_slots(rows: int) -> None:
+    device = require_sm120()
+    pool_size = 4
+    block_size = 256
+    block_stride_rows = 256
+    num_cache_blocks = 8_000_000
+    requests = min(rows, 8)
+    positions_data = [0, 1, 3, 4, 255, 256, 2047, 2048, 4095, 16383]
+    positions = torch.tensor(
+        [positions_data[row % len(positions_data)] for row in range(rows)],
+        dtype=torch.int64,
+        device=device,
+    )
+    request_ids = torch.arange(rows, dtype=torch.int32, device=device) % requests
+    block_table = torch.arange(requests * 80, dtype=torch.int32, device=device).reshape(
+        requests, 80
+    )
+    block_table.mul_(101).add_(7_000_000)
+    block_table[:, -1] = -1
+    pool_indices = torch.full((rows, 512), -1, dtype=torch.int32, device=device)
+    for row, position in enumerate(positions.cpu().tolist()):
+        selected = min((position + 1) // pool_size, 512)
+        if selected:
+            pool_indices[row, :selected] = torch.arange(
+                selected - 1, -1, -1, dtype=torch.int32, device=device
+            )
+    output = torch.empty((rows, 2051), dtype=torch.int32, device=device)
+    active_counts = torch.empty(rows, dtype=torch.int32, device=device)
+
+    sparse_mla.expand_pooled_topk_to_physical_slots(
+        pool_indices,
+        positions,
+        request_ids,
+        block_table,
+        output,
+        active_counts,
+        pool_size=pool_size,
+        block_size=block_size,
+        block_stride_rows=block_stride_rows,
+        num_cache_blocks=num_cache_blocks,
+    )
+    expected, expected_counts = _pooled_selection_reference(
+        pool_indices,
+        positions,
+        request_ids,
+        block_table,
+        pool_size=pool_size,
+        block_size=block_size,
+        block_stride_rows=block_stride_rows,
+        num_cache_blocks=num_cache_blocks,
+    )
+
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(active_counts, expected_counts, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_pooled_topk_physical_expansion_replays_live_inputs() -> None:
+    device = require_sm120()
+    rows, requests = 7, 4
+    pool_indices = torch.arange(512, dtype=torch.int32, device=device).repeat(rows, 1)
+    positions = torch.full((rows,), 2047, dtype=torch.int64, device=device)
+    request_ids = torch.arange(rows, dtype=torch.int32, device=device) % requests
+    block_table = torch.arange(requests * 16, dtype=torch.int32, device=device).reshape(
+        requests, 16
+    )
+    output = torch.empty((rows, 2051), dtype=torch.int32, device=device)
+    active_counts = torch.empty(rows, dtype=torch.int32, device=device)
+
+    def expand() -> None:
+        sparse_mla.expand_pooled_topk_to_physical_slots(
+            pool_indices,
+            positions,
+            request_ids,
+            block_table,
+            output,
+            active_counts,
+            pool_size=4,
+            block_size=256,
+            block_stride_rows=256,
+            num_cache_blocks=8_000_000,
+        )
+
+    expand()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        expand()
+
+    pool_indices.copy_(pool_indices.flip(dims=(1,)))
+    positions.add_(1)
+    request_ids.copy_(
+        torch.tensor([3, 1, 2, 0, 3, 2, 1], dtype=torch.int32, device=device)
+    )
+    block_table.add_(7_000_000)
+    output.fill_(37)
+    active_counts.fill_(37)
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    expected, expected_counts = _pooled_selection_reference(
+        pool_indices,
+        positions,
+        request_ids,
+        block_table,
+        pool_size=4,
+        block_size=256,
+        block_stride_rows=256,
+        num_cache_blocks=8_000_000,
+    )
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(active_counts, expected_counts, rtol=0, atol=0)
+
+    allocated = torch.cuda.memory_allocated(device)
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.cuda.memory_allocated(device) == allocated
+
+
 def test_glm_next_traits_define_no_rope_record() -> None:
     traits = make_unified_traits(
         ModelType.GLM_NEXT,

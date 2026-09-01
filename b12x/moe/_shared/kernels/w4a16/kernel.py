@@ -280,8 +280,9 @@ def _fake_m_for_specialization(size_m: int) -> int:
 
 
 # The W4A16 launch model chooses blocks/SM from static resource usage
-# for each specialization.  These register counts were measured from the local
-# SM121 JIT output and keep launch occupancy stable across refactors.
+# for each specialization. Most entries are measured from the local SM121 JIT
+# output; conservative caps keep supported intermediate route tiles launchable
+# when their exact count cannot change the resulting occupancy.
 _W4A16_REGS_SM121 = {
     (256, 1, 8, 8, True): 118,
     (256, 1, 16, 4, True): 118,
@@ -290,6 +291,10 @@ _W4A16_REGS_SM121 = {
     (128, 1, 4, 8, True): 118,
     (128, 1, 8, 4, True): 120,
     (256, 1, 8, 8, False): 158,
+    # The wide-N single-route tile is already above the one-CTA/SM register
+    # threshold in the narrower N=128 schedule. The architectural cap keeps
+    # the same launch contract until this specialization is measured directly.
+    (256, 1, 16, 4, False): 255,
     (128, 1, 4, 8, False): 154,
     (128, 1, 8, 4, False): 143,
     (256, 2, 16, 4, False): 212,
@@ -299,6 +304,10 @@ _W4A16_REGS_SM121 = {
     # FC2 keeps the paired-M8 schedule qualified by mixed_trellis.py.
     (256, 2, 8, 8, False): 175,
     (256, 3, 16, 4, False): 249,
+    # Block-48 is already above the one-CTA/SM register threshold at block-32.
+    # Use the architectural cap until it has its own measured resource entry;
+    # both values produce the same one-CTA/SM launch contract.
+    (256, 3, 8, 8, False): 255,
     (128, 3, 4, 8, False): 249,
     (128, 3, 8, 4, False): 250,
     (256, 4, 16, 4, False): 255,

@@ -484,6 +484,24 @@ def _correctness_reference_rank(candidate: MoeCandidate) -> tuple[object, ...]:
     )
 
 
+def _correctness_anchor_rank(
+    case: MoeSweepCase,
+    candidate: MoeCandidate,
+) -> tuple[object, ...]:
+    tile_m = candidate.config.get("dynamic_tile_m")
+    if isinstance(tile_m, int):
+        distance = abs(case.routed_rows - tile_m)
+    else:
+        distance = abs(case.num_tokens - 4)
+    return (
+        not case.is_model_native_top_k,
+        distance,
+        case.route_pattern != "balanced",
+        case.num_tokens,
+        case.top_k,
+    )
+
+
 class MoeDecodeGenerator:
     """Generate a broad MoE planner from staged per-geometry GPU races."""
 
@@ -623,19 +641,36 @@ class MoeDecodeGenerator:
             == _MOE_CANDIDATE_CONTRACT_VERSION
             and context.checkpoint_metadata_matches(cached.get("generation"))
             and cached.get("case_id") == case.case_id
-            and cached.get("candidate_ids") == expected_ids
         ):
+            cached_ids = cached.get("candidate_ids")
             raw_measurements = cached.get("measurements")
+            if not isinstance(cached_ids, list):
+                raise TypeError("MoE race checkpoint candidate IDs must be an array")
             if not isinstance(raw_measurements, list):
                 raise TypeError("MoE race checkpoint measurements must be an array")
             cached_measurements = tuple(
                 MoeMeasurement.from_dict(item) for item in raw_measurements
             )
+            measured_ids = [
+                item.candidate.candidate_id for item in cached_measurements
+            ]
+            if measured_ids != cached_ids:
+                raise ValueError(
+                    "MoE race checkpoint candidate IDs must match its measurements"
+                )
+            measurements_by_id = {
+                item.candidate.candidate_id: item for item in cached_measurements
+            }
+            requested_measurements = tuple(
+                measurements_by_id[candidate_id]
+                for candidate_id in expected_ids
+                if candidate_id in measurements_by_id
+            )
             if any(
                 item.error is None and item.latency_us is not None
-                for item in cached_measurements
-            ):
-                return cached_measurements
+                for item in requested_measurements
+            ) and len(requested_measurements) == len(expected_ids):
+                return requested_measurements
 
         measurements = session.measure(
             case,
@@ -682,12 +717,7 @@ class MoeDecodeGenerator:
                 continue
             anchor = min(
                 eligible_cases,
-                key=lambda case: (
-                    not case.is_model_native_top_k,
-                    abs(case.num_tokens - 4),
-                    case.route_pattern != "balanced",
-                    case.num_tokens,
-                ),
+                key=lambda case: _correctness_anchor_rank(case, candidate),
             )
             targets_by_anchor[anchor].append(candidate)
 
