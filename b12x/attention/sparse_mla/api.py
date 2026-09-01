@@ -28,6 +28,7 @@ from .._shared.mla.kv_cache import (
 from ._scratch import (
     B12XSparseMLABinding as Binding,
 )
+from .physical_selection import expand_pooled_topk_to_physical_slots
 from ._policy import SparseMlaConfig, SparseMlaQuery
 from ._scratch import (
     B12XSparseMLAScratch as Scratch,
@@ -76,6 +77,7 @@ __all__ = [
     "concat_and_cache_glm_next_mla",
     "concat_and_cache_glm_next_mla_fp8",
     "concat_and_cache_glm_next_mla_nvfp4",
+    "expand_pooled_topk_to_physical_slots",
     "is_supported",
     "clear_caches",
 ]
