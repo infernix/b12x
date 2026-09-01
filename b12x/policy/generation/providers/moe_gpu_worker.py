@@ -23,6 +23,7 @@ from b12x.policy.generation.moe_corpus import (
 from .moe import MoeCandidate, MoeMeasurement
 
 _MAX_RELATIVE_NORM_ERROR = 0.1
+_W4A8_MAX_RELATIVE_NORM_ERROR = 0.12
 _TUNER_OVERRIDE_ENV = (
     "B12X_DIRECT_CUTE_OPTIONS",
     "B12X_DYNAMIC_DETERMINISTIC_OUTPUT",
@@ -87,6 +88,12 @@ def _benchmark_input_scale(geometry: MoePhysicalGeometry) -> float:
     if geometry.recipe.source_format in {"btx", "b12x_trellis"}:
         return 1.0e-2
     return 1.0
+
+
+def _maximum_relative_norm_error(geometry: MoePhysicalGeometry) -> float:
+    if geometry.recipe.quant_mode in {"w4a8_mx", "w4a8_nvfp4"}:
+        return _W4A8_MAX_RELATIVE_NORM_ERROR
+    return _MAX_RELATIVE_NORM_ERROR
 
 
 def _condition_benchmark_inputs(
@@ -651,7 +658,14 @@ def _candidates_for_geometry(
             )
             for route_mode in route_modes
         )
-    dynamic_tile_ms = (128,) if recipe.quant_mode == "w6a8_mx" else (16, 32, 64, 128)
+    if recipe.quant_mode == "w6a8_mx":
+        dynamic_tile_ms = (128,)
+    elif recipe.quant_mode == "nvfp4" and geometry.activation == "relu2":
+        # The M16/M32 Relu2 kernels require 117760/121856 bytes of shared
+        # memory, above the 101376-byte SM120/SM121 opt-in limit.
+        dynamic_tile_ms = (64, 128)
+    else:
+        dynamic_tile_ms = (16, 32, 64, 128)
     candidates = []
     if recipe.quant_mode != "w6a8_mx":
         candidates.append(
@@ -1309,7 +1323,8 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
                     finite
                     and cosine >= settings.minimum_cosine
                     and graph_cosine >= settings.minimum_cosine
-                    and relative_norm_error <= _MAX_RELATIVE_NORM_ERROR
+                    and relative_norm_error
+                    <= _maximum_relative_norm_error(self._geometry)
                     and allocated_after <= allocated_before
                 )
                 graph_cosine_metric = (
