@@ -22,6 +22,8 @@ from .._shared.mla.api import (
 from .._shared.mla.kv_cache import (
     compile_glm_next_mla_cache_writer,
     concat_and_cache_glm_next_mla,
+    concat_and_cache_glm_next_mla_fp8,
+    concat_and_cache_glm_next_mla_nvfp4,
 )
 from ._scratch import (
     B12XSparseMLABinding as Binding,
@@ -72,6 +74,8 @@ __all__ = [
     "run_extend",
     "compile_glm_next_mla_cache_writer",
     "concat_and_cache_glm_next_mla",
+    "concat_and_cache_glm_next_mla_fp8",
+    "concat_and_cache_glm_next_mla_nvfp4",
     "is_supported",
     "clear_caches",
 ]
