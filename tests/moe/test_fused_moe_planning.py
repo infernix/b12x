@@ -216,7 +216,7 @@ def test_required_nbytes_avoids_launch_prewarm(
 
     required = fused_moe.required_nbytes(caps)
 
-    assert required > 800 * 1024 * 1024
+    assert required > 780 * 1024 * 1024
     assert "required_nbytes" in fused_moe.META.entry_points
     with pytest.raises(TypeError, match="TPMoEScratchCaps"):
         fused_moe.required_nbytes(object())
@@ -457,6 +457,7 @@ def test_projection_mixed_config_selects_fixed_mixed_workspace(
         128,
         128,
     )
+    assert plan._core_workspace_plan.route_block_size_m == 48
     assert specs["intermediate_cache13"].shape == (3072 * 8 * 1024,)
     assert specs["intermediate_cache2"].shape == (3072 * 8 * 512,)
     assert specs["rotation_a_gate"].shape == (3072 * 8, 6144)

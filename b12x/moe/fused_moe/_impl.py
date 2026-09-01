@@ -149,6 +149,7 @@ _W4A8_CONVERT_SCRATCH_MB_DEFAULT = 64
 # these views keep the historical local names.
 _FP4_SOURCE_FORMATS = {name: name for name in _EXECUTION_SOURCE_FORMATS}
 _TRELLIS_SOURCE_FORMATS = frozenset(_EXECUTION_TRELLIS_SOURCE_FORMATS)
+_PROJECTION_MIXED_TRELLIS_MAX_ROUTE_BLOCK_SIZE = 48
 _W4A16_SCALE_FORMATS = {
     "e4m3_k16": "e4m3_k16",
     "e4m3_k32": "e4m3_k32",
@@ -2379,6 +2380,11 @@ def _w4a8_mx_micro_preferred(
 
 
 def _policy_micro_supported(query: MoeDecodeQuery) -> bool:
+    if (
+        query.quant_mode == "w4a8_nvfp4"
+        and query.routed_rows > _DIRECT_ROUTING_MAX_ROUTED_ROWS
+    ):
+        return False
     if query.quant_mode == "w4a8_mx":
         return _w4a8_mx_micro_supported(
             num_tokens=query.num_tokens,
@@ -3175,6 +3181,13 @@ def _plan_core_workspace(
                 int(w4a16_block_size_m)
                 if w4a16_block_size_m is not None
                 else select_route_block_size_m(token_capacity, topk, route_E)
+            )
+            # Projection-mixed MCG always includes a K5 tier. Its fixed
+            # 128x128 tile exceeds the SM120/SM121 opt-in shared-memory limit
+            # at a 64-row route block, while the 48-row specialization fits.
+            block_size_m = min(
+                block_size_m,
+                _PROJECTION_MIXED_TRELLIS_MAX_ROUTE_BLOCK_SIZE,
             )
             route_slots_capacity = max_packed_route_slots(
                 routed_capacity,
