@@ -439,15 +439,13 @@ def sparse_mla_decode_forward(
         nsa_cache_seqlens_int32,
         workspace,
         bound_kv_cache,
-    ) = (
-        _resolve_sparse_mla_binding(
-            binding=binding,
-            q_all=q_all,
-            selected_indices=page_table_1,
-            cache_seqlens_int32=cache_seqlens_int32,
-            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
-            selected_name="page_table_1",
-        )
+    ) = _resolve_sparse_mla_binding(
+        binding=binding,
+        q_all=q_all,
+        selected_indices=page_table_1,
+        cache_seqlens_int32=cache_seqlens_int32,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+        selected_name="page_table_1",
     )
     if bound_kv_cache is not None:
         if kv_cache is not None and kv_cache is not bound_kv_cache:
@@ -704,7 +702,7 @@ def _run_sparse_mla(
             )
     else:
         model_type_for_call = None
-        scale_format_for_call = None
+        scale_format_for_call = None if scale_format is None else int(scale_format)
         fp8_rope_for_call = None
         latent_scale_per_token_for_call = False
     if scale_format_for_call == 2 and not _sm120_route:

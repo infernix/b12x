@@ -760,7 +760,8 @@ def index_topk_fp8(
     filled with the float32 top-k scores corresponding position-for-position to
     the returned indices. A binding with ``output_physical_slots=True`` makes the
     producer emit flat physical cache slots directly; no post-selection remap is
-    performed or supported by this entrypoint.
+    performed or supported by this entrypoint. Every ``out_indices`` slot is
+    overwritten on every route, including ``-1`` padding beyond the live width.
     """
 
     metadata, scratch, binding_active_width = _resolve_binding_metadata(
