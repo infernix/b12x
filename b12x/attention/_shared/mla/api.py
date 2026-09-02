@@ -704,7 +704,7 @@ def _run_sparse_mla(
             )
     else:
         model_type_for_call = None
-        scale_format_for_call = None
+        scale_format_for_call = None if scale_format is None else int(scale_format)
         fp8_rope_for_call = None
         latent_scale_per_token_for_call = False
     if scale_format_for_call == 2 and not _sm120_route:

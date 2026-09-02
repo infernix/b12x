@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from b12x.attention import sparse_mla
+from b12x.attention._shared.mla import api as mla_api
 from b12x.attention._shared.mla.reference import (
     _sparse_attention_reference,
     pack_mla_kv_cache_reference,
@@ -22,6 +25,7 @@ from b12x.attention._shared.mla.traits import (
     ScaleFormat,
     infer_model_type,
     make_unified_traits,
+    resolve_unplanned_traits,
 )
 from tests._reference.helpers import dequantize_nvfp4_mla_nope
 
@@ -138,21 +142,26 @@ def _pooled_selection_reference(
     logical = torch.full(
         (rows, output_width), -1, dtype=torch.int64, device=pool_indices.device
     )
-    for pool_offset in range(pool_size):
-        logical[:, pool_offset : pool_topk * pool_size : pool_size] = torch.where(
-            pool_indices >= 0,
-            pool_indices.to(torch.int64) * pool_size + pool_offset,
-            -1,
-        )
     sequence_lengths = positions + 1
     complete_pools = torch.div(sequence_lengths, pool_size, rounding_mode="floor")
-    tail_counts = sequence_lengths - complete_pools * pool_size
-    for tail_offset in range(pool_size - 1):
-        logical[:, pool_topk * pool_size + tail_offset] = torch.where(
-            tail_offset < tail_counts,
-            complete_pools * pool_size + tail_offset,
-            -1,
-        )
+    selected_pools = torch.minimum(
+        complete_pools, torch.full_like(complete_pools, pool_topk)
+    )
+    selected_history_tokens = selected_pools * pool_size
+    columns = torch.arange(output_width, dtype=torch.int64, device=pool_indices.device)
+    pool_columns = torch.div(columns, pool_size, rounding_mode="floor").clamp_max(
+        pool_topk - 1
+    )
+    selected_pool_ids = pool_indices[:, pool_columns].to(torch.int64)
+    history = columns.unsqueeze(0) < selected_history_tokens.unsqueeze(1)
+    history_values = selected_pool_ids * pool_size + columns.remainder(pool_size)
+    logical.copy_(torch.where(history & (selected_pool_ids >= 0), history_values, -1))
+
+    tail_start = complete_pools * pool_size
+    tail_counts = sequence_lengths - tail_start
+    tail_offsets = columns.unsqueeze(0) - selected_history_tokens.unsqueeze(1)
+    in_tail = (tail_offsets >= 0) & (tail_offsets < tail_counts.unsqueeze(1))
+    logical.copy_(torch.where(in_tail, tail_start.unsqueeze(1) + tail_offsets, logical))
 
     safe_logical = logical.clamp_min(0)
     block_ids = torch.div(safe_logical, block_size, rounding_mode="floor")
@@ -162,11 +171,7 @@ def _pooled_selection_reference(
     valid &= (pages >= 0) & (pages < num_cache_blocks)
     physical = pages.to(torch.int64) * block_stride_rows + safe_logical % block_size
     output = torch.where(valid, physical, -1).to(torch.int32)
-    active_counts = (
-        torch.minimum(complete_pools, torch.full_like(complete_pools, pool_topk))
-        * pool_size
-        + tail_counts
-    ).to(torch.int32)
+    active_counts = (selected_pools * pool_size + tail_counts).to(torch.int32)
     return output, active_counts
 
 
@@ -363,6 +368,53 @@ def test_glm_next_accepts_inline_scale_nvfp4_without_rope() -> None:
         )
 
 
+def test_glm_next_nvfp4_unplanned_traits_enable_inline_latent_scale() -> None:
+    traits = resolve_unplanned_traits(
+        512,
+        torch.uint8,
+        _GLM_NEXT_NVFP4_RECORD_BYTES,
+        model_type=ModelType.GLM_NEXT,
+        scale_format=ScaleFormat.NVFP4_E4M3,
+        fp8_rope=False,
+    )
+
+    assert traits.model_type == ModelType.GLM_NEXT
+    assert traits.scale_format == ScaleFormat.NVFP4_E4M3
+    assert traits.latent_scale_per_token is True
+    assert traits.kv_gmem_stride == _GLM_NEXT_NVFP4_RECORD_BYTES
+
+
+def test_traits_less_nvfp4_route_rejects_non_sm120_backend() -> None:
+    q = torch.zeros((1, 1, _GLM_NEXT_HEAD_DIM), dtype=torch.bfloat16)
+    cache = torch.zeros((1, 1, _GLM_NEXT_NVFP4_RECORD_BYTES), dtype=torch.uint8)
+    selected = torch.zeros((1, 1), dtype=torch.int32)
+    lengths = torch.ones((1,), dtype=torch.int32)
+    workspace = SimpleNamespace(
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        kv_dtype=torch.uint8,
+        v_head_dim=_GLM_NEXT_HEAD_DIM,
+        page_size=1,
+        cache_traits=None,
+    )
+
+    with pytest.raises(
+        NotImplementedError, match="NVFP4 sparse MLA requires the active SM120"
+    ):
+        mla_api._run_sparse_mla(
+            q_all=q,
+            kv_cache=cache,
+            selected_indices=selected,
+            cache_seqlens_int32=lengths,
+            active_token_counts=lengths,
+            workspace=workspace,
+            sm_scale=_GLM_NEXT_SM_SCALE,
+            v_head_dim=_GLM_NEXT_HEAD_DIM,
+            scale_format=ScaleFormat.NVFP4_E4M3,
+            model_type=ModelType.GLM_NEXT,
+        )
+
+
 def test_glm_next_nvfp4_cache_abi_is_fixed_by_plan_and_binding() -> None:
     caps = sparse_mla.Caps(
         device="cpu",
@@ -397,6 +449,14 @@ def test_glm_next_nvfp4_cache_abi_is_fixed_by_plan_and_binding() -> None:
         sparse_mla.bind(
             plan,
             kv_cache=torch.empty((1, 1, 528), dtype=torch.uint8),
+            **bind_kwargs,
+        )
+    with pytest.raises(ValueError, match="page size does not match"):
+        sparse_mla.bind(
+            plan,
+            kv_cache=torch.empty(
+                (1, 2, _GLM_NEXT_NVFP4_RECORD_BYTES), dtype=torch.uint8
+            ),
             **bind_kwargs,
         )
     binding = sparse_mla.bind(
@@ -1387,6 +1447,60 @@ def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle() -> None
 
     _assert_glm_next_attention_close(actual, expected)
     torch.testing.assert_close(actual_lse, expected_lse, rtol=0.0, atol=0.05)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+        captured_output, captured_lse = sparse_mla.run_extend(
+            binding=binding,
+            sm_scale=_GLM_NEXT_SM_SCALE,
+            return_lse=True,
+        )
+    assert captured_output.data_ptr() == actual.data_ptr()
+    assert captured_lse.data_ptr() == actual_lse.data_ptr()
+
+    q.copy_(
+        (torch.randn(q.shape, generator=generator, device=device) / 4).to(
+            torch.bfloat16
+        )
+    )
+    latent.copy_(
+        (torch.randn(latent.shape, generator=generator, device=device) / 4).to(
+            torch.bfloat16
+        )
+    )
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    replay_dequantized, _ = dequantize_nvfp4_mla_nope(
+        cache.view(num_records, _GLM_NEXT_NVFP4_RECORD_BYTES),
+        latent_scale_offset=292,
+    )
+    replay_expected, replay_expected_lse = _sparse_attention_reference(
+        q_all=q,
+        k_all=replay_dequantized,
+        v_all=replay_dequantized,
+        page_table_1=selected,
+        active_token_counts=active,
+        sm_scale=_GLM_NEXT_SM_SCALE,
+        return_lse=True,
+    )
+    allocator_counters = (
+        "allocation.all.allocated",
+        "allocation.all.freed",
+        "segment.all.allocated",
+        "segment.all.freed",
+        "num_alloc_retries",
+        "num_ooms",
+    )
+    stats_before = torch.cuda.memory_stats(device)
+    activity_before = tuple(stats_before.get(key, 0) for key in allocator_counters)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    stats_after = torch.cuda.memory_stats(device)
+    activity_after = tuple(stats_after.get(key, 0) for key in allocator_counters)
+
+    assert activity_after == activity_before
+    _assert_glm_next_attention_close(captured_output, replay_expected)
+    torch.testing.assert_close(captured_lse, replay_expected_lse, rtol=0.0, atol=0.05)
 
 
 @torch.inference_mode()
