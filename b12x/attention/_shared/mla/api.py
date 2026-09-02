@@ -439,15 +439,13 @@ def sparse_mla_decode_forward(
         nsa_cache_seqlens_int32,
         workspace,
         bound_kv_cache,
-    ) = (
-        _resolve_sparse_mla_binding(
-            binding=binding,
-            q_all=q_all,
-            selected_indices=page_table_1,
-            cache_seqlens_int32=cache_seqlens_int32,
-            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
-            selected_name="page_table_1",
-        )
+    ) = _resolve_sparse_mla_binding(
+        binding=binding,
+        q_all=q_all,
+        selected_indices=page_table_1,
+        cache_seqlens_int32=cache_seqlens_int32,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+        selected_name="page_table_1",
     )
     if bound_kv_cache is not None:
         if kv_cache is not None and kv_cache is not bound_kv_cache:
@@ -479,6 +477,9 @@ def sparse_mla_decode_forward(
         model_type=model_type,
         fp8_rope=fp8_rope,
         latent_scale_per_token=latent_scale_per_token,
+        planned_cache_traits=(
+            binding.cache_traits if bound_kv_cache is not None else None
+        ),
     )
 
 
@@ -543,6 +544,9 @@ def sparse_mla_extend_forward(
         model_type=model_type,
         fp8_rope=fp8_rope,
         latent_scale_per_token=latent_scale_per_token,
+        planned_cache_traits=(
+            binding.cache_traits if bound_kv_cache is not None else None
+        ),
     )
 
 
@@ -567,6 +571,7 @@ def _run_sparse_mla(
     model_type: int | None = None,
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool | None = None,
+    planned_cache_traits: object | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
@@ -654,59 +659,69 @@ def _run_sparse_mla(
             f"v_head_dim {v_head_dim} does not match workspace v_head_dim {workspace.v_head_dim}"
         )
     _sm120_route = _use_sm120_sparse_mla(backend=backend, device=q_all.device)
-    # The cache ABI is a plan invariant. Runtime recipe kwargs are retained as
-    # compatibility assertions only; they never select a specialization.
-    cache_traits = getattr(workspace, "cache_traits", None)
-    if cache_traits is None and _sm120_route:
-        # Compatibility path for the retired arena-style workspace. Production
-        # sparse-MLA integrations use Caps/Plan/Binding and never enter here.
-        cache_traits = resolve_unplanned_traits(
-            int(q_all.shape[-1]),
-            kv_cache.dtype,
-            int(kv_cache.shape[-1]),
-            model_type=model_type,
-            scale_format=scale_format,
-            fp8_rope=fp8_rope,
-            latent_scale_per_token=bool(latent_scale_per_token),
-        )
+    # A binding-owned cache was validated against these immutable traits at
+    # bind time. The planned serving path consumes them without repeating ABI
+    # checks for every launch.
+    cache_traits = planned_cache_traits
     if cache_traits is not None:
         model_type_for_call = int(cache_traits.model_type)
         scale_format_for_call = int(cache_traits.scale_format)
         fp8_rope_for_call = bool(cache_traits.fp8_rope)
         latent_scale_per_token_for_call = bool(cache_traits.latent_scale_per_token)
-        expected_record_bytes = int(cache_traits.kv_gmem_stride)
-        for name, supplied, planned in (
-            ("model_type", model_type, model_type_for_call),
-            ("scale_format", scale_format, scale_format_for_call),
-            ("fp8_rope", fp8_rope, fp8_rope_for_call),
-            (
-                "latent_scale_per_token",
-                latent_scale_per_token,
-                latent_scale_per_token_for_call,
-            ),
-        ):
-            if supplied is not None and int(supplied) != int(planned):
-                if name == "fp8_rope" and model_type_for_call == ModelType.GLM_NEXT:
-                    raise ValueError("GLM_NEXT sparse MLA has no RoPE cache payload")
-                raise ValueError(
-                    f"sparse MLA run {name} does not match its plan: "
-                    f"run={supplied!r}, plan={planned!r}"
-                )
-        if int(kv_cache.shape[-1]) != expected_record_bytes:
-            raise ValueError(
-                "sparse MLA kv_cache record width does not match its plan: "
-                f"got {int(kv_cache.shape[-1])}, expected {expected_record_bytes}"
-            )
-        if model_type_for_call not in (ModelType.GLM_NSA, ModelType.GLM_NEXT):
-            raise ValueError(
-                "attention.sparse_mla supports ModelType.GLM_NSA or "
-                f"ModelType.GLM_NEXT; got model_type={model_type_for_call}"
-            )
     else:
-        model_type_for_call = None
-        scale_format_for_call = None if scale_format is None else int(scale_format)
-        fp8_rope_for_call = None
-        latent_scale_per_token_for_call = False
+        # The compatibility path accepts a cache supplied at run time. It must
+        # resolve and validate the cache recipe because bind did not own it.
+        cache_traits = getattr(workspace, "cache_traits", None)
+        if cache_traits is None and _sm120_route:
+            cache_traits = resolve_unplanned_traits(
+                int(q_all.shape[-1]),
+                kv_cache.dtype,
+                int(kv_cache.shape[-1]),
+                model_type=model_type,
+                scale_format=scale_format,
+                fp8_rope=fp8_rope,
+                latent_scale_per_token=bool(latent_scale_per_token),
+            )
+        if cache_traits is not None:
+            model_type_for_call = int(cache_traits.model_type)
+            scale_format_for_call = int(cache_traits.scale_format)
+            fp8_rope_for_call = bool(cache_traits.fp8_rope)
+            latent_scale_per_token_for_call = bool(cache_traits.latent_scale_per_token)
+            expected_record_bytes = int(cache_traits.kv_gmem_stride)
+            for name, supplied, planned in (
+                ("model_type", model_type, model_type_for_call),
+                ("scale_format", scale_format, scale_format_for_call),
+                ("fp8_rope", fp8_rope, fp8_rope_for_call),
+                (
+                    "latent_scale_per_token",
+                    latent_scale_per_token,
+                    latent_scale_per_token_for_call,
+                ),
+            ):
+                if supplied is not None and int(supplied) != int(planned):
+                    if name == "fp8_rope" and model_type_for_call == ModelType.GLM_NEXT:
+                        raise ValueError(
+                            "GLM_NEXT sparse MLA has no RoPE cache payload"
+                        )
+                    raise ValueError(
+                        f"sparse MLA run {name} does not match its plan: "
+                        f"run={supplied!r}, plan={planned!r}"
+                    )
+            if int(kv_cache.shape[-1]) != expected_record_bytes:
+                raise ValueError(
+                    "sparse MLA kv_cache record width does not match its plan: "
+                    f"got {int(kv_cache.shape[-1])}, expected {expected_record_bytes}"
+                )
+            if model_type_for_call not in (ModelType.GLM_NSA, ModelType.GLM_NEXT):
+                raise ValueError(
+                    "attention.sparse_mla supports ModelType.GLM_NSA or "
+                    f"ModelType.GLM_NEXT; got model_type={model_type_for_call}"
+                )
+        else:
+            model_type_for_call = None
+            scale_format_for_call = None if scale_format is None else int(scale_format)
+            fp8_rope_for_call = None
+            latent_scale_per_token_for_call = False
     if scale_format_for_call == 2 and not _sm120_route:
         raise NotImplementedError(
             "NVFP4 sparse MLA requires the active SM120 kernel path"

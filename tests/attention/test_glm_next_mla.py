@@ -470,6 +470,51 @@ def test_glm_next_nvfp4_cache_abi_is_fixed_by_plan_and_binding() -> None:
     assert binding.scratch.cache_traits == caps.cache_traits
 
 
+def test_binding_owned_cache_forwards_prevalidated_traits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = sparse_mla.plan(
+        sparse_mla.Caps(
+            device="cpu",
+            num_q_heads=1,
+            max_q_rows=1,
+            max_width=1,
+            kv_dtype=torch.uint8,
+            head_dim=_GLM_NEXT_HEAD_DIM,
+            v_head_dim=_GLM_NEXT_HEAD_DIM,
+            page_size=1,
+            model_type=ModelType.GLM_NEXT,
+            scale_format=ScaleFormat.NVFP4_E4M3,
+            latent_scale_per_token=True,
+        )
+    )
+    spec = plan.scratch_specs()[0]
+    cache = torch.empty(
+        (1, 1, _GLM_NEXT_NVFP4_RECORD_BYTES), dtype=torch.uint8
+    )
+    binding = sparse_mla.bind(
+        plan,
+        scratch=torch.empty(spec.shape, dtype=spec.dtype),
+        q=torch.empty((1, 1, _GLM_NEXT_HEAD_DIM), dtype=torch.bfloat16),
+        selected_indices=torch.zeros((1, 1), dtype=torch.int32),
+        cache_seqlens_int32=torch.ones((1,), dtype=torch.int32),
+        nsa_cache_seqlens_int32=torch.ones((1,), dtype=torch.int32),
+        kv_cache=cache,
+    )
+    calls: dict[str, object] = {}
+
+    def fake_run_sparse_mla(**kwargs: object) -> torch.Tensor:
+        calls.update(kwargs)
+        return torch.empty((1, 1, _GLM_NEXT_HEAD_DIM), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(mla_api, "_run_sparse_mla", fake_run_sparse_mla)
+
+    sparse_mla.run_decode(binding=binding, sm_scale=_GLM_NEXT_SM_SCALE)
+
+    assert calls["kv_cache"] is cache
+    assert calls["planned_cache_traits"] is binding.cache_traits
+
+
 def test_glm_next_pooled_selection_maps_compact_physical_slots_and_replays() -> None:
     device = require_sm120()
     pool_ids = torch.full((2, 512), -1, dtype=torch.int32, device=device)
