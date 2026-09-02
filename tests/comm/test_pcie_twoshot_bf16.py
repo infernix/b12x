@@ -27,14 +27,21 @@ MAX_ROWS = int(os.getenv("B12X_TEST_TWOSHOT_BF16_MAX_ROWS", "512"))
 ROWS = (8, 16, 32, 64, 96, 128, 192, 256)
 
 
-def test_layout_scales_with_rows_and_ranks() -> None:
-    base = _make_layout(64, ROW_ELEMS, 4)
-    assert base.pack_stride > 0 and base.slot_bytes > 0
-    assert base.reduced_offset >= 0 and base.slab_bytes >= base.slot_bytes
-    taller = _make_layout(128, ROW_ELEMS, 4)
-    assert taller.slab_bytes > base.slab_bytes
-    wider = _make_layout(64, 2 * ROW_ELEMS, 4)
-    assert wider.slab_bytes > base.slab_bytes
+def test_layout_covers_supported_ranks_and_scales_with_capacity() -> None:
+    layouts = {}
+    for world_size in (2, 4, 8):
+        base = _make_layout(64, ROW_ELEMS, world_size)
+        assert base.pack_stride > 0 and base.slot_bytes > 0
+        assert base.reduced_offset > 0 and base.slab_bytes >= 2 * base.slot_bytes
+        taller = _make_layout(128, ROW_ELEMS, world_size)
+        assert taller.slab_bytes > base.slab_bytes
+        wider = _make_layout(64, 2 * ROW_ELEMS, world_size)
+        assert wider.slab_bytes > base.slab_bytes
+        layouts[world_size] = base
+    assert layouts[2].pack_stride > layouts[4].pack_stride
+    assert layouts[4].pack_stride > layouts[8].pack_stride
+    assert layouts[2].slab_bytes > layouts[4].slab_bytes
+    assert layouts[4].slab_bytes > layouts[8].slab_bytes
 
 
 def _payload(seed: int, rows: int, device: torch.device) -> torch.Tensor:
@@ -120,6 +127,24 @@ def _check_graph_capture(pool: PCIeTwoShotBF16, rank: int, world: int) -> None:
         assert captured.data_ptr() == captured_address
         assert torch.equal(captured, eager), "graph replay must match the eager result"
     _assert_one_rounding(captured, exact)
+
+
+def _check_rejects_divergent_graph_slot_bias(pool: PCIeTwoShotBF16, rank: int) -> None:
+    if rank == 0:
+        pool._slot += 1
+    try:
+        with (
+            pytest.raises(
+                RuntimeError,
+                match="graph slot selection contract differs across ranks",
+            ),
+            pool.capture(),
+        ):
+            pass
+    finally:
+        if rank == 0:
+            pool._slot -= 1
+    dist.barrier()
 
 
 def _check_reduce_scatter_all_gather(
@@ -252,15 +277,25 @@ def main() -> None:
     _check_rejects_unsupported(pool, world)
     _check_rejects_invalid_outputs(pool, world)
     _check_reduce_scatter_all_gather(pool, rank, world)
+    executed_rows = []
     for step in range(3):  # exercises the double-buffered staging slots
         for rows in ROWS:
             if rows % world == 0 and rows <= MAX_ROWS:
                 _check_all_reduce(pool, rank, world, rows, step)
+                if rows not in executed_rows:
+                    executed_rows.append(rows)
     _check_all_reduce(pool, rank, world, MAX_ROWS, step=3)
+    if MAX_ROWS not in executed_rows:
+        executed_rows.append(MAX_ROWS)
+    _check_rejects_divergent_graph_slot_bias(pool, rank)
     _check_graph_capture(pool, rank, world)
     dist.barrier()
     if rank == 0:
-        print(f"pcie_twoshot_bf16 correctness OK ({world} ranks, rows {ROWS})")
+        print(
+            "pcie_twoshot_bf16 correctness OK "
+            f"({world} ranks, all_reduce_rows={tuple(executed_rows)}, "
+            f"workspace_max_rows={MAX_ROWS})"
+        )
     pool.close()
     dist.destroy_process_group()
 

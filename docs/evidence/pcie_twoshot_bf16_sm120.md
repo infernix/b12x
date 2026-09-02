@@ -23,9 +23,34 @@ python -m torch.distributed.run --nproc-per-node=4 \
 The test executes all three public collectives at multiple tensor heights. It
 checks the reduction against an exact FP32 sum, requires at most one BF16
 rounding, verifies deterministic eager execution, rejects overlapping storage,
-and captures and replays all-reduce in a CUDA graph. The graph owns its output
-allocation after capture; replay must retain the output address and must not
-increase PyTorch CUDA allocator usage.
+rejects rank-divergent graph-slot selection, and captures and replays all-reduce
+in a CUDA graph. The graph owns its output allocation after capture; replay
+must retain the output address and must not increase PyTorch CUDA allocator
+usage.
+
+The test allocates a fixed IPC workspace for `max_rows=512`,
+`row_elems=4096`, and world size 4. Its layout contains 266,240 signal bytes,
+a 4,194,304-byte staged payload in each slot, a 1,048,576-byte reduced shard in
+each slot, two 5,242,880-byte slots, and 10,752,000 bytes in the complete slab.
+The 786,432-byte serving dispatch limit described below is a message-size
+routing boundary; it is not the workspace capacity. The exact successful test
+report is:
+
+```text
+pcie_twoshot_bf16 correctness OK (4 ranks, all_reduce_rows=(8, 16, 32, 64, 96, 128, 192, 256, 512), workspace_max_rows=512)
+```
+
+The compiled kernel artifacts use Python 3.12.3, PyTorch 2.13.0 with CUDA
+13.3, CUTLASS DSL 4.6.2, cuda-bindings 13.3.1, and PTXAS 13.3.73. Every
+reduce-scatter, all-gather, and pull all-reduce artifact for ranks 0–3 uses
+`opt-level=3`, relocatable device code disabled, assertions disabled, line
+information disabled, 512 threads, and a 4,096-element row. The compile
+manifests bind the rank and physical GPU UUID and contain separate exact
+objects for eager slot selection and graph slot biases 0 and 1. Both serving
+arms resolve the same source package fingerprint and toolchain mapping; only
+the dispatch limit determines whether the pull all-reduce object executes. The
+rank, GPU, slot mode, manifest, and object mapping is recorded in the
+[SM120 artifact map](pcie_twoshot_bf16_sm120_artifacts.md).
 
 ## GLM-5.3-Flash serving measurement
 
@@ -93,12 +118,15 @@ The benchmark client was `llm_decode_bench.py` version 0.4.29 with SHA-256
 Each sample used this command, with a distinct output path:
 
 ```bash
+ARM=enabled  # use disabled for the NCCL control
+N=1          # use 1, 2, and 3 for the three recorded samples
+mkdir -p "$ARM"
 python /root/llm_decode_bench.py \
   --host 127.0.0.1 --port 5051 --model GLM-5.3-Flash \
   --contexts 0 --concurrency 1,8,12,24 \
   --duration 30 --decode-warmup-seconds 15 \
   --max-tokens 8192 --temperature 0 --skip-prefill \
-  --display-mode plain --no-resume --output ARM/decode-run-N.json
+  --display-mode plain --no-resume --output "$ARM/decode-run-$N.json"
 ```
 
 The NCCL arm set `VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE=0`. The PCIe two-shot

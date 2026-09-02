@@ -385,7 +385,25 @@ class PCIeTwoShotBF16:
             raise RuntimeError(
                 "overlapping PCIe twoshot-bf16 capture contexts are not allowed"
             )
-        self.prepare_graph(operations=operations, threads=threads)
+        requested = tuple(dict.fromkeys(str(operation) for operation in operations))
+        threads = int(threads)
+        self.prepare_graph(operations=requested, threads=threads)
+        pending_slot_bias = (
+            self._device_slot_bias if self._device_slot_selection else self._slot & 1
+        )
+        _require_collective_contract(
+            owner="PCIe twoshot-bf16 graph slot selection",
+            exchange_group=self.exchange_group,
+            contract=(
+                requested,
+                threads,
+                self._device_slot_selection,
+                pending_slot_bias,
+            ),
+        )
+        if not self._device_slot_selection:
+            self._device_slot_bias = pending_slot_bias
+            self._device_slot_selection = True
         self._capture_context_depth = 1
         try:
             yield self
@@ -393,6 +411,72 @@ class PCIeTwoShotBF16:
             self._capture_context_depth = 0
 
     # ---- launch -----------------------------------------------------------
+
+    def _resolve_launch_parameters(
+        self,
+        operation: str,
+        *,
+        rows_per_rank: int,
+        threads: int,
+        block_limit: int,
+    ) -> tuple[int, int, int]:
+        threads = int(threads)
+        if threads <= 0 or threads > 512 or threads % 32 != 0:
+            raise ValueError("threads must be a warp-aligned value in [32, 512]")
+        shard_packs = rows_per_rank * (self.row_elems // _PACK_ELEMS)
+        if shard_packs > self._pack_stride:
+            raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
+        if block_limit <= 0 or block_limit > _MAX_BLOCKS:
+            raise ValueError(f"block_limit must be in [1, {_MAX_BLOCKS}]")
+        blocks = max(
+            1,
+            min(int(block_limit), (shard_packs + threads - 1) // threads),
+        )
+        capturing = _is_current_stream_capturing(self.device)
+        device_index = self._device_index()
+        if capturing:
+            if self._capture_context_depth <= 0:
+                raise RuntimeError(
+                    "cold PCIe twoshot-bf16 CUDA graph capture is not allowed; "
+                    "enter runtime.capture() before torch.cuda.graph()"
+                )
+            if not self._device_slot_selection:
+                raise RuntimeError(
+                    "PCIe twoshot-bf16 graph capture has no rank-synchronized "
+                    "slot selection; enter runtime.capture() on every rank"
+                )
+            if operation == "all_reduce":
+                prepared = is_twoshot_bf16_allreduce_launcher_prepared(
+                    self.world_size,
+                    self.rank,
+                    True,
+                    self._device_slot_bias,
+                    threads,
+                    self.row_elems,
+                    device_index,
+                )
+            else:
+                prepared = is_twoshot_bf16_launcher_prepared(
+                    operation,
+                    self.world_size,
+                    self.rank,
+                    True,
+                    self._device_slot_bias,
+                    threads,
+                    self.row_elems,
+                    device_index,
+                )
+            if not prepared:
+                raise RuntimeError(
+                    "cold PCIe twoshot-bf16 CUDA graph capture is not allowed; "
+                    "enter runtime.capture() before torch.cuda.graph()"
+                )
+        if self._device_slot_selection:
+            slot = 0
+        else:
+            slot = self._slot % 2
+            self._slot += 1
+        return blocks, slot, device_index
 
     def _launch(
         self,
@@ -404,50 +488,12 @@ class PCIeTwoShotBF16:
         threads: int,
         block_limit: int,
     ) -> None:
-        threads = int(threads)
-        if threads <= 0 or threads > 512 or threads % 32 != 0:
-            raise ValueError("threads must be a warp-aligned value in [32, 512]")
-        shard_packs = rows_per_rank * (self.row_elems // _PACK_ELEMS)
-        if shard_packs > self._pack_stride:
-            raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
-        if block_limit <= 0 or block_limit > _MAX_BLOCKS:
-            raise ValueError(f"block_limit must be in [1, {_MAX_BLOCKS}]")
-        blocks = max(1, min(int(block_limit), (shard_packs + threads - 1) // threads))
-        capturing = _is_current_stream_capturing(self.device)
-        device_index = self._device_index()
-        if capturing:
-            if self._capture_context_depth <= 0:
-                raise RuntimeError(
-                    "cold PCIe twoshot-bf16 CUDA graph capture is not allowed; "
-                    "enter runtime.capture() before torch.cuda.graph()"
-                )
-            graph_slot_bias = (
-                self._device_slot_bias
-                if self._device_slot_selection
-                else self._slot & 1
-            )
-            if not is_twoshot_bf16_launcher_prepared(
-                operation,
-                self.world_size,
-                self.rank,
-                True,
-                graph_slot_bias,
-                threads,
-                self.row_elems,
-                device_index,
-            ):
-                raise RuntimeError(
-                    "cold PCIe twoshot-bf16 CUDA graph capture is not allowed; "
-                    "enter runtime.capture() before torch.cuda.graph()"
-                )
-        if capturing and not self._device_slot_selection:
-            self._device_slot_bias = self._slot & 1
-            self._device_slot_selection = True
-        if self._device_slot_selection:
-            slot = 0
-        else:
-            slot = self._slot % 2
-            self._slot += 1
+        blocks, slot, device_index = self._resolve_launch_parameters(
+            operation,
+            rows_per_rank=rows_per_rank,
+            threads=threads,
+            block_limit=block_limit,
+        )
         with torch.cuda.device(self.device):
             launcher = get_twoshot_bf16_launcher(
                 operation,
@@ -564,49 +610,12 @@ class PCIeTwoShotBF16:
         threads: int,
         block_limit: int,
     ) -> None:
-        threads = int(threads)
-        if threads <= 0 or threads > 512 or threads % 32 != 0:
-            raise ValueError("threads must be a warp-aligned value in [32, 512]")
-        shard_packs = rows_per_rank * (self.row_elems // _PACK_ELEMS)
-        if shard_packs > self._pack_stride:
-            raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
-        if block_limit <= 0 or block_limit > _MAX_BLOCKS:
-            raise ValueError(f"block_limit must be in [1, {_MAX_BLOCKS}]")
-        blocks = max(1, min(int(block_limit), (shard_packs + threads - 1) // threads))
-        capturing = _is_current_stream_capturing(self.device)
-        device_index = self._device_index()
-        if capturing:
-            if self._capture_context_depth <= 0:
-                raise RuntimeError(
-                    "cold PCIe twoshot-bf16 CUDA graph capture is not allowed; "
-                    "enter runtime.capture() before torch.cuda.graph()"
-                )
-            graph_slot_bias = (
-                self._device_slot_bias
-                if self._device_slot_selection
-                else self._slot & 1
-            )
-            if not is_twoshot_bf16_allreduce_launcher_prepared(
-                self.world_size,
-                self.rank,
-                True,
-                graph_slot_bias,
-                threads,
-                self.row_elems,
-                device_index,
-            ):
-                raise RuntimeError(
-                    "cold PCIe twoshot-bf16 CUDA graph capture is not allowed; "
-                    "enter runtime.capture() before torch.cuda.graph()"
-                )
-        if capturing and not self._device_slot_selection:
-            self._device_slot_bias = self._slot & 1
-            self._device_slot_selection = True
-        if self._device_slot_selection:
-            slot = 0
-        else:
-            slot = self._slot % 2
-            self._slot += 1
+        blocks, slot, device_index = self._resolve_launch_parameters(
+            "all_reduce",
+            rows_per_rank=rows_per_rank,
+            threads=threads,
+            block_limit=block_limit,
+        )
         with torch.cuda.device(self.device):
             launcher = get_twoshot_bf16_allreduce_launcher(
                 self.world_size,
