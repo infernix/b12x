@@ -9,6 +9,9 @@ from benchmarks.benchmark_qsa import PROFILES as QSA_PROFILES
 from b12x.policy import (
     EMBEDDED_REGISTRY,
     DeviceIdentity,
+    PolicyContext,
+    PolicyMode,
+    PolicySource,
     list_profiled_components,
     profile_from_dict,
 )
@@ -66,7 +69,11 @@ class _FixedGdnSession(AbstractContextManager["_FixedGdnSession"]):
         return None
 
     def candidates(self, _case):
-        return (SweepCandidate.create({"backend": "triton"}),)
+        return (
+            SweepCandidate.create(
+                {"backend": "triton", "recurrent_block_v": 32}
+            ),
+        )
 
     def measure(self, _case, candidates):
         return (
@@ -253,6 +260,59 @@ def test_gdn_backend_identifies_decay_contract_from_head_geometry() -> None:
 
     assert GDN_POLICY.heuristic(qwen, None).backend == "cutedsl"
     assert GDN_POLICY.heuristic(glm, None).backend == "triton"
+    assert GDN_POLICY.heuristic(qwen, None).recurrent_block_v == 32
+    assert GDN_POLICY.heuristic(glm, None).recurrent_block_v == 32
+
+
+def test_rtx_pro_6000_profile_covers_glm_5_3_kda_serving_capacities() -> None:
+    """Require planned tiles for four-way tensor-parallel serving graphs."""
+
+    device = DeviceIdentity(
+        vendor="NVIDIA",
+        compute_capability=(12, 0),
+        sm_count=188,
+        product_name="NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    )
+    profile = EMBEDDED_REGISTRY.get("nvidia.rtx.pro.6000.blackwell")
+    component = profile.component("attention.gdn")
+    assert component is not None
+
+    serving_capacities = (
+        (16, 16, 1),  # One target token without speculative decoding.
+        (16, 64, 4),  # Target plus three multi-token-prediction draft tokens.
+        (16, 128, 8),  # One target token plus seven DFlash2 draft tokens.
+    )
+    for max_seqs, max_tokens, state_index_columns in serving_capacities:
+        query = GdnQuery(
+            gate_activation="sigmoid",
+            qk_l2norm=True,
+            state_dtype="float32",
+            key_heads=16,
+            value_heads=16,
+            max_seqs=max_seqs,
+            max_tokens=max_tokens,
+            state_index_columns=state_index_columns,
+        )
+        leaf = component.lookup(query.profile_fields())
+        resolution = PolicyContext.for_identity(
+            device,
+            mode=PolicyMode.PREPLANNED_ONLY,
+        ).resolve(GDN_POLICY, query)
+
+        assert leaf is not None
+        assert leaf.config["backend"] == "triton"
+        assert leaf.config["recurrent_block_v"] == 16
+        assert resolution.source is PolicySource.PREPLANNED
+        assert resolution.config.backend == "triton"
+        assert resolution.config.recurrent_block_v == 16
+
+    other_device = DeviceIdentity(
+        vendor="NVIDIA",
+        compute_capability=(12, 0),
+        sm_count=188,
+        product_name="Synthetic RTX",
+    )
+    assert GDN_POLICY.heuristic(query, other_device).recurrent_block_v == 32
 
 
 def test_generated_gdn_profile_covers_dense_and_sparse_capacity_ranges(
@@ -317,6 +377,7 @@ def test_generated_gdn_profile_covers_dense_and_sparse_capacity_ranges(
         )
         assert leaf is not None
         assert leaf.config["backend"] == "triton"
+        assert leaf.config["recurrent_block_v"] == 32
 
     assert (
         component.lookup(
@@ -343,6 +404,21 @@ def test_gdn_benchmark_factory_accepts_grouped_capacity_cases() -> None:
 
     assert len(cases) > 1
     assert session.candidates(cases[0])[0].config["backend"] == "cutedsl"
+    assert session.candidates(cases[0])[0].config["recurrent_block_v"] == 32
+
+
+def test_gdn_benchmark_factory_races_kda_recurrent_value_tiles() -> None:
+    case = next(
+        case
+        for case in gdn_cases()
+        if case.metadata["decay_recipe"] == "kda"
+    )
+    session = GdnBenchmarkFactory()(case.group_id, (case,), object())
+
+    assert tuple(candidate.config.to_dict() for candidate in session.candidates(case)) == (
+        {"backend": "triton", "recurrent_block_v": 16},
+        {"backend": "triton", "recurrent_block_v": 32},
+    )
 
 
 def test_attention_corpus_manifests_are_content_addressed() -> None:
