@@ -505,18 +505,6 @@ class PCIeTwoShotBF16:
                 self.row_elems,
                 device_index,
             )
-            if not self._device_slot_selection:
-                for slot_bias in (0, 1):
-                    get_twoshot_bf16_launcher(
-                        operation,
-                        self.world_size,
-                        self.rank,
-                        True,
-                        slot_bias,
-                        threads,
-                        self.row_elems,
-                        device_index,
-                    )
             launcher(
                 payload.data_ptr(),
                 self._staging_ptrs[slot],
@@ -626,17 +614,6 @@ class PCIeTwoShotBF16:
                 self.row_elems,
                 device_index,
             )
-            if not self._device_slot_selection:
-                for slot_bias in (0, 1):
-                    get_twoshot_bf16_allreduce_launcher(
-                        self.world_size,
-                        self.rank,
-                        True,
-                        slot_bias,
-                        threads,
-                        self.row_elems,
-                        device_index,
-                    )
             launcher(
                 payload.data_ptr(),
                 self._staging_ptrs[slot],
