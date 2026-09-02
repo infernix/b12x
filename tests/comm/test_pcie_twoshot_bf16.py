@@ -2,7 +2,7 @@
 
 Run with torchrun on 2, 4 or 8 GPUs:
 
-    python -m torch.distributed.run --nproc-per-node=4 \
+    NCCL_ALGO=Ring python -m torch.distributed.run --nproc-per-node=4 \
         tests/comm/test_pcie_twoshot_bf16.py
 
 Every all-reduce is checked against the exact fp32 sum of the gathered
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -118,12 +119,59 @@ def _check_rejects_unsupported(pool: PCIeTwoShotBF16, world: int) -> None:
         assert not pool.accepts(
             torch.empty(world + 1, ROW_ELEMS, dtype=torch.bfloat16, device=device)
         )
+    storage = torch.empty(
+        world * ROW_ELEMS + 1,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    misaligned = storage[1:].view(world, ROW_ELEMS)
+    assert misaligned.is_contiguous()
+    assert misaligned.data_ptr() % 16 != 0
+    assert not pool.accepts(misaligned)
+
+
+def _check_rejects_invalid_outputs(pool: PCIeTwoShotBF16, world: int) -> None:
+    x = _payload(6100 + pool.rank, world, pool.device)
+    wrong_shape = torch.empty(
+        x.numel(),
+        dtype=torch.bfloat16,
+        device=pool.device,
+    )
+    with pytest.raises(ValueError, match="output shape"):
+        pool.all_reduce(x, out=wrong_shape)
+
+    storage = torch.empty(
+        x.numel() + 1,
+        dtype=torch.bfloat16,
+        device=pool.device,
+    )
+    misaligned = storage[1:].view_as(x)
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        pool.all_reduce(x, out=misaligned)
+
+    local_rows = x.shape[0] // world
+    with pytest.raises(TypeError, match="output must be bfloat16"):
+        pool.reduce_scatter(
+            x,
+            out=torch.empty(
+                local_rows,
+                ROW_ELEMS,
+                dtype=torch.float16,
+                device=pool.device,
+            ),
+        )
+
+    shard = _payload(6200 + pool.rank, local_rows, pool.device)
+    with pytest.raises(ValueError, match="output shape"):
+        pool.all_gather(shard, out=x[:local_rows])
 
 
 def main() -> None:
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
+    # The error comparison below is specifically against NCCL's BF16 ring.
+    os.environ["NCCL_ALGO"] = "Ring"
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl")
     device = torch.device("cuda", local_rank)
@@ -136,10 +184,12 @@ def main() -> None:
     )
     pool.prepare_graph()
     _check_rejects_unsupported(pool, world)
+    _check_rejects_invalid_outputs(pool, world)
     for step in range(3):  # exercises the double-buffered staging slots
         for rows in ROWS:
             if rows % world == 0 and rows <= MAX_ROWS:
                 _check_all_reduce(pool, rank, world, rows, step)
+    _check_all_reduce(pool, rank, world, MAX_ROWS, step=3)
     _check_graph_capture(pool, rank, world)
     dist.barrier()
     if rank == 0:

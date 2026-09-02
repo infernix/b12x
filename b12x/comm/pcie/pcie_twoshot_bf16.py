@@ -142,11 +142,6 @@ class PCIeTwoShotBF16:
         self._ipc_exports_freed = False
         self._coordinated_close_complete = False
         self._closed_ipc_import_indices: set[tuple[int, int]] = set()
-        # Persistent reduce-scatter shard for all_reduce (stable address for
-        # CUDA graphs; sized for the largest supported message).
-        self._shard = torch.empty(
-            max_rows // world_size, row_elems, dtype=torch.bfloat16, device=self.device
-        )
         return self
 
     @classmethod
@@ -262,21 +257,34 @@ class PCIeTwoShotBF16:
 
     # ---- checks ---------------------------------------------------------
 
+    def _check_tensor(
+        self,
+        tensor: torch.Tensor,
+        *,
+        shape: tuple[int, ...],
+        name: str,
+    ) -> None:
+        if tensor.shape != shape:
+            raise ValueError(f"{name} shape {tuple(tensor.shape)} != {shape}")
+        if tensor.device != self.device:
+            raise ValueError(f"{name} must be on the runtime CUDA device")
+        if tensor.dtype != torch.bfloat16:
+            raise TypeError(f"{name} must be bfloat16")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+        if tensor.data_ptr() % 16 != 0:
+            raise ValueError(f"{name} must be 16-byte aligned")
+
     def _check(self, payload: torch.Tensor, rows: int) -> None:
         if self._closed:
             raise RuntimeError("PCIeTwoShotBF16 is closed")
-        if payload.shape != (rows, self.row_elems):
-            raise ValueError(
-                f"payload shape {tuple(payload.shape)} != ({rows}, {self.row_elems})"
-            )
         if rows > self.max_rows:
             raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
-        if payload.device != self.device:
-            raise ValueError("payload must be on the runtime CUDA device")
-        if payload.dtype != torch.bfloat16:
-            raise TypeError("payload must be bfloat16")
-        if not payload.is_contiguous():
-            raise ValueError("payload must be contiguous")
+        self._check_tensor(
+            payload,
+            shape=(rows, self.row_elems),
+            name="payload",
+        )
 
     def _device_index(self) -> int:
         return (
@@ -287,7 +295,12 @@ class PCIeTwoShotBF16:
 
     def accepts(self, inp: torch.Tensor) -> bool:
         """True when ``all_reduce`` can serve this tensor."""
-        if self._closed or inp.dtype != torch.bfloat16 or not inp.is_contiguous():
+        if (
+            self._closed
+            or inp.dtype != torch.bfloat16
+            or not inp.is_contiguous()
+            or inp.data_ptr() % 16 != 0
+        ):
             return False
         if inp.device != self.device:
             return False
@@ -470,6 +483,11 @@ class PCIeTwoShotBF16:
                     dtype=torch.bfloat16,
                     device=self.device,
                 )
+            self._check_tensor(
+                out,
+                shape=(rows // self.world_size, self.row_elems),
+                name="output",
+            )
             self._launch(
                 "reduce_scatter",
                 payload,
@@ -498,6 +516,11 @@ class PCIeTwoShotBF16:
                     dtype=torch.bfloat16,
                     device=self.device,
                 )
+            self._check_tensor(
+                out,
+                shape=(rows * self.world_size, self.row_elems),
+                name="output",
+            )
             self._launch(
                 "all_gather",
                 payload,
@@ -609,6 +632,11 @@ class PCIeTwoShotBF16:
         with _device_guard(self.device):
             if out is None:
                 out = torch.empty_like(inp)
+            self._check_tensor(
+                out,
+                shape=tuple(inp.shape),
+                name="output",
+            )
             out_view = out.view(rows, self.row_elems)
             self._launch_pull_all_reduce(
                 payload,
