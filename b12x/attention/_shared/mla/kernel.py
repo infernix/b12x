@@ -59,9 +59,10 @@ from .smem import get_unified_shared_storage_cls, make_smem_layout
 from .traits import (
     ModelType,
     ScaleFormat,
-    infer_model_type,
+    UnifiedMLATraits,
     is_glm_model_type,
     make_unified_traits,
+    resolve_unplanned_traits,
 )
 
 # natural-log of 2 (base2 <-> natural LSE conversion).
@@ -78,7 +79,6 @@ _DSV4_HEAD_DIM = 512
 _GLM_HEAD_DIM = 576
 # GLM per-token packed cache record (reference.pack_mla_kv_cache_reference).
 _GLM_KV_GMEM_STRIDE = 656
-_GLM_NEXT_KV_GMEM_STRIDE = 528
 # DSV4 H8 packs the contiguous 576-byte data record into a 592-byte smem row.
 # The 16-byte pad preserves KV_SMEM_STRIDE/4 % 32 == 20, matching the generic
 # 464-byte row's bank rotation while allowing one bulk copy per candidate.
@@ -2746,6 +2746,7 @@ def run_unified_decode(
     model_type_override: int | None = None,
     fp8_rope_override: bool | None = None,
     latent_scale_per_token: bool = False,
+    traits_override: UnifiedMLATraits | None = None,
 ):
     """Active SM120 sparse-MLA decode: kernel (split-K partials) + merge.
 
@@ -2852,55 +2853,20 @@ def run_unified_decode(
     rem_heads = heads % hpb
     h_blocks = h_blocks_full + (1 if rem_heads else 0)
 
-    model_type, compute_mode, scale_format = infer_model_type(
-        q_head_dim,
-        swa_k_cache.dtype,
-        model_type=model_type_override,
-    )
-    if scale_format_override is not None:
-        scale_format = int(scale_format_override)
-    if scale_format == ScaleFormat.NVFP4_E4M3 and fp8_rope_override is None:
-        record_bytes = int(swa_k_cache.shape[-1])
-        if record_bytes not in (368, 432):
-            raise ValueError(
-                f"NVFP4 cache record must be 368 or 432 bytes, got {record_bytes}"
-            )
-        fp8_rope_override = record_bytes == 368
-    # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
-    # the NVFP4 fp8-rope 368-byte record ONLY.
-    if latent_scale_per_token:
-        if scale_format != ScaleFormat.NVFP4_E4M3:
-            raise ValueError(
-                "SM120 sparse MLA decode latent_scale_per_token requires "
-                f"ScaleFormat.NVFP4_E4M3; got scale_format={int(scale_format)}"
-            )
-        if not bool(fp8_rope_override):
-            raise ValueError(
-                "SM120 sparse MLA decode latent_scale_per_token requires the "
-                "fp8-rope 368-byte NVFP4 record; got the 432-byte record"
-            )
-    traits = make_unified_traits(
-        model_type,
-        compute_mode,
-        scale_format,
-        fp8_rope=fp8_rope_override,
-        latent_scale_per_token=bool(latent_scale_per_token),
-    )
-    if int(model_type) == int(ModelType.GLM_NEXT) and int(
-        swa_k_cache.shape[-1]
-    ) != _GLM_NEXT_KV_GMEM_STRIDE:
-        raise ValueError(
-            "GLM_NEXT sparse MLA cache record must be 528 bytes, got "
-            f"{int(swa_k_cache.shape[-1])}"
+    if traits_override is None:
+        traits = resolve_unplanned_traits(
+            q_head_dim,
+            swa_k_cache.dtype,
+            int(swa_k_cache.shape[-1]),
+            model_type=model_type_override,
+            scale_format=scale_format_override,
+            fp8_rope=fp8_rope_override,
+            latent_scale_per_token=bool(latent_scale_per_token),
         )
-    if scale_format == ScaleFormat.NVFP4_E4M3 and int(swa_k_cache.shape[-1]) != int(
-        traits.kv_gmem_stride
-    ):
-        raise ValueError(
-            "NVFP4 cache record width disagrees with fp8_rope_override: "
-            f"got {int(swa_k_cache.shape[-1])} bytes, expected "
-            f"{int(traits.kv_gmem_stride)}"
-        )
+        model_type = int(traits.model_type)
+    else:
+        traits = traits_override
+        model_type = int(traits.model_type)
     d_v = int(traits.d_v)  # output O dim (512 for both; V == nope for GLM)
 
     topk = int(swa_indices.shape[1])
@@ -3188,7 +3154,7 @@ def run_unified_decode(
             int(head_block_offset),
             bool(has_extra),
             bool(per_token_len),
-            bool(latent_scale_per_token),
+            bool(traits.latent_scale_per_token),
         )
 
     if h_blocks_full > 0:
