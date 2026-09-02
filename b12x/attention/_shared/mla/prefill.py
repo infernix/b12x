@@ -99,6 +99,20 @@ def _mg_head_partitions(heads: int, hpb: int = 16) -> tuple[tuple[int, int, int]
     return tuple(parts)
 
 
+_TOPK_CONTAINERS = (512, 1024, 2048)
+_TOPK_EXACT = frozenset({128, 512, 1024, 2048, 2051, 2112})
+
+
+def _topk_container(topk: int) -> int:
+    """Smallest MG index container holding ``topk`` valid entries per row."""
+    if topk in _TOPK_EXACT:
+        return topk
+    for container in _TOPK_CONTAINERS:
+        if topk < container:
+            return container
+    return topk
+
+
 def run_unified_prefill(
     *,
     q: torch.Tensor,
@@ -195,10 +209,7 @@ def run_unified_prefill(
         scale_format = inferred_scale_format
     else:
         scale_format = int(scale_format)
-        if (
-            model_type == ModelType.GLM_NSA
-            and scale_format == ScaleFormat.NVFP4_E4M3
-        ):
+        if model_type == ModelType.GLM_NSA and scale_format == ScaleFormat.NVFP4_E4M3:
             # NVFP4 GLM-family prefill runs the BF16-QK MG arm (native E2M1
             # dequant + BF16 MMA); FP8 compute would misread the 432B record.
             compute_mode = ComputeMode.BF16
@@ -262,6 +273,17 @@ def run_unified_prefill(
         topk_length = torch.full((num_tokens,), topk, dtype=torch.int32, device=device)
     else:
         topk_length = topk_length.to(device=device, dtype=torch.int32).contiguous()
+
+    container = _topk_container(topk)
+    if container != topk:
+        # A short sequence clamps the runtime top-k below the model's
+        # index_topk (e.g. 192 for a 192-token prefill). The MG kernels take
+        # fixed containers; widen the index rows with the invalid sentinel and
+        # keep the per-token valid length, exactly like GLM_NEXT's 2112/2051.
+        topk_indices = torch.nn.functional.pad(
+            topk_indices, (0, container - topk), value=-1
+        )
+        topk = container
 
     if stride_kv_block is None:
         stride_kv_block = _cache_block_stride_bytes(
