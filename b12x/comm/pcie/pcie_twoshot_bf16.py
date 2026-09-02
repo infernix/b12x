@@ -74,8 +74,8 @@ def _make_layout(max_rows: int, row_elems: int, world_size: int) -> _TwoShotBf16
     packs_per_row = row_elems // _PACK_ELEMS
     pack_stride = _align_up(max_rows_per_rank * packs_per_row, 16)
     payload_bytes = world_size * pack_stride * 16
-    # The pull all-reduce keeps one reduced quarter per slot after the
-    # full staged payload.
+    # The pull all-reduce keeps one reduced shard (pack_stride packs) per slot
+    # after the full staged payload.
     reduced_offset = _align_up(payload_bytes, IPC_SLAB_ALIGNMENT)
     slot_bytes = _align_up(reduced_offset + pack_stride * 16, IPC_SLAB_ALIGNMENT)
     signal_bytes = _align_up(_SIGNAL_BYTES, IPC_SLAB_ALIGNMENT)
@@ -86,6 +86,27 @@ def _make_layout(max_rows: int, row_elems: int, world_size: int) -> _TwoShotBf16
         slot_bytes=slot_bytes,
         slab_bytes=signal_bytes + 2 * slot_bytes,
     )
+
+
+def _contiguous_storage_interval(tensor: torch.Tensor) -> tuple[int, int]:
+    """Return the occupied byte interval of a validated contiguous tensor."""
+    start = int(tensor.data_ptr())
+    return start, start + int(tensor.numel()) * int(tensor.element_size())
+
+
+def _require_disjoint(
+    output: torch.Tensor,
+    source: torch.Tensor,
+    *,
+    source_name: str,
+) -> None:
+    """Reject aliases that violate the non-coherent pull-kernel contract."""
+    if output.device != source.device:
+        return
+    output_start, output_end = _contiguous_storage_interval(output)
+    source_start, source_end = _contiguous_storage_interval(source)
+    if max(output_start, source_start) < min(output_end, source_end):
+        raise ValueError(f"output must not overlap {source_name}")
 
 
 class PCIeTwoShotBF16:
@@ -488,6 +509,7 @@ class PCIeTwoShotBF16:
                 shape=(rows // self.world_size, self.row_elems),
                 name="output",
             )
+            _require_disjoint(out, payload, source_name="payload")
             self._launch(
                 "reduce_scatter",
                 payload,
@@ -521,6 +543,7 @@ class PCIeTwoShotBF16:
                 shape=(rows * self.world_size, self.row_elems),
                 name="output",
             )
+            _require_disjoint(out, payload, source_name="payload")
             self._launch(
                 "all_gather",
                 payload,
@@ -543,12 +566,12 @@ class PCIeTwoShotBF16:
         threads = int(threads)
         if threads <= 0 or threads > 512 or threads % 32 != 0:
             raise ValueError("threads must be a warp-aligned value in [32, 512]")
-        quarter_packs = rows_per_rank * (self.row_elems // _PACK_ELEMS)
-        if quarter_packs > self._pack_stride:
+        shard_packs = rows_per_rank * (self.row_elems // _PACK_ELEMS)
+        if shard_packs > self._pack_stride:
             raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
         if block_limit <= 0 or block_limit > _MAX_BLOCKS:
             raise ValueError(f"block_limit must be in [1, {_MAX_BLOCKS}]")
-        blocks = max(1, min(int(block_limit), (quarter_packs + threads - 1) // threads))
+        blocks = max(1, min(int(block_limit), (shard_packs + threads - 1) // threads))
         capturing = _is_current_stream_capturing(self.device)
         device_index = self._device_index()
         if capturing:
@@ -637,6 +660,7 @@ class PCIeTwoShotBF16:
                 shape=tuple(inp.shape),
                 name="output",
             )
+            _require_disjoint(out, inp, source_name="input")
             out_view = out.view(rows, self.row_elems)
             self._launch_pull_all_reduce(
                 payload,

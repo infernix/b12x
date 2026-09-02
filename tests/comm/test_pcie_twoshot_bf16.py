@@ -96,12 +96,47 @@ def _check_graph_capture(pool: PCIeTwoShotBF16, rank: int, world: int) -> None:
             captured = pool.all_reduce(static)
     torch.cuda.synchronize()
     dist.barrier()
+    captured_address = captured.data_ptr()
+    allocated_after_capture = torch.cuda.memory_allocated(pool.device)
     for _ in range(3):
         graph.replay()
         torch.cuda.synchronize()
         dist.barrier()
+        assert captured.data_ptr() == captured_address
+        assert torch.cuda.memory_allocated(pool.device) == allocated_after_capture
         assert torch.equal(captured, eager), "graph replay must match the eager result"
     _assert_one_rounding(captured, exact)
+
+
+def _check_reduce_scatter_all_gather(
+    pool: PCIeTwoShotBF16, rank: int, world: int
+) -> None:
+    rows = min(64, MAX_ROWS)
+    rows -= rows % world
+    assert rows > 0
+    local_rows = rows // world
+    payload = _payload(5300 + rank, rows, pool.device)
+    exact = _exact_sum(payload, world)
+
+    shard = torch.empty(
+        local_rows,
+        ROW_ELEMS,
+        dtype=torch.bfloat16,
+        device=pool.device,
+    )
+    returned_shard = pool.reduce_scatter(payload, out=shard)
+    torch.cuda.synchronize()
+    assert returned_shard is shard
+    expected_shard = exact[rank * local_rows : (rank + 1) * local_rows]
+    _assert_one_rounding(shard, expected_shard)
+
+    gathered = torch.empty_like(payload)
+    returned_gather = pool.all_gather(shard, out=gathered)
+    torch.cuda.synchronize()
+    assert returned_gather is gathered
+    reference_shards = [torch.empty_like(shard) for _ in range(world)]
+    dist.all_gather(reference_shards, shard)
+    assert torch.equal(gathered, torch.cat(reference_shards, dim=0))
 
 
 def _check_rejects_unsupported(pool: PCIeTwoShotBF16, world: int) -> None:
@@ -165,6 +200,24 @@ def _check_rejects_invalid_outputs(pool: PCIeTwoShotBF16, world: int) -> None:
     with pytest.raises(ValueError, match="output shape"):
         pool.all_gather(shard, out=x[:local_rows])
 
+    overlap_storage = torch.empty(
+        x.numel() + 8,
+        dtype=torch.bfloat16,
+        device=pool.device,
+    )
+    overlap_input = overlap_storage[: x.numel()].view_as(x)
+    overlap_output = overlap_storage[8:].view_as(x)
+    with pytest.raises(ValueError, match="output must not overlap input"):
+        pool.all_reduce(overlap_input, out=overlap_output)
+
+    with pytest.raises(ValueError, match="output must not overlap payload"):
+        pool.reduce_scatter(x, out=x[:local_rows])
+
+    gather_storage = torch.empty_like(x)
+    gather_payload = gather_storage[:local_rows]
+    with pytest.raises(ValueError, match="output must not overlap payload"):
+        pool.all_gather(gather_payload, out=gather_storage)
+
 
 def main() -> None:
     rank = int(os.environ["RANK"])
@@ -185,6 +238,7 @@ def main() -> None:
     pool.prepare_graph()
     _check_rejects_unsupported(pool, world)
     _check_rejects_invalid_outputs(pool, world)
+    _check_reduce_scatter_all_gather(pool, rank, world)
     for step in range(3):  # exercises the double-buffered staging slots
         for rows in ROWS:
             if rows % world == 0 and rows <= MAX_ROWS:

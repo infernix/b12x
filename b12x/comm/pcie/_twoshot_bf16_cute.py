@@ -3,7 +3,7 @@
 Structure mirrors :mod:`_twoshot_cute` (the fp8-transport variant): phase one
 pushes this rank's shard into every peer's IPC staging slot (posted PCIe
 writes), a per-CTA flag barrier follows, and phase two either reduces the
-local quarter (reduce_scatter) or copies the staged shards into place
+local rank's shard (reduce_scatter) or copies the staged shards into place
 (all_gather).  Payload packs are 16 bytes = 8 bf16 values; the reduction
 accumulates in fp32 in a fixed rank order (local rank first, then
 ``(local + i) % world`` for ``i = 1..world-1``) and rounds once to bf16, so a
@@ -641,12 +641,14 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
     """Single-launch lossless bf16 all-reduce built on remote READS only.
 
     Phase A stages this rank's full payload into its own IPC slab (local
-    copy).  After barrier #1 every rank pulls its quarter of every peer's
+    copy).  After barrier #1 every rank pulls its shard (P/world for a
+    per-rank payload of P bytes) from every peer's
     staged payload, accumulates in fp32 (rank order: self, then
-    ``(rank + i) % world``), rounds once to bf16 and writes the reduced quarter
+    ``(rank + i) % world``), rounds once to bf16 and writes the reduced shard
     both to the output and to its slab's reduced region.  After barrier #2
-    every rank pulls the other ranks' reduced quarters into the output.
-    Wire bytes per rank: 1.5P of PCIe reads (same as ring), two barriers.
+    every rank pulls the other ranks' reduced shards into the output. PCIe read
+    volume per rank is 2P*(world - 1)/world, which is 1.5P for world size 4;
+    synchronization uses two barriers.
     """
 
     def __init__(
@@ -788,8 +790,8 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
         gdim, _, _ = cute.arch.grid_dim()
         local_rank = rank
         packs_per_row = Int32(self._row_elems // _PACK_ELEMS)
-        quarter_packs = Int64(rows_per_rank) * Int64(packs_per_row)
-        full_packs = quarter_packs * Int64(self._world_size)
+        shard_packs = Int64(rows_per_rank) * Int64(packs_per_row)
+        full_packs = shard_packs * Int64(self._world_size)
         threads = Int64(self._threads)
         grid_threads = Int64(gdim) * threads
         flat = Int64(bidx) * threads + Int64(tidx)
@@ -827,17 +829,17 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
 
         self._barrier(signals, local_rank)
 
-        # Phase B: pull my quarter from every peer's staged payload, reduce.
-        quarter_base = Int64(local_rank) * quarter_packs
+        # Phase B: pull this rank's shard from every peer's staged payload.
+        shard_base = Int64(local_rank) * shard_packs
         index = flat
-        while index < quarter_packs:
+        while index < shard_packs:
             accumulator = cute.make_rmem_tensor((_PACK_ELEMS,), cutlass.Float32)
             for lane in cutlass.range_constexpr(_PACK_ELEMS):
                 accumulator[lane] = Float32(0.0)
             # Issue the local and all remote pack loads back-to-back (the peer
             # loop is unrolled at compile time), then accumulate in fixed
             # rank order: self, then (rank + i) % world for i = 1..world-1.
-            pack_offset = (quarter_base + index) * Int64(16)
+            pack_offset = (shard_base + index) * Int64(16)
             local_words = ld_global_nc_v4_u32(payload_address + pack_offset)
             peer_words = []
             for peer_index in cutlass.range_constexpr(1, self._world_size):
@@ -850,7 +852,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
             for peer_index in cutlass.range_constexpr(self._world_size - 1):
                 self._accumulate_words(accumulator, peer_words[peer_index])
             self._store_pack(
-                output_address + (quarter_base + index) * Int64(16), accumulator
+                output_address + (shard_base + index) * Int64(16), accumulator
             )
             self._store_pack(
                 self_base + reduced_offset + index * Int64(16), accumulator
@@ -859,7 +861,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
 
         self._barrier(signals, local_rank)
 
-        # Phase C: pull the other ranks' reduced quarters into the output.
+        # Phase C: pull the other ranks' reduced shards into the output.
         for peer_index in cutlass.range_constexpr(1, self._world_size):
             source_rank = (local_rank + Int32(peer_index)) % Int32(self._world_size)
             peer_reduced = (
@@ -867,11 +869,9 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
                 + staging_slot_offset
                 + reduced_offset
             )
-            destination = output_address + Int64(source_rank) * quarter_packs * Int64(
-                16
-            )
+            destination = output_address + Int64(source_rank) * shard_packs * Int64(16)
             index = flat
-            while index < quarter_packs:
+            while index < shard_packs:
                 words = ld_global_v4_u32(peer_reduced + index * Int64(16))
                 st_global_v4_u32(
                     destination + index * Int64(16),
