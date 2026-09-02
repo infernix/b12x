@@ -46,6 +46,23 @@ arguments in both arms. The control disabled this collective with
 768 KiB. Each concurrency cell used a 15-second warmup followed by three
 30-second samples. `C8` and `C12` mean 8 and 12 concurrent requests.
 
+The benchmark client was `llm_decode_bench.py` version 0.4.29 with SHA-256
+`a17ee69dd2ee5aa59d9c9a1b03e28cae6fe2837545ecc967256b2828215deab7`.
+Each sample used this command, with a distinct output path:
+
+```bash
+python /root/llm_decode_bench.py \
+  --host 127.0.0.1 --port 5051 --model GLM-5.3-Flash \
+  --contexts 0 --concurrency 1,8,12,24 \
+  --duration 30 --decode-warmup-seconds 15 \
+  --max-tokens 8192 --temperature 0 --skip-prefill \
+  --display-mode plain --no-resume --output ARM/decode-run-N.json
+```
+
+The NCCL arm set `VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE=0`. The PCIe two-shot
+arm set `VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE=786432`. No other server option
+or environment value changed between the arms.
+
 | Arm | Concurrency | Output tok/s samples | Verifier steps/s samples | Median output tok/s | Median verifier steps/s |
 |:--|--:|:--|:--|--:|--:|
 | Disabled | 8 | 732.047, 731.156, 729.200 | 281.098, 280.580, 282.060 | 731.156 | 281.098 |
