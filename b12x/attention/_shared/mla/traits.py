@@ -386,9 +386,7 @@ def resolve_unplanned_traits(
         int(q_head_dim), kv_dtype, model_type=model_type
     )
     scale_format = (
-        int(inferred_scale_format)
-        if scale_format is None
-        else int(scale_format)
+        int(inferred_scale_format) if scale_format is None else int(scale_format)
     )
     if is_glm_model_type(model_type) and scale_format == ScaleFormat.NVFP4_E4M3:
         compute_mode = ComputeMode.BF16
@@ -412,8 +410,7 @@ def resolve_unplanned_traits(
         latent_scale_per_token=bool(latent_scale_per_token),
     )
     if (
-        model_type == ModelType.GLM_NEXT
-        or scale_format == ScaleFormat.NVFP4_E4M3
+        model_type == ModelType.GLM_NEXT or scale_format == ScaleFormat.NVFP4_E4M3
     ) and int(record_bytes) != int(traits.kv_gmem_stride):
         if model_type != ModelType.GLM_NEXT:
             raise ValueError(

@@ -37,6 +37,19 @@ _GLM_NEXT_NVFP4_RECORD_BYTES = 304
 _GLM_NEXT_PAGE_SIZE = 64
 _GLM_NEXT_HEAD_DIM = 512
 _GLM_NEXT_SM_SCALE = 256**-0.5
+_ALLOCATOR_COUNTERS = (
+    "allocation.all.allocated",
+    "allocation.all.freed",
+    "segment.all.allocated",
+    "segment.all.freed",
+    "num_alloc_retries",
+    "num_ooms",
+)
+
+
+def _allocator_counters(device: torch.device) -> dict[str, int]:
+    stats = torch.cuda.memory_stats(device)
+    return {name: int(stats.get(name, 0)) for name in _ALLOCATOR_COUNTERS}
 
 
 def _glm_next_plan_and_binding(
@@ -65,9 +78,7 @@ def _glm_next_plan_and_binding(
             page_size=page_size,
             model_type=ModelType.GLM_NEXT,
             scale_format=(
-                ScaleFormat.NVFP4_E4M3
-                if is_nvfp4
-                else ScaleFormat.ARBITRARY_FP32
+                ScaleFormat.NVFP4_E4M3 if is_nvfp4 else ScaleFormat.ARBITRARY_FP32
             ),
             cache_record_bytes=int(kv_cache.shape[-1]),
             fp8_rope=False,
@@ -108,12 +119,12 @@ def _glm_next_dense_physical_reference(
     w_uk_t: torch.Tensor,
     w_uv: torch.Tensor,
 ) -> torch.Tensor:
-    keys = torch.einsum(
-        "rl,hpl->rhp", latent.float(), w_uk_t.float()
-    ).to(torch.bfloat16)
-    values = torch.einsum(
-        "rl,hlv->rhv", latent.float(), w_uv.float()
-    ).to(torch.bfloat16)
+    keys = torch.einsum("rl,hpl->rhp", latent.float(), w_uk_t.float()).to(
+        torch.bfloat16
+    )
+    values = torch.einsum("rl,hlv->rhv", latent.float(), w_uv.float()).to(
+        torch.bfloat16
+    )
     logits = torch.einsum("rhp,shp->hrs", q.float(), keys.float())
     logits.mul_(_GLM_NEXT_SM_SCALE)
     causal_mask = torch.ones(
@@ -121,9 +132,9 @@ def _glm_next_dense_physical_reference(
     ).triu_(1)
     logits.masked_fill_(causal_mask.unsqueeze(0), -torch.inf)
     probabilities = torch.softmax(logits, dim=-1)
-    return torch.einsum(
-        "hrs,shv->rhv", probabilities, values.float()
-    ).to(torch.bfloat16)
+    return torch.einsum("hrs,shv->rhv", probabilities, values.float()).to(
+        torch.bfloat16
+    )
 
 
 def _pooled_selection_reference(
@@ -346,6 +357,15 @@ def test_glm_next_accepts_inline_scale_nvfp4_without_rope() -> None:
     assert nvfp4_traits.d_rope == 0
     assert nvfp4_traits.compute_mode == ComputeMode.BF16
 
+    compatibility_traits = resolve_unplanned_traits(
+        512,
+        torch.uint8,
+        _GLM_NEXT_NVFP4_RECORD_BYTES,
+        model_type=ModelType.GLM_NEXT,
+        scale_format=ScaleFormat.NVFP4_E4M3,
+    )
+    assert compatibility_traits.latent_scale_per_token
+
     with pytest.raises(ValueError, match="inline per-token latent scale"):
         make_unified_traits(
             ModelType.GLM_NEXT,
@@ -461,9 +481,7 @@ def test_glm_next_nvfp4_cache_abi_is_fixed_by_plan_and_binding() -> None:
         )
     binding = sparse_mla.bind(
         plan,
-        kv_cache=torch.empty(
-            (1, 1, _GLM_NEXT_NVFP4_RECORD_BYTES), dtype=torch.uint8
-        ),
+        kv_cache=torch.empty((1, 1, _GLM_NEXT_NVFP4_RECORD_BYTES), dtype=torch.uint8),
         **bind_kwargs,
     )
     assert binding.kv_cache is not None
@@ -515,6 +533,35 @@ def test_binding_owned_cache_forwards_prevalidated_traits(
     assert calls["planned_cache_traits"] is binding.cache_traits
 
 
+def test_traits_less_cpu_route_rejects_nvfp4_before_reference_fallback() -> None:
+    q = torch.empty((1, 1, 512), dtype=torch.bfloat16)
+    cache = torch.empty((1, 1, _GLM_NEXT_NVFP4_RECORD_BYTES), dtype=torch.uint8)
+    selected = torch.zeros((1, 1), dtype=torch.int32)
+    lengths = torch.ones((1,), dtype=torch.int32)
+    binding = SimpleNamespace(
+        q=q,
+        selected_indices=selected,
+        cache_seqlens_int32=lengths,
+        nsa_cache_seqlens_int32=lengths,
+        kv_cache=cache,
+        scratch=SimpleNamespace(
+            device=q.device,
+            dtype=q.dtype,
+            kv_dtype=cache.dtype,
+            v_head_dim=512,
+            page_size=1,
+            cache_traits=None,
+        ),
+    )
+
+    with pytest.raises(NotImplementedError, match="active SM120 kernel path"):
+        sparse_mla.run_decode(
+            binding=binding,
+            sm_scale=_GLM_NEXT_SM_SCALE,
+            scale_format=ScaleFormat.NVFP4_E4M3,
+        )
+
+
 def test_glm_next_pooled_selection_maps_compact_physical_slots_and_replays() -> None:
     device = require_sm120()
     pool_ids = torch.full((2, 512), -1, dtype=torch.int32, device=device)
@@ -561,14 +608,17 @@ def test_glm_next_pooled_selection_maps_compact_physical_slots_and_replays() -> 
             active,
             **kwargs,
         )
-    allocated = torch.cuda.memory_allocated(device)
+    allocator_counters = _allocator_counters(device)
     output.fill_(7)
     graph.replay()
     graph.replay()
     torch.cuda.synchronize(device)
-    assert torch.cuda.memory_allocated(device) == allocated
+    assert _allocator_counters(device) == allocator_counters
     assert active.cpu().tolist() == [10, 5]
     assert output[0, :10].cpu().tolist() == [52, 53, 54, 55, 48, 49, 50, 51, 16, 17]
+    assert output[1, :5].cpu().tolist() == [80, 81, 82, 83, 84]
+    assert bool(torch.all(output[0, 10:] == -1).item())
+    assert bool(torch.all(output[1, 5:] == -1).item())
 
 
 def test_glm_next_reference_record_is_528_bytes() -> None:
@@ -755,9 +805,11 @@ def test_glm_next_cache_writer_preserves_padded_tail_and_record_abi(
 
     records = torch.stack((cache[0, 0], cache[1, 1], cache[2, 2])).cpu()
     dequantized = unpack_mla_kv_cache_reference(records.unsqueeze(1))[:, 0]
-    source = kv_c.index_select(
-        0, torch.tensor([0, 3, 5], dtype=torch.int64, device=device)
-    ).float().cpu()
+    source = (
+        kv_c.index_select(0, torch.tensor([0, 3, 5], dtype=torch.int64, device=device))
+        .float()
+        .cpu()
+    )
     cosine = torch.nn.functional.cosine_similarity(
         dequantized.flatten(), source.flatten(), dim=0
     )
@@ -802,9 +854,11 @@ def test_glm_next_nvfp4_writer_uses_inline_scale_record(
         group_scales_end=288,
         latent_scale_offset=292,
     )
-    source = latent.index_select(
-        0, torch.tensor([0, 2], dtype=torch.int64, device=device)
-    ).float().cpu()
+    source = (
+        latent.index_select(0, torch.tensor([0, 2], dtype=torch.int64, device=device))
+        .float()
+        .cpu()
+    )
     cosine = torch.nn.functional.cosine_similarity(
         dequantized.flatten(), source.flatten(), dim=0
     )
@@ -989,9 +1043,7 @@ def test_glm_next_production_decode_matches_packed_record_oracle() -> None:
         ]
     ).to(torch.int32)
     active = torch.tensor([width, 65], dtype=torch.int32, device=device)
-    cache_seqlens = torch.full(
-        (rows,), num_records, dtype=torch.int32, device=device
-    )
+    cache_seqlens = torch.full((rows,), num_records, dtype=torch.int32, device=device)
     _, binding = _glm_next_plan_and_binding(
         device=device,
         kv_cache=cache,
@@ -1064,9 +1116,7 @@ def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle() -> None:
         ]
     ).to(torch.int32)
     active = torch.tensor([width, 65], dtype=torch.int32, device=device)
-    cache_seqlens = torch.full(
-        (rows,), num_records, dtype=torch.int32, device=device
-    )
+    cache_seqlens = torch.full((rows,), num_records, dtype=torch.int32, device=device)
     _, binding = _glm_next_plan_and_binding(
         device=device,
         kv_cache=cache,
@@ -1142,9 +1192,7 @@ def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle() -> None:
     assert torch.cuda.memory_allocated(device) == allocated_before
     assert torch.cuda.memory_reserved(device) == reserved_before
     _assert_glm_next_attention_close(captured_output, replay_expected)
-    torch.testing.assert_close(
-        captured_lse, replay_expected_lse, rtol=0.0, atol=0.05
-    )
+    torch.testing.assert_close(captured_lse, replay_expected_lse, rtol=0.0, atol=0.05)
 
 
 @torch.inference_mode()
@@ -1157,9 +1205,7 @@ def test_glm_next_hybrid_manager_page_replays_across_page_boundary() -> None:
         page_size * _GLM_NEXT_RECORD_BYTES
         + page_size // 4 * 128 * torch.bfloat16.itemsize
     )
-    backing = torch.zeros(
-        (num_pages, page_stride), dtype=torch.uint8, device=device
-    )
+    backing = torch.zeros((num_pages, page_stride), dtype=torch.uint8, device=device)
     cache = torch.as_strided(
         backing,
         size=(num_pages, page_size, _GLM_NEXT_RECORD_BYTES),
@@ -1189,9 +1235,7 @@ def test_glm_next_hybrid_manager_page_replays_across_page_boundary() -> None:
         / 4
     ).to(torch.bfloat16)
     selected = slots.to(torch.int32).unsqueeze(0).contiguous()
-    active = torch.full(
-        (1,), slots.numel(), dtype=torch.int32, device=device
-    )
+    active = torch.full((1,), slots.numel(), dtype=torch.int32, device=device)
     cache_seqlens = torch.full(
         (1,), num_pages * page_size, dtype=torch.int32, device=device
     )
@@ -1248,9 +1292,9 @@ def test_glm_next_hybrid_manager_page_replays_across_page_boundary() -> None:
 
     for _ in range(2):
         q.copy_(
-            (
-                torch.randn(q.shape, generator=generator, device=device) / 4
-            ).to(torch.bfloat16)
+            (torch.randn(q.shape, generator=generator, device=device) / 4).to(
+                torch.bfloat16
+            )
         )
         latent.copy_(
             (
@@ -1264,9 +1308,7 @@ def test_glm_next_hybrid_manager_page_replays_across_page_boundary() -> None:
         )
         sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
         flat_cache.copy_(
-            cache.contiguous().view(
-                num_pages * page_size, 1, _GLM_NEXT_RECORD_BYTES
-            )
+            cache.contiguous().view(num_pages * page_size, 1, _GLM_NEXT_RECORD_BYTES)
         )
         replay_expected, replay_expected_lse = sparse_mla_reference(
             q_all=q,
@@ -1327,16 +1369,12 @@ def test_glm_next_production_prefill_2051_replays_without_allocation() -> None:
         )
         / 4
     ).to(torch.bfloat16)
-    selected = torch.full(
-        (rows, container_width), -1, dtype=torch.int32, device=device
-    )
+    selected = torch.full((rows, container_width), -1, dtype=torch.int32, device=device)
     selected[0, :active_width] = torch.randperm(
         num_records, generator=generator, device=device
     )[:active_width].to(torch.int32)
     active = torch.full((rows,), active_width, dtype=torch.int32, device=device)
-    cache_seqlens = torch.full(
-        (rows,), num_records, dtype=torch.int32, device=device
-    )
+    cache_seqlens = torch.full((rows,), num_records, dtype=torch.int32, device=device)
     _, binding = _glm_next_plan_and_binding(
         device=device,
         kv_cache=cache,
@@ -1409,9 +1447,7 @@ def test_glm_next_production_prefill_2051_replays_without_allocation() -> None:
     assert torch.cuda.memory_allocated(device) == allocated_before
     assert torch.cuda.memory_reserved(device) == reserved_before
     _assert_glm_next_attention_close(captured_output, replay_expected)
-    torch.testing.assert_close(
-        captured_lse, replay_expected_lse, rtol=0.0, atol=0.05
-    )
+    torch.testing.assert_close(captured_lse, replay_expected_lse, rtol=0.0, atol=0.05)
 
 
 @torch.inference_mode()
@@ -1450,16 +1486,12 @@ def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle() -> None
         )
         / 4
     ).to(torch.bfloat16)
-    selected = torch.full(
-        (rows, container_width), -1, dtype=torch.int32, device=device
-    )
+    selected = torch.full((rows, container_width), -1, dtype=torch.int32, device=device)
     selected[0, :active_width] = torch.randperm(
         num_records, generator=generator, device=device
     )[:active_width].to(torch.int32)
     active = torch.full((rows,), active_width, dtype=torch.int32, device=device)
-    cache_seqlens = torch.full(
-        (rows,), num_records, dtype=torch.int32, device=device
-    )
+    cache_seqlens = torch.full((rows,), num_records, dtype=torch.int32, device=device)
     _, binding = _glm_next_plan_and_binding(
         device=device,
         kv_cache=cache,
@@ -1587,9 +1619,7 @@ def test_glm_next_tp4_hybrid_page_prefill_matches_oracle_and_replays() -> None:
         )
         / 4
     ).to(torch.bfloat16)
-    selected = torch.full(
-        (rows, container_width), -1, dtype=torch.int32, device=device
-    )
+    selected = torch.full((rows, container_width), -1, dtype=torch.int32, device=device)
     for row in range(rows):
         selected[row, : row + 1] = slots[: row + 1].to(torch.int32)
     active = torch.arange(1, rows + 1, dtype=torch.int32, device=device)
@@ -1649,20 +1679,18 @@ def test_glm_next_tp4_hybrid_page_prefill_matches_oracle_and_replays() -> None:
     assert captured_lse.data_ptr() == actual_lse.data_ptr()
 
     q.copy_(
-        (
-            torch.randn(q.shape, generator=generator, device=device) / 4
-        ).to(torch.bfloat16)
+        (torch.randn(q.shape, generator=generator, device=device) / 4).to(
+            torch.bfloat16
+        )
     )
     latent.copy_(
-        (
-            torch.randn(latent.shape, generator=generator, device=device) / 4
-        ).to(torch.bfloat16)
+        (torch.randn(latent.shape, generator=generator, device=device) / 4).to(
+            torch.bfloat16
+        )
     )
     sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
     flat_cache.copy_(
-        cache.contiguous().view(
-            num_pages * page_size, 1, _GLM_NEXT_RECORD_BYTES
-        )
+        cache.contiguous().view(num_pages * page_size, 1, _GLM_NEXT_RECORD_BYTES)
     )
     replay_expected, replay_expected_lse = sparse_mla_reference(
         q_all=q,
@@ -1682,9 +1710,7 @@ def test_glm_next_tp4_hybrid_page_prefill_matches_oracle_and_replays() -> None:
     assert torch.cuda.memory_reserved(device) == reserved_before
     assert torch.all(backing[:, semantic_page_bytes:] == sentinel)
     _assert_glm_next_attention_close(captured_output, replay_expected)
-    torch.testing.assert_close(
-        captured_lse, replay_expected_lse, rtol=0.0, atol=0.05
-    )
+    torch.testing.assert_close(captured_lse, replay_expected_lse, rtol=0.0, atol=0.05)
 
 
 @torch.inference_mode()
@@ -1739,14 +1765,10 @@ def test_glm_next_writer_and_reader_use_int64_for_live_high_page() -> None:
     slots = torch.tensor([0, high_slot], dtype=torch.int64, device=device)
     sparse_mla.concat_and_cache_glm_next_mla(sources, cache, slots)
 
-    q = torch.randn(
-        (1, 8, _GLM_NEXT_HEAD_DIM), dtype=torch.bfloat16, device=device
-    )
+    q = torch.randn((1, 8, _GLM_NEXT_HEAD_DIM), dtype=torch.bfloat16, device=device)
     selected = torch.tensor([[high_slot]], dtype=torch.int32, device=device)
     active = torch.ones((1,), dtype=torch.int32, device=device)
-    cache_seqlens = torch.tensor(
-        [high_slot + 1], dtype=torch.int32, device=device
-    )
+    cache_seqlens = torch.tensor([high_slot + 1], dtype=torch.int32, device=device)
     _, binding = _glm_next_plan_and_binding(
         device=device,
         kv_cache=cache,
@@ -1767,11 +1789,14 @@ def test_glm_next_writer_and_reader_use_int64_for_live_high_page() -> None:
     expected = expected_value.view(1, 1, -1).expand_as(actual)
     torch.cuda.synchronize(device)
 
-    assert _glm_next_cache_byte_offset(
-        high_slot,
-        block_size=page_size,
-        block_stride=page_stride_bytes,
-    ) > int32_max
+    assert (
+        _glm_next_cache_byte_offset(
+            high_slot,
+            block_size=page_size,
+            block_stride=page_stride_bytes,
+        )
+        > int32_max
+    )
     _assert_glm_next_attention_close(actual, expected)
 
 
@@ -1831,14 +1856,10 @@ def test_glm_next_nvfp4_writer_and_reader_use_int64_for_live_high_page() -> None
     slots = torch.tensor([0, high_slot], dtype=torch.int64, device=device)
     sparse_mla.concat_and_cache_glm_next_mla(sources, cache, slots)
 
-    q = torch.randn(
-        (1, 8, _GLM_NEXT_HEAD_DIM), dtype=torch.bfloat16, device=device
-    )
+    q = torch.randn((1, 8, _GLM_NEXT_HEAD_DIM), dtype=torch.bfloat16, device=device)
     selected = torch.tensor([[high_slot]], dtype=torch.int32, device=device)
     active = torch.ones((1,), dtype=torch.int32, device=device)
-    cache_seqlens = torch.tensor(
-        [high_slot + 1], dtype=torch.int32, device=device
-    )
+    cache_seqlens = torch.tensor([high_slot + 1], dtype=torch.int32, device=device)
     _, binding = _glm_next_plan_and_binding(
         device=device,
         kv_cache=cache,

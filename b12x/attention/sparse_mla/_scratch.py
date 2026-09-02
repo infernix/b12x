@@ -364,9 +364,7 @@ def build_sparse_mla_binding(
     )
     if kv_cache is not None:
         if kv_cache.ndim != 3:
-            raise ValueError(
-                f"kv_cache must be rank-3, got {tuple(kv_cache.shape)}"
-            )
+            raise ValueError(f"kv_cache must be rank-3, got {tuple(kv_cache.shape)}")
         _validate_device(kv_cache, scratch=scratch, name="kv_cache")
         if kv_cache.dtype != scratch.kv_dtype:
             raise TypeError(
@@ -394,9 +392,7 @@ def build_sparse_mla_binding(
         scale_format=getattr(scratch, "scale_format", None),
         cache_record_bytes=getattr(scratch, "cache_record_bytes", None),
         fp8_rope=getattr(scratch, "fp8_rope", None),
-        latent_scale_per_token=getattr(
-            scratch, "latent_scale_per_token", None
-        ),
+        latent_scale_per_token=getattr(scratch, "latent_scale_per_token", None),
         cache_traits=getattr(scratch, "cache_traits", None),
         kv_cache=kv_cache,
     )
