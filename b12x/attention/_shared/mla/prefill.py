@@ -103,8 +103,17 @@ _TOPK_CONTAINERS = (512, 1024, 2048)
 _TOPK_EXACT = frozenset({128, 512, 1024, 2048, 2051, 2112})
 
 
-def _topk_container(topk: int) -> int:
-    """Smallest MG index container holding ``topk`` valid entries per row."""
+def _topk_container(model_type: int, topk: int) -> int:
+    """Return the DSV4 MG container width for a runtime top-k row.
+
+    GLM sparse-MLA plans bind caller-owned index workspaces whose row width is
+    part of the plan contract. Replacing those rows with an allocating padded
+    tensor after binding can invalidate a captured GLM plan, so GLM row widths
+    remain unchanged. DSV4 accepts the padded fixed-container representation
+    and is the model family that requires sub-container widening.
+    """
+    if model_type != ModelType.DSV4:
+        return topk
     if topk in _TOPK_EXACT:
         return topk
     for container in _TOPK_CONTAINERS:
@@ -252,7 +261,7 @@ def run_unified_prefill(
     else:
         topk_length = topk_length.to(device=device, dtype=torch.int32).contiguous()
 
-    container = _topk_container(topk)
+    container = _topk_container(model_type, topk)
     if container != topk:
         # A short sequence clamps the runtime top-k below the model's
         # index_topk (e.g. 192 for a 192-token prefill). The MG kernels take
