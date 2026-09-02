@@ -37,6 +37,10 @@ _PAGED_INDEX_TILE_BLOCK_K = 512
 _PAGED_INDEX_HEAD_DIM = 128
 _INDEXER_CONTIGUOUS_BLOCK_Q = 32
 _INDEXER_CONTIGUOUS_PREFILL_BLOCK_K = 256
+# Largest element count of one kernel tensor: dynamic shape and stride extents
+# travel as 32-bit values in the launch descriptor, so a logits tile beyond
+# this cannot be launched and the planner fails closed instead.
+_MAX_KERNEL_TENSOR_ELEMENTS = 2**31 - 1
 _INDEXER_CONTIGUOUS_DECODE_BLOCK_K = 64
 _INDEXER_CONTIGUOUS_HEAD_DIM = 128
 _INDEXER_CONTIGUOUS_SCALE_BYTES = 4
@@ -1121,6 +1125,13 @@ def _indexer_contiguous_scratch_layout(
         1,
         num_q_tiles * max_chunk_tiles * _INDEXER_CONTIGUOUS_BLOCK_Q * prefill_block_k,
     )
+    if tile_logits_elements > _MAX_KERNEL_TENSOR_ELEMENTS:
+        raise ValueError(
+            "contiguous indexer logits tile of "
+            f"{max_q_rows} rows x {max_chunk_tiles * prefill_block_k} K rows "
+            f"({tile_logits_elements} elements) exceeds the kernel tensor limit "
+            f"of {_MAX_KERNEL_TENSOR_ELEMENTS} elements; bound supertile_k"
+        )
 
     cursor = 0
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
