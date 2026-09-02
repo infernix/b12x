@@ -5,8 +5,9 @@ travel as bf16 packs, are accumulated in fp32 in a fixed rank order and
 rounded once.  Intended for TP decode all-reduces above the one-shot
 ceiling (tens of KB) and below the DMA ring floor (MB), where NCCL ring is
 the incumbent.  Graph capture follows the two-shot contract: enter
-``runtime.capture()`` around ``torch.cuda.graph`` and keep replays of graphs
-captured from one instance serialized.
+``runtime.capture()`` around ``torch.cuda.graph``. All eager launches and graph
+replays from one instance must be serialized, and callers must stop submitting
+work before closing that instance.
 """
 
 from __future__ import annotations
@@ -110,7 +111,7 @@ def _require_disjoint(
 
 
 class PCIeTwoShotBF16:
-    """Two-shot lossless bf16 reduce_scatter / all_gather / all_reduce runtime."""
+    """Serialized lossless BF16 reduce-scatter/all-gather/all-reduce runtime."""
 
     def __init__(self, *args, **kwargs) -> None:
         raise RuntimeError("use PCIeTwoShotBF16.from_exchange_group()")
@@ -732,6 +733,11 @@ class PCIeTwoShotBF16:
             )
 
     def close(self) -> None:
+        """Synchronize submitted work and release channels on every rank.
+
+        The caller must prevent any eager launch or graph replay from being
+        submitted concurrently with or after this collective close.
+        """
         if getattr(self, "_coordinated_close_complete", False):
             return
         _coordinated_close_channels(
