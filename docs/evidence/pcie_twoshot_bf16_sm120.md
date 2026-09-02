@@ -46,6 +46,48 @@ arguments in both arms. The control disabled this collective with
 768 KiB. Each concurrency cell used a 15-second warmup followed by three
 30-second samples. `C8` and `C12` mean 8 and 12 concurrent requests.
 
+The qualification host used these GPU identities:
+
+| Physical index | GPU UUID | PCI address |
+|---:|:---|:---|
+| 4 | `GPU-8800cf0c-1ba5-7136-d796-2a91f9e9586e` | `00000000:43:00.0` |
+| 5 | `GPU-4a0aa20b-8e36-2e05-4efb-8befbf1181d4` | `00000000:44:00.0` |
+| 6 | `GPU-1a0323f7-8113-a1e1-c68b-f23fecf77171` | `00000000:63:00.0` |
+| 7 | `GPU-0027fc86-3322-ce2a-856c-f49eb61eb63e` | `00000000:64:00.0` |
+
+The B12X and vLLM checkouts were
+`/root/vllm/worktrees/b12x-glm53-r17-perf-20260902` and
+`/root/vllm/worktrees/vllm-glm53-r17-perf-20260902`. The container launcher
+expanded to the following serving command; `ARM_LIMIT` was `0` for the NCCL
+control and `786432` for the PCIe two-shot candidate:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 \
+VLLM_ENABLE_PCIE_ALLREDUCE=1 \
+VLLM_PCIE_ALLREDUCE_BACKEND=b12x \
+VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE="$ARM_LIMIT" \
+NCCL_MIN_NCHANNELS=32 NCCL_MAX_NCHANNELS=32 \
+NCCL_IB_DISABLE=1 NCCL_P2P_LEVEL=SYS NCCL_CUMEM_ENABLE=0 \
+/opt/venv/bin/vllm serve /model \
+  --served-model-name GLM-5.3-Flash --host 0.0.0.0 --port 5051 \
+  --tensor-parallel-size 4 --pipeline-parallel-size 1 \
+  --decode-context-parallel-size 1 --cp-kv-cache-interleave-size 4 \
+  --dcp-kv-cache-interleave-size 4 --max-num-seqs 32 \
+  --max-model-len 262144 --max-num-batched-tokens 4096 \
+  --prefill-schedule-interval 8 --max-cudagraph-capture-size 256 \
+  --gpu-memory-utilization 0.90 --mamba-cache-mode align \
+  --enable-chunked-prefill --enable-prefix-caching --dtype bfloat16 \
+  --kv-cache-dtype fp8 --quantization modelopt_mixed --block-size 256 \
+  --load-format instanttensor --attention-backend B12X \
+  --moe-backend b12x --linear-backend b12x \
+  --no-enable-flashinfer-autotune \
+  --additional-config '{"glm53_kda_decode_backend":"auto","kda_prefill_backend":"flashkda"}' \
+  --compilation-config '{"cudagraph_mode":"FULL"}' \
+  --speculative-config \
+  '{"method":"dflash","model":"/draft","num_speculative_tokens":7,"attention_backend":"FLASH_ATTN"}' \
+  --cudagraph-capture-sizes 1 2 4 8 16 32 40 48 64 96 128 192 256
+```
+
 The benchmark client was `llm_decode_bench.py` version 0.4.29 with SHA-256
 `a17ee69dd2ee5aa59d9c9a1b03e28cae6fe2837545ecc967256b2828215deab7`.
 Each sample used this command, with a distinct output path:
@@ -63,6 +105,13 @@ The NCCL arm set `VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE=0`. The PCIe two-shot
 arm set `VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE=786432`. No other server option
 or environment value changed between the arms.
 
+The reported cells are the raw post-warmup samples. Cold-start throughput was
+not retained and is outside the steady-state decode claim. Both measured arms
+passed the distributed collective test described above before serving. The
+serving processes captured their declared CUDA graphs, retained stable graph
+tensor addresses, completed every request without an API error, and selected
+the intended NCCL or PCIe two-shot route at the declared boundary.
+
 | Arm | Concurrency | Output tok/s samples | Verifier steps/s samples | Median output tok/s | Median verifier steps/s |
 |:--|--:|:--|:--|--:|--:|
 | Disabled | 8 | 732.047, 731.156, 729.200 | 281.098, 280.580, 282.060 | 731.156 | 281.098 |
@@ -78,4 +127,4 @@ The enabled-minus-disabled median change, calculated as
 
 The conclusion is limited to the declared four-GPU SM120 topology and tensor
 sizes selected by the vLLM integration. Other GPU architectures, world sizes,
-and message sizes remain unsupported until separately qualified.
+and message sizes are not qualified by this report.

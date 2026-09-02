@@ -19,7 +19,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from b12x.comm.pcie.pcie_twoshot_bf16 import PCIeTwoShotBF16, _make_layout
+from b12x.comm.pcie import PCIeTwoShotBF16
+from b12x.comm.pcie.pcie_twoshot_bf16 import _make_layout
 
 ROW_ELEMS = int(os.getenv("B12X_TEST_TWOSHOT_BF16_ROW_ELEMS", "4096"))
 MAX_ROWS = int(os.getenv("B12X_TEST_TWOSHOT_BF16_MAX_ROWS", "512"))
@@ -77,7 +78,9 @@ def _check_all_reduce(
 
 
 def _check_graph_capture(pool: PCIeTwoShotBF16, rank: int, world: int) -> None:
-    rows = 64
+    rows = min(64, MAX_ROWS)
+    rows -= rows % world
+    assert rows > 0
     static = _payload(4242 + rank, rows, pool.device)
     exact = _exact_sum(static, world)
     eager = pool.all_reduce(static)
@@ -97,13 +100,24 @@ def _check_graph_capture(pool: PCIeTwoShotBF16, rank: int, world: int) -> None:
     torch.cuda.synchronize()
     dist.barrier()
     captured_address = captured.data_ptr()
-    allocated_after_capture = torch.cuda.memory_allocated(pool.device)
+    allocator_reports_request_count = torch.cuda.get_allocator_backend() == "native"
     for _ in range(3):
+        allocated_before_replay = torch.cuda.memory_allocated(pool.device)
+        allocation_count_before_replay = (
+            int(torch.cuda.memory_stats(pool.device)["allocation.all.allocated"])
+            if allocator_reports_request_count
+            else None
+        )
         graph.replay()
         torch.cuda.synchronize()
+        if allocation_count_before_replay is not None:
+            assert (
+                int(torch.cuda.memory_stats(pool.device)["allocation.all.allocated"])
+                == allocation_count_before_replay
+            )
+        assert torch.cuda.memory_allocated(pool.device) == allocated_before_replay
         dist.barrier()
         assert captured.data_ptr() == captured_address
-        assert torch.cuda.memory_allocated(pool.device) == allocated_after_capture
         assert torch.equal(captured, eager), "graph replay must match the eager result"
     _assert_one_rounding(captured, exact)
 
@@ -111,9 +125,8 @@ def _check_graph_capture(pool: PCIeTwoShotBF16, rank: int, world: int) -> None:
 def _check_reduce_scatter_all_gather(
     pool: PCIeTwoShotBF16, rank: int, world: int
 ) -> None:
-    rows = min(64, MAX_ROWS)
-    rows -= rows % world
-    assert rows > 0
+    rows = MAX_ROWS
+    assert rows > 0 and rows % world == 0
     local_rows = rows // world
     payload = _payload(5300 + rank, rows, pool.device)
     exact = _exact_sum(payload, world)
