@@ -27,11 +27,7 @@ def test_common_models_expand_across_tp1_through_tp16() -> None:
     }
 
     recipes_by_family = {
-        family: tuple(
-            recipe
-            for recipe in MOE_RECIPES
-            if recipe.family_id == family
-        )
+        family: tuple(recipe for recipe in MOE_RECIPES if recipe.family_id == family)
         for family in {recipe.family_id for recipe in MOE_RECIPES}
     }
     for model in COMMON_MOE_MODELS:
@@ -199,7 +195,6 @@ def test_nondivisible_tp_shards_share_one_padded_physical_geometry() -> None:
     assert geometry.intermediate_size == 224
 
 
-
 def test_sweep_deduplicates_model_aliases_before_crossing_runtime_axes() -> None:
     recipe = MoeRecipe(
         recipe_id="same",
@@ -249,6 +244,7 @@ def test_default_sweep_has_stable_complete_cross_product() -> None:
     assert {case.num_tokens for case in cases} == set(COMMON_PLAN_TOKEN_COUNTS)
     assert {case.route_pattern for case in cases} == set(COMMON_ROUTE_PATTERNS)
     assert len({case.case_id for case in cases}) == len(cases)
+    assert corpus_manifest()["schema_version"] == 2
     assert len(corpus_manifest()["corpus_sha256"]) == 64
 
 
@@ -320,6 +316,4 @@ def test_moe_benchmark_preset_catalog_is_fully_mapped_to_the_corpus() -> None:
         assert models[preset.model_id].activation in recipe.compatible_activations
         benchmark = MODEL_PROFILES[preset.preset_id]
         assert preset.tp_size == benchmark.tp_size
-        assert recipe.quant_mode == (
-            benchmark.default_quant_mode or "nvfp4"
-        )
+        assert recipe.quant_mode == (benchmark.default_quant_mode or "nvfp4")

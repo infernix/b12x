@@ -611,9 +611,7 @@ def gdn_cases() -> tuple[SweepCase, ...]:
                 label=f"{geometry.model_id}-columns{columns}-edge",
             )
         )
-    for serving_mode, max_seqs, max_tokens, columns in (
-        GLM53_TP3_KDA_SERVING_CASES
-    ):
+    for serving_mode, max_seqs, max_tokens, columns in GLM53_TP3_KDA_SERVING_CASES:
         cases.append(
             SweepCase.create(
                 group_id="glm-5.3-flash-kda-tp3-serving",
@@ -903,6 +901,10 @@ def _manifest_payload(component: str) -> dict[str, object]:
     }
     if component == "gdn":
         shared["geometries"] = [asdict(item) for item in GDN_GEOMETRIES]
+        shared["glm53_tp3_kda_profile_ids"] = list(GLM53_TP3_KDA_PROFILE_IDS)
+        shared["glm53_tp3_kda_serving_cases"] = [
+            list(item) for item in GLM53_TP3_KDA_SERVING_CASES
+        ]
     elif component == "gqa":
         shared["geometries"] = [asdict(item) for item in GQA_GEOMETRIES]
     elif component == "qsa":
@@ -911,9 +913,7 @@ def _manifest_payload(component: str) -> dict[str, object]:
         shared["qsa_context_tokens"] = list(QSA_CONTEXT_TOKENS)
         shared["qsa_page_sizes"] = list(QSA_PAGE_SIZES)
         shared["qsa_position_layouts"] = [list(item) for item in QSA_POSITION_LAYOUTS]
-        shared["qsa_speculative_context_tokens"] = list(
-            QSA_SPECULATIVE_CONTEXT_TOKENS
-        )
+        shared["qsa_speculative_context_tokens"] = list(QSA_SPECULATIVE_CONTEXT_TOKENS)
     elif component == "mla":
         shared["geometries"] = [asdict(item) for item in MLA_GEOMETRIES]
     elif component == "sparse_mla":
@@ -924,7 +924,10 @@ def _manifest_payload(component: str) -> dict[str, object]:
 
 
 def attention_corpus_manifest(component: str) -> dict[str, object]:
-    payload = {"schema_version": 1, **_manifest_payload(component)}
+    payload = {
+        "schema_version": 2 if component == "gdn" else 1,
+        **_manifest_payload(component),
+    }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["corpus_sha256"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     return payload

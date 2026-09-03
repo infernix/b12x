@@ -871,6 +871,7 @@ def test_standard_moe_micro_masks_source_native_w2_tail(
         max_normalized_rmse=0.03,
     )
 
+
 @pytest.mark.parametrize(
     ("intermediate_size", "expected_swap_ab", "expected_fused_fc1", "expected_sa_m"),
     [
@@ -1250,8 +1251,18 @@ def test_standard_moe_dynamic_inactive_route_live_graph_oracle(
     assert torch.count_nonzero(case.binding.output[-8:]).item() == 0
 
 
+@pytest.mark.parametrize(
+    ("scalar_scales", "fast_math"),
+    (
+        pytest.param(False, True, id="expert-scales-fast-math"),
+        pytest.param(True, True, id="scalar-scales-fast-math"),
+        pytest.param(False, False, id="expert-scales-precise-math"),
+    ),
+)
 def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,
+    scalar_scales: bool,
+    fast_math: bool,
 ) -> None:
     """Exercise the exact GLM-5.3 M8 split route/compute specialization."""
 
@@ -1273,6 +1284,8 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
     monkeypatch.setenv("B12X_DYNAMIC_SPLIT_COMPUTE_MAC", "224")
     from b12x.moe.fused_moe import _impl as fused_moe_impl
 
+    monkeypatch.setattr(fused_moe_impl, "_FAST_MATH_DEFAULT", fast_math)
+
     fused_moe_impl.clear_tp_moe_caches()
 
     weights = _make_nvfp4_weights(
@@ -1282,11 +1295,12 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
-    weights = replace(
-        weights,
-        a1_scale=torch.ones(num_experts, dtype=torch.float32, device=device),
-        a2_scale=torch.ones(num_experts, dtype=torch.float32, device=device),
-    )
+    if not scalar_scales:
+        weights = replace(
+            weights,
+            a1_scale=torch.ones(num_experts, dtype=torch.float32, device=device),
+            a2_scale=torch.ones(num_experts, dtype=torch.float32, device=device),
+        )
     initial = _make_inputs(
         device,
         m=m,
@@ -1305,10 +1319,11 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
         hidden_size=hidden_size,
         topk=topk,
     )
+    quant_scale_math = "reciprocal_multiply" if fast_math else "direct_division"
     initial_reference = _nvfp4_oracle(
         weights,
         initial,
-        quant_scale_math="reciprocal_multiply",
+        quant_scale_math=quant_scale_math,
         num_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -1316,7 +1331,7 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
     changed_reference = _nvfp4_oracle(
         weights,
         changed,
-        quant_scale_math="reciprocal_multiply",
+        quant_scale_math=quant_scale_math,
         num_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -1327,7 +1342,7 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
         quant_mode="nvfp4",
         source_format="modelopt_nvfp4",
         num_topk=topk,
-        fast_math=True,
+        fast_math=fast_math,
     )
     launch_plan = case.scratch_plan.launch_plan
     assert launch_plan.implementation == "dynamic"
@@ -1338,14 +1353,23 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
     assert dynamic_config is not None
     assert dynamic_config.split_route_compute
     assert dynamic_config.split_compute_mac == 224
+    assert dynamic_config.fast_math is fast_math
+    assert dynamic_config.split_fast_prepare is fast_math
+    expected_prepare = "route_pack" if fast_math else "prepare"
     assert {
         kind for kind, _dtype, _launch in case.scratch_plan._prewarmed_dynamic_launches
     } == {
-        "route_pack",
+        "fused_shared",
+        expected_prepare,
         "compute",
     }
-    assert len(case.scratch_plan._prewarmed_dynamic_launches) == 4
-    assert fused_moe_impl._M8_ROUTE_PACK_KERNEL_CACHE
+    assert len(case.scratch_plan._prewarmed_dynamic_launches) == 6
+    assert {
+        dtype
+        for kind, dtype, _launch in case.scratch_plan._prewarmed_dynamic_launches
+        if kind == "fused_shared"
+    } == {torch.int32, torch.int64}
+    assert bool(fused_moe_impl._M8_ROUTE_PACK_KERNEL_CACHE) is fast_math
 
     compiled_before = {
         key: id(value) for key, value in fused_moe_impl._DYNAMIC_KERNEL_CACHE.items()
@@ -1365,7 +1389,11 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
             changed=changed,
             initial_reference=initial_reference,
             changed_reference=changed_reference,
-            context="standard-moe-glm53-m8-split-route-compute",
+            context=(
+                "standard-moe-glm53-m8-split-route-compute-"
+                f"{'scalar' if scalar_scales else 'expert'}-"
+                f"{'fast' if fast_math else 'precise'}"
+            ),
             min_cos=0.999,
             max_normalized_rmse=0.03,
             replay_count=3,
@@ -1389,7 +1417,11 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
     _assert_oracle(
         case.binding.output,
         changed_reference,
-        context="standard-moe-glm53-m8-runtime-compute-grid",
+        context=(
+            "standard-moe-glm53-m8-runtime-compute-grid-"
+            f"{'scalar' if scalar_scales else 'expert'}-"
+            f"{'fast' if fast_math else 'precise'}"
+        ),
         min_cos=0.999,
         max_normalized_rmse=0.03,
     )

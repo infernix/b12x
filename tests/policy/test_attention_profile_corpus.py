@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from types import SimpleNamespace
 
+import b12x.policy.generation.attention_corpus as attention_corpus_module
 from benchmarks.benchmark_gdn_decode import QWEN38_GDN_CASES
 from benchmarks.benchmark_paged_attention import BENCHMARK_PROFILES
 from benchmarks.benchmark_qsa import PROFILES as QSA_PROFILES
@@ -75,11 +76,7 @@ class _FixedGdnSession(AbstractContextManager["_FixedGdnSession"]):
         return None
 
     def candidates(self, _case):
-        return (
-            SweepCandidate.create(
-                {"backend": "triton", "recurrent_block_v": 32}
-            ),
-        )
+        return (SweepCandidate.create({"backend": "triton", "recurrent_block_v": 32}),)
 
     def measure(self, case, candidates):
         self._benchmarked.append(case)
@@ -169,12 +166,10 @@ def test_gdn_corpus_includes_qwen_and_glm_decay_contracts() -> None:
             case.query["key_heads"],
         )
         for case in tp3_cases
-    ] == [
-        (*serving_case, 22) for serving_case in GLM53_TP3_KDA_SERVING_CASES
-    ]
-    assert {
-        tuple(case.metadata["profile_ids"]) for case in tp3_cases
-    } == {GLM53_TP3_KDA_PROFILE_IDS}
+    ] == [(*serving_case, 22) for serving_case in GLM53_TP3_KDA_SERVING_CASES]
+    assert {tuple(case.metadata["profile_ids"]) for case in tp3_cases} == {
+        GLM53_TP3_KDA_PROFILE_IDS
+    }
     exercised = {
         case.query
         for case in cases
@@ -350,6 +345,7 @@ def test_rtx_pro_6000_profile_covers_glm_5_3_kda_serving_capacities() -> None:
     )
     assert GDN_POLICY.heuristic(query, other_device).recurrent_block_v == 32
 
+
 def test_rtx_pro_6000_profile_preplans_glm_5_3_tp3_kda_capacities() -> None:
     device = DeviceIdentity(
         vendor="NVIDIA",
@@ -357,14 +353,12 @@ def test_rtx_pro_6000_profile_preplans_glm_5_3_tp3_kda_capacities() -> None:
         sm_count=188,
         product_name="NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
     )
-    component = EMBEDDED_REGISTRY.get(
-        "nvidia.rtx.pro.6000.blackwell"
-    ).component("attention.gdn")
+    component = EMBEDDED_REGISTRY.get("nvidia.rtx.pro.6000.blackwell").component(
+        "attention.gdn"
+    )
     assert component is not None
 
-    for _mode, max_seqs, max_tokens, state_index_columns in (
-        GLM53_TP3_KDA_SERVING_CASES
-    ):
+    for _mode, max_seqs, max_tokens, state_index_columns in GLM53_TP3_KDA_SERVING_CASES:
         query = GdnQuery(
             gate_activation="sigmoid",
             qk_l2norm=True,
@@ -481,8 +475,7 @@ def test_gdn_generator_filters_profile_specific_cases_before_racing(
     unrestricted_case = next(
         case
         for case in gdn_cases()
-        if case.query["key_heads"] == 16
-        and case.metadata.get("profile_ids") is None
+        if case.query["key_heads"] == 16 and case.metadata.get("profile_ids") is None
     )
     cases = (*restricted_cases, unrestricted_case)
     device = DeviceIdentity(
@@ -534,9 +527,7 @@ def test_gdn_generator_filters_profile_specific_cases_before_racing(
         assert component is not None
         generated[profile_id] = (estimate, factory, component)
 
-    rtx_estimate, rtx_factory, rtx_component = generated[
-        GLM53_TP3_KDA_PROFILE_IDS[0]
-    ]
+    rtx_estimate, rtx_factory, rtx_component = generated[GLM53_TP3_KDA_PROFILE_IDS[0]]
     gb10_estimate, gb10_factory, gb10_component = generated["nvidia.gb10.48sm"]
     assert rtx_estimate.case_count == len(cases)
     assert gb10_estimate.case_count == 1
@@ -554,6 +545,72 @@ def test_gdn_generator_filters_profile_specific_cases_before_racing(
         assert gb10_component.lookup(case.query) is None
 
 
+def test_gdn_generator_invalidates_version_one_candidate_checkpoint(
+    tmp_path,
+) -> None:
+    case = next(
+        case
+        for case in gdn_cases()
+        if case.query["key_heads"] == 16 and case.metadata.get("profile_ids") is None
+    )
+    factory = _FixedGdnFactory()
+    generator = GdnAttentionGenerator(
+        benchmark_factory=factory,
+        cases=(case,),
+    )
+    context = GenerationContext(
+        device=DeviceIdentity(
+            vendor="nvidia",
+            compute_capability=(12, 0),
+            sm_count=188,
+            product_name="Synthetic Blackwell",
+        ),
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="test",
+        settings=GenerationSettings(),
+    )
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    stale_candidate = SweepCandidate.create({"backend": "triton"})
+    checkpoints.save(
+        generator.component_id,
+        case.case_id,
+        {
+            "schema_version": 2,
+            "candidate_contract_version": 1,
+            "generation": context.checkpoint_metadata(),
+            "case_id": case.case_id,
+            "group_id": case.group_id,
+            "query": case.query.to_dict(),
+            "scenario": case.scenario,
+            "metadata": case.metadata.to_dict(),
+            "candidate_ids": [stale_candidate.candidate_id],
+            "measurements": [
+                SweepMeasurement(
+                    candidate=stale_candidate,
+                    latency_us=1.0,
+                    correct=True,
+                ).to_dict()
+            ],
+        },
+    )
+
+    generator.generate(
+        context,
+        progress=NullProgressReporter(),
+        checkpoints=checkpoints,
+    )
+
+    assert factory.benchmarked == [case]
+    refreshed = checkpoints.load(generator.component_id, case.case_id)
+    assert refreshed is not None
+    assert refreshed["candidate_contract_version"] == 2
+    assert refreshed["measurements"][0]["config"] == {
+        "backend": "triton",
+        "recurrent_block_v": 32,
+    }
+
+
 def test_gdn_benchmark_factory_accepts_grouped_capacity_cases() -> None:
     group_id = gdn_cases()[0].group_id
     cases = tuple(case for case in gdn_cases() if case.group_id == group_id)
@@ -566,33 +623,68 @@ def test_gdn_benchmark_factory_accepts_grouped_capacity_cases() -> None:
 
 
 def test_gdn_benchmark_factory_races_kda_recurrent_value_tiles() -> None:
-    case = next(
-        case
-        for case in gdn_cases()
-        if case.metadata["decay_recipe"] == "kda"
-    )
+    case = next(case for case in gdn_cases() if case.metadata["decay_recipe"] == "kda")
     session = GdnBenchmarkFactory()(case.group_id, (case,), object())
 
-    assert tuple(candidate.config.to_dict() for candidate in session.candidates(case)) == (
+    assert tuple(
+        candidate.config.to_dict() for candidate in session.candidates(case)
+    ) == (
         {"backend": "triton", "recurrent_block_v": 16},
         {"backend": "triton", "recurrent_block_v": 32},
     )
 
 
 def test_attention_corpus_manifests_are_content_addressed() -> None:
-    for component in ("gdn", "gqa", "mla", "qsa", "sparse_mla"):
+    expected_schema_versions = {
+        "gdn": 2,
+        "gqa": 1,
+        "mla": 1,
+        "qsa": 1,
+        "sparse_mla": 1,
+    }
+    for component, schema_version in expected_schema_versions.items():
         manifest = attention_corpus_manifest(component)
 
-        assert manifest["schema_version"] == 1
+        assert manifest["schema_version"] == schema_version
         assert len(manifest["corpus_sha256"]) == 64
+
+
+def test_gdn_manifest_hash_tracks_serving_cases_and_profile_ids(monkeypatch) -> None:
+    serving_cases = attention_corpus_module.GLM53_TP3_KDA_SERVING_CASES
+    profile_ids = attention_corpus_module.GLM53_TP3_KDA_PROFILE_IDS
+    original = attention_corpus_manifest("gdn")
+
+    monkeypatch.setattr(
+        attention_corpus_module,
+        "GLM53_TP3_KDA_SERVING_CASES",
+        (*serving_cases, ("future", 16, 256, 16)),
+    )
+    serving_changed = attention_corpus_manifest("gdn")
+    monkeypatch.setattr(
+        attention_corpus_module,
+        "GLM53_TP3_KDA_SERVING_CASES",
+        serving_cases,
+    )
+    monkeypatch.setattr(
+        attention_corpus_module,
+        "GLM53_TP3_KDA_PROFILE_IDS",
+        (*profile_ids, "nvidia.synthetic"),
+    )
+    profiles_changed = attention_corpus_manifest("gdn")
+
+    assert original["glm53_tp3_kda_serving_cases"] == [
+        list(item) for item in serving_cases
+    ]
+    assert original["glm53_tp3_kda_profile_ids"] == list(profile_ids)
+    assert serving_changed["corpus_sha256"] != original["corpus_sha256"]
+    assert profiles_changed["corpus_sha256"] != original["corpus_sha256"]
 
 
 def test_mhc_tuner_races_the_medium_prefill_plan() -> None:
     case = next(
         case
         for case in _mhc_cases()
-        if case.query["hidden_size"] == 4_096
-        and case.query["max_tokens"] == 3_072
+        if case.query["hidden_size"] == 4_096 and case.query["max_tokens"] == 3_072
     )
     configs = tuple(
         candidate.config.to_dict()
@@ -642,30 +734,23 @@ def test_glm_profile_generation_envelope_matches_presets() -> None:
     mhc_queries = MhcGenerator().reviewed_queries()
 
     assert any(
-        query.num_q_heads == 32 and query.top_k == 2_048
-        for query in dsa_queries
+        query.num_q_heads == 32 and query.top_k == 2_048 for query in dsa_queries
     )
-    assert any(
-        query.num_q_heads == 32 and query.top_k == 512 for query in dsa_queries
-    )
+    assert any(query.num_q_heads == 32 and query.top_k == 512 for query in dsa_queries)
     assert {
         (query.qk_head_dim, query.v_head_dim, query.model_type)
         for query in sparse_queries
     } == {(576, 512, None), (512, 512, 2)}
     assert {query.num_q_heads for query in sparse_queries} == {8, 16, 32, 64}
     assert any(
-        query.max_tokens == 6
-        and query.hidden_size == 4_096
-        and query.split_k == 64
+        query.max_tokens == 6 and query.hidden_size == 4_096 and query.split_k == 64
         for query in mhc_queries
     )
     assert {4_096, 7_168} == {query.hidden_size for query in mhc_queries}
     assert set(COMMON_PREFILL_TOKEN_CAPACITIES) <= {
         query.max_tokens for query in mhc_queries
     }
-    assert {2_304, 3_072, 3_584} <= {
-        query.max_tokens for query in mhc_queries
-    }
+    assert {2_304, 3_072, 3_584} <= {query.max_tokens for query in mhc_queries}
     assert {query.score_mode for query in dsa_queries} == {"dsa", "msa"}
     assert set(COMMON_PREFILL_TOKEN_CAPACITIES) <= {
         query.max_q_rows for query in dsa_queries if query.mode == "prefill"
@@ -678,19 +763,13 @@ def test_glm_profile_generation_envelope_matches_presets() -> None:
 def test_named_attention_benchmark_presets_are_in_the_reviewed_inventory() -> None:
     preset_ids = {preset.preset_id for preset in ATTENTION_BENCHMARK_PRESETS}
     assert {
-        name.removeprefix("paged:")
-        for name in preset_ids
-        if name.startswith("paged:")
+        name.removeprefix("paged:") for name in preset_ids if name.startswith("paged:")
     } == set(BENCHMARK_PROFILES)
     assert {
-        name.removeprefix("qsa:")
-        for name in preset_ids
-        if name.startswith("qsa:")
+        name.removeprefix("qsa:") for name in preset_ids if name.startswith("qsa:")
     } == set(QSA_PROFILES)
     assert {
-        name.removeprefix("gdn:")
-        for name in preset_ids
-        if name.startswith("gdn:")
+        name.removeprefix("gdn:") for name in preset_ids if name.startswith("gdn:")
     } == {case.name for case in QWEN38_GDN_CASES}
     assert preset_ids == {
         "compressed-mla:deepseek-v4-flash-default",

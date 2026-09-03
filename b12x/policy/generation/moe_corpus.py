@@ -131,7 +131,6 @@ class MoeGeometryAlias:
     source: str
 
 
-
 @dataclass(frozen=True, kw_only=True)
 class MoeProfiledPhysicalGeometry:
     model_id: str
@@ -147,7 +146,9 @@ class MoeProfiledPhysicalGeometry:
         if self.tp_size <= 0 or self.physical_intermediate_size <= 0:
             raise ValueError("profiled MoE geometry sizes must be positive")
         if not self.profile_ids or len(self.profile_ids) != len(set(self.profile_ids)):
-            raise ValueError("profiled MoE geometry profile IDs must be non-empty and unique")
+            raise ValueError(
+                "profiled MoE geometry profile IDs must be non-empty and unique"
+            )
         if any(not profile_id for profile_id in self.profile_ids):
             raise ValueError("profiled MoE geometry profile IDs must be non-empty")
 
@@ -730,8 +731,7 @@ def expand_physical_geometries(
                         logical_intermediate_sizes=logical_sizes,
                         physical_intermediate_size=physical_size,
                         padding_per_tp_group=(
-                            physical_size * profiled.tp_size
-                            - model.intermediate_size
+                            physical_size * profiled.tp_size - model.intermediate_size
                         ),
                         native_top_k=model.native_top_k,
                         source=profiled.source,
@@ -806,7 +806,7 @@ def expand_sweep_cases(
 
 def corpus_manifest() -> dict[str, object]:
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "tp_sizes": list(COMMON_TP_SIZES),
         "top_k": list(COMMON_TOP_K),
         "decode_tokens": list(COMMON_DECODE_TOKENS),
