@@ -20,6 +20,7 @@ GLM53_TP3_KDA_SERVING_CASES = (
     ("mtp3", 16, 64, 4),
     ("dflash7", 16, 128, 8),
 )
+GLM53_TP3_KDA_PROFILE_IDS = ("nvidia.rtx.pro.6000.blackwell",)
 QSA_BATCHES = COMMON_SEQUENCE_CAPACITIES
 QSA_CONTEXT_TOKENS = (2_048, 8_192, 32_768, 65_536, 131_072, 262_144)
 QSA_PAGE_SIZES = (16, 64)
@@ -629,6 +630,7 @@ def gdn_cases() -> tuple[SweepCase, ...]:
                 metadata={
                     "decay_recipe": "kda",
                     "model_id": "glm-5.3-flash-kda-tp3",
+                    "profile_ids": list(GLM53_TP3_KDA_PROFILE_IDS),
                     "query_lengths": [columns] * max_seqs,
                     "serving_mode": serving_mode,
                     "source": "GLM-5.3 Flash KDA physical-66-head TP3 geometry",
@@ -940,6 +942,7 @@ __all__ = [
     "GDN_GEOMETRIES",
     "GDN_STATE_INDEX_COLUMNS",
     "GLM53_TP3_KDA_SERVING_CASES",
+    "GLM53_TP3_KDA_PROFILE_IDS",
     "GQA_GEOMETRIES",
     "MLA_GEOMETRIES",
     "QSA_GEOMETRIES",

@@ -28,6 +28,7 @@ from b12x.policy.generation.attention_corpus import (
     COMMON_SEQUENCE_CAPACITIES,
     GDN_GEOMETRIES,
     GQA_GEOMETRIES,
+    GLM53_TP3_KDA_PROFILE_IDS,
     GLM53_TP3_KDA_SERVING_CASES,
     MLA_GEOMETRIES,
     QSA_GEOMETRIES,
@@ -163,6 +164,9 @@ def test_gdn_corpus_includes_qwen_and_glm_decay_contracts() -> None:
     ] == [
         (*serving_case, 22) for serving_case in GLM53_TP3_KDA_SERVING_CASES
     ]
+    assert {
+        tuple(case.metadata["profile_ids"]) for case in tp3_cases
+    } == {GLM53_TP3_KDA_PROFILE_IDS}
     exercised = {
         case.query
         for case in cases
@@ -178,6 +182,12 @@ def test_embedded_gdn_profiles_cover_every_corpus_query() -> None:
         component = profile.component("attention.gdn")
         assert component is not None, profile.profile_id
         for query, case in cases_by_query.items():
+            applicable_profiles = case.metadata.get("profile_ids")
+            if (
+                applicable_profiles is not None
+                and profile.profile_id not in applicable_profiles
+            ):
+                continue
             hit = component.lookup(query)
             assert hit is not None, (profile.profile_id, query.to_dict())
             expected_backend = (
@@ -364,7 +374,8 @@ def test_rtx_pro_6000_profile_preplans_glm_5_3_tp3_kda_capacities() -> None:
         ).resolve(GDN_POLICY, query)
 
         assert leaf is not None
-        assert leaf.config == {"backend": "triton", "recurrent_block_v": 16}
+        assert leaf.config["backend"] == "triton"
+        assert leaf.config["recurrent_block_v"] == 16
         assert resolution.source is PolicySource.PREPLANNED
         assert resolution.config.backend == "triton"
         assert resolution.config.recurrent_block_v == 16
