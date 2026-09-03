@@ -80,7 +80,6 @@ class MoeModelGeometry:
     recipe_families: tuple[str, ...]
     source: str
     tp_sizes: tuple[int, ...] = COMMON_TP_SIZES
-    tp_physical_intermediate_sizes: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.model_id or not self.activation or not self.source:
@@ -100,16 +99,6 @@ class MoeModelGeometry:
             raise ValueError("tp_sizes must contain positive values")
         if len(self.tp_sizes) != len(set(self.tp_sizes)):
             raise ValueError("tp_sizes must be unique")
-        physical_tp_sizes = tuple(tp for tp, _size in self.tp_physical_intermediate_sizes)
-        if len(physical_tp_sizes) != len(set(physical_tp_sizes)):
-            raise ValueError("TP physical intermediate overrides must be unique")
-        for tp_size, physical_size in self.tp_physical_intermediate_sizes:
-            if tp_size not in self.tp_sizes:
-                raise ValueError(
-                    "TP physical intermediate overrides must reference a profiled TP size"
-                )
-            if physical_size <= 0:
-                raise ValueError("TP physical intermediate sizes must be positive")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -132,7 +121,9 @@ class MoeGeometryAlias:
     tp_size: int
     global_intermediate_size: int
     logical_intermediate_sizes: tuple[int, ...]
+    # Per-rank padded kernel width shared by every rank in this TP group.
     physical_intermediate_size: int
+    # Aggregate padding across the full TP group: physical * TP - logical total.
     padding_per_tp_group: int
     native_top_k: int
     source: str
@@ -429,7 +420,6 @@ COMMON_MOE_MODELS = (
         activation="silu",
         recipe_families=("modelopt-nvfp4",),
         source="benchmark_moe.MODEL_PROFILES['glm53-flash-shape']",
-        tp_physical_intermediate_sizes=((3, 704),),
     ),
     MoeModelGeometry(
         model_id="kimi-k3",
@@ -575,9 +565,6 @@ def expand_physical_geometries(
         recipes_by_family.setdefault(recipe.family_id, []).append(recipe)
     aliases_by_key: dict[tuple[object, ...], list[MoeGeometryAlias]] = {}
     recipe_by_key: dict[tuple[object, ...], MoeRecipe] = {}
-    model_physical_sizes = {
-        model.model_id: dict(model.tp_physical_intermediate_sizes) for model in models
-    }
     for model in models:
         for family_id in model.recipe_families:
             try:
@@ -606,10 +593,7 @@ def expand_physical_geometries(
                     if not logical_sizes:
                         continue
                     logical_max = max(logical_sizes)
-                    physical_size = model_physical_sizes[model.model_id].get(
-                        tp_size,
-                        recipe.physical_intermediate_size(logical_max),
-                    )
+                    physical_size = recipe.physical_intermediate_size(logical_max)
                     if (
                         physical_size < logical_max
                         or physical_size % recipe.intermediate_alignment
