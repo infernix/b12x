@@ -270,11 +270,6 @@ def _pointer(tensor: torch.Tensor, dtype: type[cutlass.Numeric]) -> cute.Pointer
     )
 
 
-def swizzled_column(row: int, column: int) -> int:
-    """Physical column of logical ``(row, column)`` in a workspace tile."""
-    return ((((column >> 3) ^ (row & 7)) << 3) | (column & 7))
-
-
 class _PrologueKernel:
     """Validate packed metadata and build the banded tile tables in one CTA.
 
@@ -1521,6 +1516,10 @@ class _RecurrenceKernel:
                             row0, row1, col_base, tid,
                         )
                     self._refresh_shadow(acc, shadow)
+                    # The guard is load-bearing: the loop body and its zero
+                    # trip count are the same without it, but the generated
+                    # schedule is far worse (the sixteen-head 4096-token case
+                    # measures 428 us instead of 220 us on RTX PRO 6000).
                     if has_tiles:
                         for step in cutlass.range(l_end - l_begin, unroll=1):
                             local = l_begin + step
@@ -2244,6 +2243,5 @@ __all__ = [
     "run_prepare",
     "run_prologue",
     "run_recurrence",
-    "swizzled_column",
     "workspace_tiles",
 ]

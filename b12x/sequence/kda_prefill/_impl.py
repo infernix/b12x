@@ -216,7 +216,6 @@ def _materialize_plan(
     if v_split not in V_SPLIT_CHOICES:
         raise ValueError(f"v_split must be one of {V_SPLIT_CHOICES}, got {v_split}")
     tiles = caps.tiles_capacity
-    chunk = caps.chunk_tokens
     heads = caps.heads
     window_tiles = max(1, min(int(window_tiles), tiles))
     max_windows = -(-tiles // window_tiles)

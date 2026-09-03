@@ -35,3 +35,24 @@ final-state scatter that the vLLM layer runs around FlashKDA. Lower is better.
 succeeded. FlashKDA's per-tile cost doubles from 16 to 64 heads at the same
 sequence, so its prepare kernel and workspace traffic are a substantial share
 of the total, not only the sequential recurrence.
+
+## 20260903-rtx-pro-6000-flashkda-triton-baselines-h32.json
+
+The same baseline at 32 heads, the GLM-5.3 Flash TP2 geometry, measured on the
+same idle device from the same vLLM checkout at commit `83cb22a0e3` with
+`CUDA_VISIBLE_DEVICES=2`. Method, inputs, and columns are those of the file
+above.
+
+| case | chain tiles | FlashKDA cold µs | warm µs | µs/tile | gather+scatter µs | Triton cold µs | warm µs |
+|---|---|---|---|---|---|---|---|
+| h32-t1024-n1 | 64 | 79.1 | 69.2 | 1.237 | 23.2 | 129.4 | 117.4 |
+| h32-t2048-n1 | 128 | 139.3 | 136.8 | 1.088 | 22.7 | 241.7 | 243.8 |
+| h32-t4096-n1 | 256 | 284.7 | 294.5 | 1.112 | 22.7 | 621.5 | 629.3 |
+| h32-t4096-n4 | 64 | 223.2 | 233.1 | 3.488 | 24.2 | 632.8 | 640.6 |
+| h32-t512x8 | 32 | 237.6 | 245.3 | 7.424 | 24.3 | 650.7 | 657.5 |
+| h32-t8192-n1 | 512 | 594.0 | 604.2 | 1.160 | 23.1 | 1433.4 | 1440.4 |
+| h32-t32768-n1 | 2048 | 2414.9 | 2427.5 | 1.179 | 22.5 | 6158.7 | 6218.3 |
+
+FlashKDA's per-tile cost at 32 heads is roughly 1.1 µs for a single prompt but
+3.5 µs for four 1024-token requests and 7.4 µs for eight 512-token requests, so
+its batched-prefill cost is set by per-sequence work rather than by tile count.
