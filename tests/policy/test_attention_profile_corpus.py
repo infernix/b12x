@@ -20,6 +20,7 @@ from b12x.policy.generation import (
     GenerationContext,
     GenerationSettings,
     SweepCandidate,
+    SweepCase,
     SweepMeasurement,
 )
 from b12x.policy.generation.attention_corpus import (
@@ -64,6 +65,9 @@ from b12x.sequence.gdn_decode._policy import GDN_POLICY, GdnQuery
 
 
 class _FixedGdnSession(AbstractContextManager["_FixedGdnSession"]):
+    def __init__(self, benchmarked: list[SweepCase]) -> None:
+        self._benchmarked = benchmarked
+
     def __enter__(self) -> "_FixedGdnSession":
         return self
 
@@ -77,7 +81,8 @@ class _FixedGdnSession(AbstractContextManager["_FixedGdnSession"]):
             ),
         )
 
-    def measure(self, _case, candidates):
+    def measure(self, case, candidates):
+        self._benchmarked.append(case)
         return (
             SweepMeasurement(
                 candidate=candidates[0],
@@ -88,8 +93,11 @@ class _FixedGdnSession(AbstractContextManager["_FixedGdnSession"]):
 
 
 class _FixedGdnFactory:
+    def __init__(self) -> None:
+        self.benchmarked: list[SweepCase] = []
+
     def __call__(self, _group_id, _cases, _context):
-        return _FixedGdnSession()
+        return _FixedGdnSession(self.benchmarked)
 
 
 def test_builtin_registry_covers_every_top_level_component() -> None:
@@ -460,6 +468,90 @@ def test_generated_gdn_profile_covers_dense_and_sparse_capacity_ranges(
         )
         is None
     )
+
+
+def test_gdn_generator_filters_profile_specific_cases_before_racing(
+    tmp_path,
+) -> None:
+    restricted_cases = tuple(
+        case
+        for case in gdn_cases()
+        if case.metadata.get("model_id") == "glm-5.3-flash-kda-tp3"
+    )
+    unrestricted_case = next(
+        case
+        for case in gdn_cases()
+        if case.query["key_heads"] == 16
+        and case.metadata.get("profile_ids") is None
+    )
+    cases = (*restricted_cases, unrestricted_case)
+    device = DeviceIdentity(
+        vendor="nvidia",
+        compute_capability=(12, 0),
+        sm_count=188,
+        product_name="Synthetic Blackwell",
+    )
+    generated = {}
+    for profile_id in (
+        GLM53_TP3_KDA_PROFILE_IDS[0],
+        "nvidia.gb10.48sm",
+    ):
+        work_dir = tmp_path / profile_id
+        factory = _FixedGdnFactory()
+        generator = GdnAttentionGenerator(
+            benchmark_factory=factory,
+            cases=cases,
+        )
+        context = GenerationContext(
+            device=device,
+            device_ordinal=0,
+            work_dir=work_dir,
+            source_revision="test",
+            settings=GenerationSettings(),
+            profile_id=profile_id,
+        )
+        estimate = generator.estimate(context)
+        result = generator.generate(
+            context,
+            progress=NullProgressReporter(),
+            checkpoints=CheckpointStore(work_dir / "checkpoints"),
+        )
+        profile = profile_from_dict(
+            {
+                "profile_id": profile_id,
+                "targets": [
+                    {
+                        "vendor": device.vendor,
+                        "compute_capability": list(device.compute_capability),
+                        "sm_count": device.sm_count,
+                        "product_name": device.product_name,
+                    }
+                ],
+                "components": [result.component],
+            }
+        )
+        component = profile.component("attention.gdn")
+        assert component is not None
+        generated[profile_id] = (estimate, factory, component)
+
+    rtx_estimate, rtx_factory, rtx_component = generated[
+        GLM53_TP3_KDA_PROFILE_IDS[0]
+    ]
+    gb10_estimate, gb10_factory, gb10_component = generated["nvidia.gb10.48sm"]
+    assert rtx_estimate.case_count == len(cases)
+    assert gb10_estimate.case_count == 1
+    assert {case.case_id for case in rtx_factory.benchmarked} == {
+        case.case_id for case in cases
+    }
+    assert {case.case_id for case in gb10_factory.benchmarked} == {
+        unrestricted_case.case_id
+    }
+    assert rtx_component.lookup(unrestricted_case.query) is not None
+    assert gb10_component.lookup(unrestricted_case.query) is not None
+    for case in restricted_cases:
+        assert case.query["key_heads"] == 22
+        assert rtx_component.lookup(case.query) is not None
+        assert gb10_component.lookup(case.query) is None
 
 
 def test_gdn_benchmark_factory_accepts_grouped_capacity_cases() -> None:

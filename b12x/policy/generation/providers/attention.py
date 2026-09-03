@@ -135,6 +135,27 @@ class GdnAttentionGenerator(_AttentionGenerator):
             },
         )
 
+    def _cases_for_context(
+        self,
+        context: GenerationContext,
+    ) -> tuple[SweepCase, ...]:
+        cases = super()._cases_for_context(context)
+        applicable = []
+        for case in cases:
+            profile_ids = case.metadata.get("profile_ids")
+            if profile_ids is None:
+                applicable.append(case)
+                continue
+            if (
+                not isinstance(profile_ids, Sequence)
+                or isinstance(profile_ids, (str, bytes))
+                or any(not isinstance(profile_id, str) for profile_id in profile_ids)
+            ):
+                raise TypeError("GDN case profile_ids must be an array of strings")
+            if context.profile_id in profile_ids:
+                applicable.append(case)
+        return tuple(applicable)
+
 
 class GqaAttentionGenerator(_AttentionGenerator):
     """Generate the paged GQA attention component profile."""
