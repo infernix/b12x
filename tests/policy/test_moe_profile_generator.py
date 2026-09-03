@@ -112,6 +112,30 @@ def test_embedded_moe_profiles_cover_every_corpus_query_with_valid_configs(
                 hit.config,
             )
 
+@pytest.mark.parametrize("num_tokens", (1, 8, 64))
+def test_rtx_profile_resolves_qualified_glm53_tp3_n704_geometry(
+    num_tokens: int,
+) -> None:
+    query = {
+        "activation": "silu",
+        "hidden_size": 4096,
+        "intermediate_size": 704,
+        "num_experts": 288,
+        "num_tokens": num_tokens,
+        "quant_mode": "nvfp4",
+        "routed_rows": num_tokens * 8,
+        "source_format": "modelopt_nvfp4",
+        "top_k": 8,
+    }
+    component = EMBEDDED_REGISTRY.get(
+        "nvidia.rtx.pro.6000.blackwell"
+    ).component("moe.decode")
+    assert component is not None
+
+    hit = component.lookup(query)
+    assert hit is not None
+    assert _config_covers_query(query, hit.config)
+
 
 def test_modelopt_w4a8_profile_worker_uses_a8_activation() -> None:
     from b12x.moe import fused_moe
