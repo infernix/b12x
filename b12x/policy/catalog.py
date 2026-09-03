@@ -148,7 +148,7 @@ PLANNING_COMPONENTS = (
         component_id=DSA_INDEXER,
         policy_ref="b12x.attention.dsa_indexer._policy:DSA_INDEXER_POLICY",
         generator_ref=(
-            "b12x.policy.generation.providers.qualification:DsaIndexerGenerator"
+            "b12x.policy.generation.providers.tunable:DsaIndexerProfileGenerator"
         ),
     ),
     PlanningComponentRegistration(

@@ -12,6 +12,7 @@ signature change.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
@@ -51,6 +52,7 @@ class B12XSparseMLAScratchCaps:
     num_q_heads: int
     max_q_rows: int
     max_width: int
+    softmax_scale: float
     dtype: torch.dtype = torch.bfloat16
     kv_dtype: torch.dtype = torch.bfloat16
     head_dim: int = 576
@@ -74,6 +76,10 @@ class B12XSparseMLAScratchCaps:
     max_q_chunks: int | None = None
     page_size: int = 64
     head_major_output: bool = False
+    latent_scale: float = 1.0
+    return_lse: bool = False
+    lse_scale: Literal["base2", "natural"] = "base2"
+    has_attention_sink: bool = False
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -83,6 +89,12 @@ class B12XSparseMLAScratchCaps:
         object.__setattr__(self, "num_q_heads", max(int(self.num_q_heads), 1))
         object.__setattr__(self, "max_q_rows", max(int(self.max_q_rows), 1))
         object.__setattr__(self, "max_width", max(int(self.max_width), 1))
+        softmax_scale = float(self.softmax_scale)
+        if not math.isfinite(softmax_scale) or softmax_scale <= 0.0:
+            raise ValueError(
+                f"softmax_scale must be finite and positive, got {softmax_scale}"
+            )
+        object.__setattr__(self, "softmax_scale", softmax_scale)
         object.__setattr__(self, "head_dim", max(int(self.head_dim), 1))
         object.__setattr__(self, "v_head_dim", max(int(self.v_head_dim), 1))
         requested_model_type = self.model_type
@@ -151,6 +163,19 @@ class B12XSparseMLAScratchCaps:
         if self.max_q_chunks is not None:
             object.__setattr__(self, "max_q_chunks", max(int(self.max_q_chunks), 1))
         object.__setattr__(self, "page_size", max(int(self.page_size), 1))
+        latent_scale = float(self.latent_scale)
+        if not math.isfinite(latent_scale) or latent_scale <= 0.0:
+            raise ValueError(
+                f"latent_scale must be finite and positive, got {latent_scale}"
+            )
+        object.__setattr__(self, "latent_scale", latent_scale)
+        object.__setattr__(self, "return_lse", bool(self.return_lse))
+        if self.lse_scale not in ("base2", "natural"):
+            raise ValueError(
+                "lse_scale must be 'base2' or 'natural', "
+                f"got {self.lse_scale!r}"
+            )
+        object.__setattr__(self, "has_attention_sink", bool(self.has_attention_sink))
 
 
 @dataclass(kw_only=True)
