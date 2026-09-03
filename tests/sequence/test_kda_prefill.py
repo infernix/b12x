@@ -308,3 +308,160 @@ def test_run_rejects_lower_bound_outside_range() -> None:
             run_oracle(inputs)
         with pytest.raises(ValueError, match="lower_bound"):
             run_oracle(inputs, prefill_kda_chunk_mirror)
+
+
+# ---------------------------------------------------------------------------
+# GPU: prologue and prepare kernels against the chunk mirror trace.
+# ---------------------------------------------------------------------------
+
+
+def make_binding(inputs: dict, *, max_tokens: int, max_seqs: int, metadata_validation: str = "transactional", **caps_extra):
+    """Bind ``inputs`` (from make_inputs on a CUDA device) at planned capacity."""
+    from b12x.policy import PolicyContext, PolicyMode
+    from b12x.sequence.kda_prefill import _impl as impl
+
+    device = inputs["q"].device
+    heads = int(inputs["q"].shape[1])
+    caps = impl.Caps(
+        device=device, max_tokens=max_tokens, max_seqs=max_seqs,
+        max_state_slots=int(inputs["pool"].shape[0]), heads=heads,
+        null_state_index=inputs["null_state_index"], metadata_validation=metadata_validation,
+        **caps_extra,
+    )
+    plan = impl.plan(caps, policy=PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY))
+    scratch = torch.empty(plan.scratch_specs()[0].shape, dtype=torch.uint8, device=device)
+
+    def pad_rows(t: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros((max_tokens,) + tuple(t.shape[1:]), dtype=t.dtype, device=device)
+        out[: t.shape[0]] = t
+        return out
+
+    def pad_seqs(t: torch.Tensor, extra: int = 0) -> torch.Tensor:
+        out = torch.zeros(max_seqs + extra, dtype=t.dtype, device=device)
+        out[: t.shape[0]] = t
+        return out
+
+    tensors = {
+        "q": pad_rows(inputs["q"]), "k": pad_rows(inputs["k"]), "v": pad_rows(inputs["v"]),
+        "raw_g": pad_rows(inputs["raw_g"]), "raw_beta": pad_rows(inputs["raw_beta"]),
+        "A_log": inputs["A_log"], "dt_bias": inputs["dt_bias"],
+        "recurrent_state": inputs["pool"].clone(),
+        "cu_seqlens": pad_seqs(inputs["cu_seqlens"], extra=1),
+        "initial_state_indices": pad_seqs(inputs["initial"]),
+        "final_state_indices": pad_seqs(inputs["final"]),
+        "checkpoint_state_indices": pad_seqs(inputs["checkpoint_slots"]),
+        "checkpoint_offsets": pad_seqs(inputs["checkpoint_offsets"]),
+        "num_seqs": torch.tensor([inputs["num_seqs"]], dtype=torch.int32, device=device),
+        "num_tokens": torch.tensor([inputs["num_tokens"]], dtype=torch.int32, device=device),
+        "output": torch.zeros(max_tokens, heads, HEAD_DIM, dtype=torch.bfloat16, device=device),
+    }
+    return impl.bind(plan, scratch=scratch, **tensors), tensors
+
+
+def _mirror_trace(inputs: dict):
+    _, trace = prefill_kda_chunk_mirror(
+        inputs["q"], inputs["k"], inputs["v"], inputs["raw_g"], inputs["raw_beta"],
+        inputs["A_log"], inputs["dt_bias"], inputs["pool"].clone(), inputs["cu_seqlens"],
+        inputs["initial"], inputs["final"], inputs["checkpoint_slots"], inputs["checkpoint_offsets"],
+        inputs["num_seqs"], inputs["num_tokens"], lower_bound=inputs["lower_bound"],
+        null_state_index=inputs["null_state_index"], trace=True,
+    )
+    return trace
+
+
+@pytest.mark.parametrize(
+    "lengths",
+    [[1], [16], [17], [15, 100, 0, 300, 33], [64, 64]],
+    ids=lambda v: "-".join(map(str, v)),
+)
+@pytest.mark.parametrize("lower_bound", [-5.0, -0.5])
+def test_prepare_kernel_matches_chunk_mirror(lengths, lower_bound) -> None:
+    from ..conftest import require_b12x
+    from b12x.sequence.kda_prefill._cute_kernels import run_prepare, run_prologue, workspace_tiles
+
+    device = require_b12x()
+    checkpoint = [(0, 0)] * len(lengths)
+    if lengths[-1] >= 32:
+        checkpoint[-1] = (32, 3 * len(lengths))
+    inputs = make_inputs(
+        lengths=lengths, heads=2, seed=41, device=device, lower_bound=lower_bound,
+        checkpoint=checkpoint, gate_profile="saturated" if lower_bound == -5.0 else "random",
+    )
+    binding, _ = make_binding(inputs, max_tokens=512, max_seqs=8)
+    run_prologue(binding)
+    run_prepare(binding, lower_bound=lower_bound, scale=HEAD_DIM**-0.5, eps=1e-6)
+    torch.cuda.synchronize(device)
+    assert binding.error_code.item() == 0
+    trace = _mirror_trace(inputs)
+    base = binding.seq_tile_base[: len(lengths) + 1].tolist()
+    expected_base = [0]
+    for length in lengths:
+        expected_base.append(expected_base[-1] + (length + 15) // 16)
+    assert base == expected_base
+    tile_seq = binding.tile_seq.tolist()
+    for seq in range(len(lengths)):
+        for tile in range(expected_base[seq], expected_base[seq + 1]):
+            assert tile_seq[tile] == seq
+    assert all(t == -1 for t in tile_seq[expected_base[-1] :])
+    tiles = workspace_tiles(binding)
+    for (seq, local), record in trace.k1.items():
+        tile = expected_base[seq] + local
+        for name, key in (("q_tilde", "q_tilde"), ("k_tilde", "k_tilde"), ("k_r", "k_r")):
+            got = tiles[name][tile].float()
+            expected = record[key].float()
+            assert torch.isfinite(got).all(), name
+            # One bf16 ulp of slack covers the kernel's approximate exp2 and rsqrt.
+            torch.testing.assert_close(got, expected, rtol=2**-7, atol=1e-6, msg=f"{name} {seq} {local}")
+        for name, key, tol in (("inv", "inv_op", 2**-7), ("mqk", "mqk", 2**-9)):
+            got = tiles[name][tile].float()
+            expected = record[key].float()
+            scale = max(1.0, expected.abs().max().item())
+            assert torch.isfinite(got).all(), name
+            assert (got - expected).abs().max().item() <= tol * scale, (name, seq, local)
+        torch.testing.assert_close(tiles["lambda_c"][tile], record["lambda_c"], rtol=1e-4, atol=0)
+        torch.testing.assert_close(tiles["beta"][tile], record["beta"], rtol=1e-5, atol=1e-6)
+        rows = min(16, lengths[seq] - 16 * local)
+        assert torch.count_nonzero(tiles["k_tilde"][tile, :, rows:]) == 0
+        assert torch.count_nonzero(tiles["k_r"][tile, :, rows:]) == 0
+
+
+@pytest.mark.parametrize(
+    "mutate,bit",
+    [
+        (lambda t: t["final_state_indices"].__setitem__(1, int(t["final_state_indices"][0])), 1),
+        (lambda t: t["final_state_indices"].__setitem__(1, int(t["initial_state_indices"][0])), 1),
+        (lambda t: t["cu_seqlens"].__setitem__(2, 30), 2),
+        (lambda t: t["cu_seqlens"].__setitem__(1, 45), 2),
+        (lambda t: t["num_tokens"].fill_(10_000), 2),
+        (lambda t: t["num_seqs"].fill_(9), 2),
+        (lambda t: t["final_state_indices"].__setitem__(0, 99), 4),
+        (lambda t: t["initial_state_indices"].__setitem__(0, -1), 4),
+        (lambda t: t["checkpoint_offsets"].__setitem__(0, 17), 8),
+        (lambda t: t["checkpoint_offsets"].__setitem__(0, 64), 8),
+    ],
+    ids=[
+        "dup-final", "final-is-other-initial", "cu-end-mismatch", "cu-nonmonotonic",
+        "num-tokens-over", "num-seqs-over", "final-out-of-range", "initial-negative",
+        "ckpt-unaligned", "ckpt-past-length",
+    ],
+)
+def test_prologue_reports_malformed_metadata(mutate, bit) -> None:
+    from ..conftest import require_b12x
+    from b12x.sequence.kda_prefill._cute_kernels import run_prepare, run_prologue
+
+    device = require_b12x()
+    inputs = make_inputs(lengths=[20, 20], heads=2, seed=43, device=device, checkpoint=[(16, 6), (0, 0)])
+    binding, tensors = make_binding(inputs, max_tokens=64, max_seqs=8)
+    mutate(tensors)
+    binding.ws_inv.fill_(float("nan"))
+    run_prologue(binding)
+    run_prepare(binding, lower_bound=-5.0, scale=HEAD_DIM**-0.5, eps=1e-6)
+    torch.cuda.synchronize(device)
+    assert binding.error_code.item() & bit
+    assert torch.isnan(binding.ws_inv.float()).all(), "prepare must not run after a metadata error"
+    trusted, trusted_tensors = make_binding(inputs, max_tokens=64, max_seqs=8, metadata_validation="trusted")
+    mutate(trusted_tensors)
+    trusted.error_code.fill_(0)
+    run_prologue(trusted)
+    torch.cuda.synchronize(device)
+    assert trusted.error_code.item() == 0
