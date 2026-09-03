@@ -80,6 +80,7 @@ class MoeModelGeometry:
     recipe_families: tuple[str, ...]
     source: str
     tp_sizes: tuple[int, ...] = COMMON_TP_SIZES
+    # Entries are (TP size, padded per-rank kernel width), never global totals.
     tp_physical_intermediate_sizes: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
@@ -132,7 +133,9 @@ class MoeGeometryAlias:
     tp_size: int
     global_intermediate_size: int
     logical_intermediate_sizes: tuple[int, ...]
+    # Per-rank padded kernel width shared by every rank in this TP group.
     physical_intermediate_size: int
+    # Aggregate padding across the full TP group: physical * TP - logical total.
     padding_per_tp_group: int
     native_top_k: int
     source: str
