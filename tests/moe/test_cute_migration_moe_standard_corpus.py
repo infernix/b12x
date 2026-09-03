@@ -559,6 +559,72 @@ def test_standard_moe_micro_live_graph_oracle(
     )
 
 
+def test_glm53_tp3_n704_micro_m1_rowpair_fc2_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the native three-chunk M=1 FC2 row-pair implementation."""
+
+    from b12x.moe.fused_moe import _impl as tp_moe_impl
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    recorded: dict[str, object] = {}
+    spec = tp_moe_impl._ACTIVATION_KERNEL_SPECS["silu"]
+
+    def make_recorded_kernel(**kwargs):
+        kernel = spec.micro_kernel_cls(**kwargs)
+        recorded["micro_kernel"] = kernel
+        return kernel
+
+    monkeypatch.setitem(
+        tp_moe_impl._ACTIVATION_KERNEL_SPECS,
+        "silu",
+        replace(spec, micro_kernel_cls=make_recorded_kernel),
+    )
+    intermediate_size = 704
+    weights = _make_nvfp4_weights(
+        device,
+        seed=121,
+        intermediate_size=intermediate_size,
+    )
+    initial = _make_inputs(device, m=1, seed=122, route_shift=0)
+    changed = _make_inputs(device, m=1, seed=123, route_shift=2)
+    initial_reference = _nvfp4_oracle(
+        weights,
+        initial,
+        quant_scale_math="reciprocal_multiply",
+        intermediate_size=intermediate_size,
+    )
+    changed_reference = _nvfp4_oracle(
+        weights,
+        changed,
+        quant_scale_math="reciprocal_multiply",
+        intermediate_size=intermediate_size,
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+    )
+    kernel = recorded["micro_kernel"]
+
+    assert case.scratch_plan.launch_plan.implementation == "micro"
+    assert case.binding.implementation == "micro"
+    assert kernel._cfg.n == intermediate_size
+    assert kernel._cfg.fc2_n_chunks == 3
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context="glm53-tp3-n704-micro-m1-rowpair-fc2",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
+
+
 def test_standard_moe_glm53_m1_rowpair_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -801,6 +867,90 @@ def test_standard_moe_micro_masks_source_native_w2_tail(
         initial_reference=initial_reference,
         changed_reference=changed_reference,
         context=f"standard-moe-micro-w2-tail-n{intermediate_size}-m{m}",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
+
+@pytest.mark.parametrize(
+    ("intermediate_size", "expected_swap_ab", "expected_fused_fc1", "expected_sa_m"),
+    [
+        pytest.param(512, False, True, 16, id="tp4-n512-aligned-fused"),
+        pytest.param(704, True, False, 128, id="tp3-n704-swapped"),
+    ],
+)
+def test_glm53_dynamic_small_batch_native_shard_geometry_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+    intermediate_size: int,
+    expected_swap_ab: bool,
+    expected_fused_fc1: bool,
+    expected_sa_m: int,
+) -> None:
+    """Keep TP4 aligned FC1 and exercise TP3's swapped dynamic FC1 route."""
+
+    from b12x.moe.fused_moe import _impl as tp_moe_impl
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    recorded: dict[str, object] = {}
+    spec = tp_moe_impl._ACTIVATION_KERNEL_SPECS["silu"]
+
+    def make_recorded_kernel(**kwargs):
+        kernel = spec.dynamic_kernel_cls(**kwargs)
+        recorded["dynamic_kernel"] = kernel
+        return kernel
+
+    monkeypatch.setitem(
+        tp_moe_impl._ACTIVATION_KERNEL_SPECS,
+        "silu",
+        replace(spec, dynamic_kernel_cls=make_recorded_kernel),
+    )
+    weights = _make_nvfp4_weights(
+        device,
+        seed=181 + intermediate_size,
+        intermediate_size=intermediate_size,
+    )
+    initial = _make_inputs(
+        device,
+        m=9,
+        seed=182 + intermediate_size,
+        route_shift=0,
+    )
+    changed = _make_inputs(
+        device,
+        m=9,
+        seed=183 + intermediate_size,
+        route_shift=2,
+    )
+    initial_reference = _nvfp4_oracle(
+        weights,
+        initial,
+        intermediate_size=intermediate_size,
+    )
+    changed_reference = _nvfp4_oracle(
+        weights,
+        changed,
+        intermediate_size=intermediate_size,
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+    )
+    kernel = recorded["dynamic_kernel"]
+
+    assert case.scratch_plan.launch_plan.implementation == "dynamic"
+    assert case.binding.implementation == "dynamic"
+    assert kernel.swap_ab is expected_swap_ab
+    assert kernel.w4a4_fc1_fused is expected_fused_fc1
+    assert kernel.sa_tile_shape_mk[0] == expected_sa_m
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context=f"glm53-dynamic-small-batch-n{intermediate_size}",
         min_cos=0.999,
         max_normalized_rmse=0.03,
     )
