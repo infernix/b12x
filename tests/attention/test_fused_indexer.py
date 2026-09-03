@@ -788,6 +788,48 @@ def test_resolve_fused_merge_threshold_maps_each_choice() -> None:
         resolve_fused_merge_threshold("fastest", **common)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for indexer planning"
+)
+def test_plan_indexer_scratch_applies_policy_fused_merge() -> None:
+    from b12x.attention.dsa_indexer._policy import (
+        DSA_INDEXER,
+        FUSED_MERGE_COOPERATIVE,
+        FUSED_MERGE_SERIAL,
+        DsaIndexerConfig,
+    )
+    from b12x.attention.dsa_indexer.fused_indexer import _FORCE_LAST_CTA
+    from b12x.attention.dsa_indexer.scratch import (
+        INDEXER_PAGED_ROUTE_FUSED,
+        B12XIndexerScratchCaps,
+        plan_indexer_scratch,
+    )
+    from b12x.policy import PolicyContext, PolicyMode
+
+    device = torch.device("cuda")
+    caps = B12XIndexerScratchCaps(
+        device=device,
+        source_layout="paged",
+        num_q_heads=32,
+        max_q_rows=4,
+        topk=2048,
+        max_page_table_width=512,
+        route=INDEXER_PAGED_ROUTE_FUSED,
+    )
+    base = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
+    thresholds = {}
+    for choice in (FUSED_MERGE_COOPERATIVE, FUSED_MERGE_SERIAL):
+        policy = base.with_override(
+            DSA_INDEXER, DsaIndexerConfig(backend="native", fused_merge=choice)
+        )
+        plan = plan_indexer_scratch(caps, policy=policy)
+        thresholds[choice] = int(plan.inner.layout.fused_merge_threshold)
+    assert thresholds[FUSED_MERGE_COOPERATIVE] == 0
+    assert thresholds[FUSED_MERGE_SERIAL] == _FORCE_LAST_CTA
+    auto_plan = plan_indexer_scratch(caps, policy=base)
+    assert int(auto_plan.inner.layout.fused_merge_threshold) == 0
+
+
 def test_dsa_indexer_merge_generator_races_both_arms() -> None:
     from b12x.policy.generation.providers.tunable import (
         DsaIndexerMergeGenerator,

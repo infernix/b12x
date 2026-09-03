@@ -28,10 +28,16 @@ from b12x.attention.dsa_indexer.msa_reference import (
 )
 from b12x.policy import PolicyContext, get_auto_policy
 
-from ._policy import DSA_INDEXER_POLICY, DsaIndexerQuery
+from ._policy import (
+    DSA_INDEXER_POLICY,
+    FUSED_MERGE_AUTO,
+    FUSED_MERGE_CHOICES,
+    DsaIndexerQuery,
+)
 
 _PAGED_INDEX_SUPERTILE_K_ENV = "B12X_PAGED_INDEX_SUPERTILE_K"
 _PAGED_INDEX_SUPERTILE_K_DEFAULT = 32768
+_INDEXER_STREAM_SCORER_ENV = "B12X_INDEXER_STREAM_SCORER"
 _PAGED_INDEX_TILE_BLOCK_Q = 32
 _PAGED_INDEX_TILE_BLOCK_K = 512
 _PAGED_INDEX_HEAD_DIM = 128
@@ -92,6 +98,7 @@ class B12XIndexerScratchCaps:
     page_size: int = 64
     supertile_k: int = 0
     shared_page_table: bool = False
+    output_physical_slots: bool = False
     dtype: torch.dtype = torch.bfloat16
     kv_dtype: torch.dtype = torch.uint8
     k_dtype: torch.dtype = torch.float8_e4m3fn
@@ -145,6 +152,9 @@ class B12XIndexerScratchCaps:
         object.__setattr__(self, "page_size", max(int(self.page_size), 1))
         object.__setattr__(self, "supertile_k", max(int(self.supertile_k), 0))
         object.__setattr__(self, "shared_page_table", bool(self.shared_page_table))
+        object.__setattr__(
+            self, "output_physical_slots", bool(self.output_physical_slots)
+        )
         object.__setattr__(
             self, "reserve_paged_logits", bool(self.reserve_paged_logits)
         )
@@ -209,8 +219,15 @@ class B12XIndexerPagedScratchCaps:
     route: str = INDEXER_PAGED_ROUTE_AUTO
     score_mode: str = "dsa"
     num_idx_heads: int = 1
+    # Cross-CTA merge arm of the fused route (see DsaIndexerConfig.fused_merge).
+    fused_merge: str = FUSED_MERGE_AUTO
 
     def __post_init__(self) -> None:
+        if self.fused_merge not in FUSED_MERGE_CHOICES:
+            raise ValueError(
+                f"unsupported fused_merge {self.fused_merge!r}; expected one of "
+                f"{FUSED_MERGE_CHOICES}"
+            )
         device = torch.device(self.device)
         if device.type == "cuda" and device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -317,6 +334,11 @@ class _B12XIndexerPagedScratchLayout:
     supertile_tokens: int
     max_chunks: int
     route: str
+    stream_scorer: bool
+    persistent_scorer_ctas: int
+    stream_scorer_ctas: int
+    fused_ctas_per_group: int
+    fused_merge_threshold: int
     prefill_block_k: int | None
     tile_logits_elements: int
     gather_k_rows: int
@@ -396,6 +418,11 @@ class B12XIndexerPagedScratch:
     paged_tile_logits_k_rows: int
     max_chunks: int
     route: str
+    stream_scorer: bool
+    persistent_scorer_ctas: int
+    stream_scorer_ctas: int
+    fused_ctas_per_group: int = 1
+    fused_merge_threshold: int = 0
     shared_page_table: bool = False
     prefill_block_k: int | None = None
     fixed_capacity: bool = True
@@ -889,6 +916,13 @@ def _indexer_paged_scratch_layout(
     caps: B12XIndexerPagedScratchCaps,
 ) -> _B12XIndexerPagedScratchLayout:
     max_q_rows = max(int(caps.max_q_rows), 1)
+    raw_stream_scorer = os.environ.get(_INDEXER_STREAM_SCORER_ENV)
+    stream_scorer = raw_stream_scorer is None or raw_stream_scorer.strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
     page_size = max(int(caps.page_size), 1)
     supertile_tokens = _resolve_indexer_paged_supertile_tokens(
         int(caps.paged_tile_logits_k_rows),
@@ -924,13 +958,33 @@ def _indexer_paged_scratch_layout(
         num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     else:
         num_sms = 1
+    persistent_scorer_ctas = max(num_sms * 4, 1)
+    if max_q_rows >= 4:
+        persistent_scorer_ctas = max(persistent_scorer_ctas // 2, 1)
+    stream_scorer_ctas = max(1, (num_sms + max_q_rows - 1) // max_q_rows)
+    fused_ctas_per_group = 1
+    fused_merge_threshold = 0
     fused_pack_elements = 0
     fused_state_words = 0
     if route == INDEXER_PAGED_ROUTE_FUSED:
         from b12x.attention.dsa_indexer.fused_indexer import (
             fused_indexer_scratch_capacity,
+            resolve_fused_merge_threshold,
         )
 
+        fused_ctas_per_group = max(
+            1,
+            min(
+                int(caps.max_page_table_width),
+                int(num_sms) // max(1, max_q_rows),
+            ),
+        )
+        fused_merge_threshold = resolve_fused_merge_threshold(
+            caps.fused_merge,
+            ctas_per_group=fused_ctas_per_group,
+            num_heads=int(caps.num_q_heads),
+            topk=int(caps.topk),
+        )
         fused_pack_elements, fused_state_words = fused_indexer_scratch_capacity(
             max_q_rows,
             int(caps.topk),
@@ -1076,6 +1130,11 @@ def _indexer_paged_scratch_layout(
         supertile_tokens=supertile_tokens,
         max_chunks=max_chunks,
         route=route,
+        stream_scorer=stream_scorer,
+        persistent_scorer_ctas=persistent_scorer_ctas,
+        stream_scorer_ctas=stream_scorer_ctas,
+        fused_ctas_per_group=fused_ctas_per_group,
+        fused_merge_threshold=fused_merge_threshold,
         prefill_block_k=prefill_block_k,
         tile_logits_elements=tile_logits_elements,
         gather_k_rows=gather_k_rows,
@@ -1265,6 +1324,8 @@ def _materialize_indexer_paged_scratch(
     caps: B12XIndexerPagedScratchCaps,
     scratch_storage: torch.Tensor,
     layout: _B12XIndexerPagedScratchLayout,
+    *,
+    initialize: bool = True,
 ) -> B12XIndexerPagedScratch:
     max_q_rows = max(int(caps.max_q_rows), 1)
     topk = max(int(caps.topk), 1)
@@ -1341,12 +1402,13 @@ def _materialize_indexer_paged_scratch(
         shape=(1,),
         dtype=torch.int32,
     )
-    width_cap = max(
-        int(caps.max_page_table_width) * int(caps.page_size),
-        int(layout.supertile_tokens),
-        1,
-    )
-    active_width_cap.fill_(int(width_cap))
+    if initialize:
+        width_cap = max(
+            int(caps.max_page_table_width) * int(caps.page_size),
+            int(layout.supertile_tokens),
+            1,
+        )
+        active_width_cap.fill_(int(width_cap))
     if int(layout.fused_pack_elements) > 0 and int(layout.fused_state_words) > 0:
         fused_pack_values, _ = materialize_scratch_view(
             scratch_storage,
@@ -1369,7 +1431,8 @@ def _materialize_indexer_paged_scratch(
         # One-time initialization at workspace bind/materialization.  Both fused
         # merge strategies restore their cross-launch counters before returning,
         # so serving graph replays do not need to capture a state memset.
-        fused_merge_state.zero_()
+        if initialize:
+            fused_merge_state.zero_()
     else:
         fused_pack_values = None
         fused_pack_indices = None
@@ -1476,6 +1539,11 @@ def _materialize_indexer_paged_scratch(
         paged_tile_logits_k_rows=layout.supertile_tokens,
         max_chunks=layout.max_chunks,
         route=layout.route,
+        stream_scorer=layout.stream_scorer,
+        persistent_scorer_ctas=layout.persistent_scorer_ctas,
+        stream_scorer_ctas=layout.stream_scorer_ctas,
+        fused_ctas_per_group=layout.fused_ctas_per_group,
+        fused_merge_threshold=layout.fused_merge_threshold,
         shared_page_table=bool(caps.shared_page_table),
         prefill_block_k=layout.prefill_block_k,
         indexer_k_quant_bytes=indexer_k_quant_bytes,
@@ -2149,6 +2217,7 @@ class B12XIndexerPagedScratchPlan:
         expected_num_q_heads: int | None = None,
         shared_page_table: bool | None = None,
         output_physical_slots: bool = False,
+        _initialize: bool = True,
     ) -> B12XIndexerPagedBinding:
         scratch_storage = scratch_tensor(
             scratch,
@@ -2159,6 +2228,7 @@ class B12XIndexerPagedScratchPlan:
             self.caps,
             scratch_storage,
             self.layout,
+            initialize=_initialize,
         )
         if shared_page_table is None:
             shared_page_table = bool(self.caps.shared_page_table)
@@ -2392,6 +2462,9 @@ def plan_indexer_scratch(
                 route=caps.route,
                 score_mode=caps.score_mode,
                 num_idx_heads=caps.num_idx_heads,
+                fused_merge=str(
+                    getattr(resolution.config, "fused_merge", FUSED_MERGE_AUTO)
+                ),
             )
         )
     elif caps.source_layout == INDEXER_SOURCE_LAYOUT_CONTIGUOUS:

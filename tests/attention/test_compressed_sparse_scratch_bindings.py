@@ -6,7 +6,6 @@ import pytest
 import torch
 
 import b12x.attention.dsa_indexer._impl as indexer_impl
-import b12x.attention.dsa_indexer.paged as paged_indexer_impl
 import b12x.attention._shared.mla.api as sparse_mla_impl
 import b12x.attention._shared.mla.compressed_api as compressed_sparse_mla_impl
 import b12x.attention._shared.mla.kernel as compressed_sparse_mla_kernel
@@ -260,7 +259,12 @@ def test_indexer_common_plan_selects_sm12x_c4_decode_routes(
     props = type(
         "Props",
         (),
-        {"major": 12, "minor": minor, "multi_processor_count": sm_count},
+        {
+            "major": 12,
+            "minor": minor,
+            "multi_processor_count": sm_count,
+            "name": "test SM12x device",
+        },
     )()
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
 
