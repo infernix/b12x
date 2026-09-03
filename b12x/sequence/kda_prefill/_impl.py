@@ -27,12 +27,16 @@ from .._shared.tensors import (
     require_row_contiguous,
     require_tensor,
 )
-from ._policy import KDA_PREFILL_POLICY, V_SPLIT_CHOICES, KdaPrefillQuery
+from ._policy import (
+    CHUNK_TOKENS,
+    KDA_PREFILL_POLICY,
+    V_SPLIT_CHOICES,
+    KdaPrefillQuery,
+    WorkspaceRecord,
+    tiles_capacity,
+)
 
 MetadataValidation = Literal["transactional", "trusted"]
-
-# Elements of the per-(tile, head) auxiliary record: lambda_c[128], beta[C], pad.
-MISC_RECORD_ELEMENTS = 160
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -69,8 +73,8 @@ class Caps:
             raise ValueError("model_dtype must be torch.bfloat16")
         if self.state_dtype != torch.float32:
             raise ValueError("state_dtype must be torch.float32")
-        if self.chunk_tokens != 16:
-            raise ValueError("chunk_tokens must be 16")
+        if self.chunk_tokens != CHUNK_TOKENS:
+            raise ValueError(f"chunk_tokens must be {CHUNK_TOKENS}")
         if self.metadata_validation not in ("transactional", "trusted"):
             raise ValueError("metadata_validation must be 'transactional' or 'trusted'")
         object.__setattr__(self, "qk_l2norm", bool(self.qk_l2norm))
@@ -84,15 +88,30 @@ class Caps:
     @property
     def tiles_capacity(self) -> int:
         """Upper bound on packed chunk tiles: one partial tile per sequence."""
-        return -(-self.max_tokens // self.chunk_tokens) + self.max_seqs
+        return tiles_capacity(self.max_tokens, self.max_seqs)
 
 
 @dataclass(frozen=True)
 class Plan:
-    """Fixed launch policy and caller-allocated scratch layout for one Caps."""
+    """Fixed launch policy and caller-allocated scratch layout for one Caps.
+
+    Chunk tiles are ordered in bands (local tile index major, sequence rank
+    minor, longest sequences first) and processed in windows of
+    ``window_tiles`` consecutive positions, so every live sequence advances
+    in every window. The prepare kernel writes each window into one of two
+    workspace ring slots and the recurrence kernel of a window consumes that
+    slot while the next window is being prepared. A sequence that continues
+    across a window boundary keeps its running state in its final state slot,
+    which must therefore not be null. ``max_windows`` is the launch count
+    that covers the full capacity.
+    """
 
     caps: Caps
     v_split: int
+    k_split: int
+    stages: int
+    window_tiles: int
+    max_windows: int
     duplicate_table_size: int
     offsets: Mapping[str, int]
     _scratch_specs: tuple[ScratchBufferSpec, ...]
@@ -103,6 +122,24 @@ class Plan:
 
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
         return tuple((spec.shape, spec.dtype) for spec in self._scratch_specs)
+
+    @property
+    def recurrence_rows(self) -> int:
+        """Grid rows of one recurrence launch: sequences a window can intersect."""
+        return min(self.caps.max_seqs, self.window_tiles)
+
+    def launched_windows(self, max_live_tokens: int | None, max_live_seqs: int | None) -> int:
+        """Windows to launch for a run bounded by the given live counts."""
+        if max_live_tokens is None and max_live_seqs is None:
+            return self.max_windows
+        tokens = self.caps.max_tokens if max_live_tokens is None else int(max_live_tokens)
+        seqs = self.caps.max_seqs if max_live_seqs is None else int(max_live_seqs)
+        if tokens < 0 or tokens > self.caps.max_tokens:
+            raise ValueError(f"max_live_tokens={tokens} exceeds capacity {self.caps.max_tokens}")
+        if seqs < 0 or seqs > self.caps.max_seqs:
+            raise ValueError(f"max_live_seqs={seqs} exceeds capacity {self.caps.max_seqs}")
+        tiles = tiles_capacity(tokens, seqs)
+        return max(1, min(self.max_windows, -(-tiles // self.window_tiles)))
 
     def output_shape(self, tokens: int | None = None) -> tuple[int, int, int]:
         live_tokens = self.caps.max_tokens if tokens is None else int(tokens)
@@ -122,15 +159,14 @@ class Binding:
     scratch: torch.Tensor
     error_code: torch.Tensor
     duplicate_slots: torch.Tensor
-    seq_tile_base: torch.Tensor
-    tile_seq: torch.Tensor
-    seq_order: torch.Tensor
-    ws_q: torch.Tensor
-    ws_k: torch.Tensor
-    ws_kr: torch.Tensor
-    ws_misc: torch.Tensor
-    ws_inv: torch.Tensor
-    ws_mqk: torch.Tensor
+    band_base: torch.Tensor
+    sorted_seq: torch.Tensor
+    rank_of: torch.Tensor
+    pos_seq: torch.Tensor
+    pos_local: torch.Tensor
+    window_table: torch.Tensor
+    ready_flags: torch.Tensor
+    ws: torch.Tensor
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor
@@ -168,25 +204,35 @@ def _query(caps: Caps) -> KdaPrefillQuery:
     )
 
 
-def _materialize_plan(caps: Caps, *, v_split: int, policy_resolution: object | None) -> Plan:
+def _materialize_plan(
+    caps: Caps,
+    *,
+    v_split: int,
+    k_split: int,
+    stages: int,
+    window_tiles: int,
+    policy_resolution: object | None,
+) -> Plan:
     if v_split not in V_SPLIT_CHOICES:
         raise ValueError(f"v_split must be one of {V_SPLIT_CHOICES}, got {v_split}")
     tiles = caps.tiles_capacity
     chunk = caps.chunk_tokens
     heads = caps.heads
+    window_tiles = max(1, min(int(window_tiles), tiles))
+    max_windows = -(-tiles // window_tiles)
+    ring_records = 2 * window_tiles * heads
     duplicate_table_size = _next_power_of_two(4 * caps.max_seqs)
     regions = (
         ("error_code", 1, torch.int32),
         ("duplicate_slots", duplicate_table_size, torch.int32),
-        ("seq_tile_base", caps.max_seqs + 1, torch.int32),
-        ("tile_seq", tiles, torch.int32),
-        ("seq_order", caps.max_seqs, torch.int32),
-        ("ws_q", tiles * heads * chunk * KDA_HEAD_DIM, torch.bfloat16),
-        ("ws_k", tiles * heads * chunk * KDA_HEAD_DIM, torch.bfloat16),
-        ("ws_kr", tiles * heads * chunk * KDA_HEAD_DIM, torch.bfloat16),
-        ("ws_misc", tiles * heads * MISC_RECORD_ELEMENTS, torch.float32),
-        ("ws_inv", tiles * heads * chunk * chunk, torch.bfloat16),
-        ("ws_mqk", tiles * heads * chunk * chunk, torch.bfloat16),
+        ("band_base", tiles + 2, torch.int32),
+        ("sorted_seq", caps.max_seqs, torch.int32),
+        ("rank_of", caps.max_seqs, torch.int32),
+        ("pos_seq", tiles, torch.int32),
+        ("pos_local", tiles, torch.int32),
+        ("window_table", 2 * max_windows, torch.int32),
+        ("ready_flags", ring_records, torch.int32),
+        ("ws", ring_records * WorkspaceRecord.BYTES, torch.uint8),
     )
     offsets: dict[str, int] = {}
     cursor = 0
@@ -198,6 +244,10 @@ def _materialize_plan(caps: Caps, *, v_split: int, policy_resolution: object | N
     return Plan(
         caps=caps,
         v_split=int(v_split),
+        k_split=int(k_split),
+        stages=int(stages),
+        window_tiles=window_tiles,
+        max_windows=max_windows,
         duplicate_table_size=duplicate_table_size,
         offsets=offsets,
         _scratch_specs=(spec,),
@@ -215,7 +265,12 @@ def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
     policy.require_device(caps.device)
     resolution = policy.resolve(KDA_PREFILL_POLICY, _query(caps))
     return _materialize_plan(
-        caps, v_split=int(resolution.config.v_split), policy_resolution=resolution
+        caps,
+        v_split=int(resolution.config.v_split),
+        k_split=int(resolution.config.k_split),
+        stages=int(resolution.config.stages),
+        window_tiles=int(resolution.config.window_tiles),
+        policy_resolution=resolution,
     )
 
 
@@ -259,7 +314,6 @@ def bind(
     caps = plan.caps
     device = caps.device
     heads = caps.heads
-    chunk = caps.chunk_tokens
     tiles = caps.tiles_capacity
     token_capacity = positive("q token capacity", q.shape[0]) if q.dim() == 3 else 0
     if token_capacity > caps.max_tokens:
@@ -305,18 +359,18 @@ def bind(
     require_row_contiguous("output", output, shape=row_shape, device=device, dtypes=(torch.bfloat16,))
 
     storage = scratch_tensor(scratch, plan.scratch_specs(), owner="KDA prefill")
+    ring = 2 * plan.window_tiles
     views = {
         "error_code": _record_view(storage, plan, "error_code", (1,), torch.int32),
         "duplicate_slots": _record_view(storage, plan, "duplicate_slots", (plan.duplicate_table_size,), torch.int32),
-        "seq_tile_base": _record_view(storage, plan, "seq_tile_base", (caps.max_seqs + 1,), torch.int32),
-        "tile_seq": _record_view(storage, plan, "tile_seq", (tiles,), torch.int32),
-        "seq_order": _record_view(storage, plan, "seq_order", (caps.max_seqs,), torch.int32),
-        "ws_q": _record_view(storage, plan, "ws_q", (tiles, heads, chunk, KDA_HEAD_DIM), torch.bfloat16),
-        "ws_k": _record_view(storage, plan, "ws_k", (tiles, heads, chunk, KDA_HEAD_DIM), torch.bfloat16),
-        "ws_kr": _record_view(storage, plan, "ws_kr", (tiles, heads, chunk, KDA_HEAD_DIM), torch.bfloat16),
-        "ws_misc": _record_view(storage, plan, "ws_misc", (tiles, heads, MISC_RECORD_ELEMENTS), torch.float32),
-        "ws_inv": _record_view(storage, plan, "ws_inv", (tiles, heads, chunk, chunk), torch.bfloat16),
-        "ws_mqk": _record_view(storage, plan, "ws_mqk", (tiles, heads, chunk, chunk), torch.bfloat16),
+        "band_base": _record_view(storage, plan, "band_base", (tiles + 2,), torch.int32),
+        "sorted_seq": _record_view(storage, plan, "sorted_seq", (caps.max_seqs,), torch.int32),
+        "rank_of": _record_view(storage, plan, "rank_of", (caps.max_seqs,), torch.int32),
+        "pos_seq": _record_view(storage, plan, "pos_seq", (tiles,), torch.int32),
+        "pos_local": _record_view(storage, plan, "pos_local", (tiles,), torch.int32),
+        "window_table": _record_view(storage, plan, "window_table", (plan.max_windows, 2), torch.int32),
+        "ready_flags": _record_view(storage, plan, "ready_flags", (ring, heads), torch.int32),
+        "ws": _record_view(storage, plan, "ws", (ring, heads, WorkspaceRecord.BYTES), torch.uint8),
     }
     mutable = {"scratch": storage, "recurrent_state": recurrent_state, "output": output}
     read_only = {
@@ -369,14 +423,31 @@ def run(
     lower_bound: float,
     scale: float | None = None,
     eps: float = 1e-6,
+    max_live_tokens: int | None = None,
+    max_live_seqs: int | None = None,
 ) -> torch.Tensor:
-    """Run the prologue, prepare, and recurrence kernels; capture safe."""
+    """Run the prologue, prepare, and recurrence kernels; capture safe.
+
+    ``max_live_tokens`` and ``max_live_seqs`` are optional host-side upper
+    bounds on the device counts; they only limit how many pipeline windows are
+    launched. Under transactional validation a run whose live tiles exceed the
+    launched windows fails closed like any other malformed metadata; under
+    trusted validation the bounds are part of the caller's contract.
+
+    A sequence whose tiles span more than one pipeline window keeps its
+    running state in its final state slot between windows, so such a
+    sequence must have a non-null final slot (transactional validation flags
+    a null one as an invalid slot).
+    """
     if not isinstance(binding, Binding):
         raise TypeError("binding must be kda_prefill.Binding")
     lower_bound_value, scale_value, eps_value = _check_run_scalars(lower_bound, scale, eps)
+    windows = binding.plan.launched_windows(max_live_tokens, max_live_seqs)
     from ._cute_kernels import run_prefill
 
-    run_prefill(binding, lower_bound=lower_bound_value, scale=scale_value, eps=eps_value)
+    run_prefill(
+        binding, lower_bound=lower_bound_value, scale=scale_value, eps=eps_value, windows=windows
+    )
     return binding.output
 
 
@@ -392,7 +463,6 @@ def prewarm(binding: Binding) -> None:
 __all__ = [
     "Binding",
     "Caps",
-    "MISC_RECORD_ELEMENTS",
     "Plan",
     "bind",
     "plan",

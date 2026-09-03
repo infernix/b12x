@@ -315,7 +315,15 @@ def test_run_rejects_lower_bound_outside_range() -> None:
 # ---------------------------------------------------------------------------
 
 
-def make_binding(inputs: dict, *, max_tokens: int, max_seqs: int, metadata_validation: str = "transactional", **caps_extra):
+def make_binding(
+    inputs: dict,
+    *,
+    max_tokens: int,
+    max_seqs: int,
+    metadata_validation: str = "transactional",
+    policy=None,
+    **caps_extra,
+):
     """Bind ``inputs`` (from make_inputs on a CUDA device) at planned capacity."""
     from b12x.policy import PolicyContext, PolicyMode
     from b12x.sequence.kda_prefill import _impl as impl
@@ -328,7 +336,9 @@ def make_binding(inputs: dict, *, max_tokens: int, max_seqs: int, metadata_valid
         null_state_index=inputs["null_state_index"], metadata_validation=metadata_validation,
         **caps_extra,
     )
-    plan = impl.plan(caps, policy=PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY))
+    if policy is None:
+        policy = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
+    plan = impl.plan(caps, policy=policy)
     scratch = torch.empty(plan.scratch_specs()[0].shape, dtype=torch.uint8, device=device)
 
     def pad_rows(t: torch.Tensor) -> torch.Tensor:
@@ -393,19 +403,30 @@ def test_prepare_kernel_matches_chunk_mirror(lengths, lower_bound) -> None:
     torch.cuda.synchronize(device)
     assert binding.error_code.item() == 0
     trace = _mirror_trace(inputs)
-    base = binding.seq_tile_base[: len(lengths) + 1].tolist()
-    expected_base = [0]
-    for length in lengths:
-        expected_base.append(expected_base[-1] + (length + 15) // 16)
-    assert base == expected_base
-    tile_seq = binding.tile_seq.tolist()
+    counts = [(length + 15) // 16 for length in lengths]
+    order = sorted(range(len(lengths)), key=lambda seq: (-counts[seq], seq))
+    rank_of = binding.rank_of[: len(lengths)].tolist()
+    assert sorted(rank_of) == list(range(len(lengths)))
+    assert [rank_of[seq] for seq in order] == list(range(len(lengths))) or all(
+        counts[order[rank]] == counts[binding.sorted_seq[rank].item()] for rank in range(len(lengths))
+    ), "ranks must order sequences by descending tile count"
+    band_base = binding.band_base.tolist()
+    expected_band = [0]
+    for local in range(max(counts) + 1):
+        expected_band.append(expected_band[-1] + sum(1 for c in counts if c > local))
+    assert band_base[: len(expected_band)] == expected_band
+    total = sum(counts)
+    assert band_base[binding.plan.caps.tiles_capacity + 1] == total
+    pos_seq = binding.pos_seq.tolist()
+    pos_local = binding.pos_local.tolist()
     for seq in range(len(lengths)):
-        for tile in range(expected_base[seq], expected_base[seq + 1]):
-            assert tile_seq[tile] == seq
-    assert all(t == -1 for t in tile_seq[expected_base[-1] :])
+        for local in range(counts[seq]):
+            position = band_base[local] + rank_of[seq]
+            assert pos_seq[position] == seq and pos_local[position] == local
+    assert all(t == -1 for t in pos_seq[total:])
     tiles = workspace_tiles(binding)
     for (seq, local), record in trace.k1.items():
-        tile = expected_base[seq] + local
+        tile = band_base[local] + rank_of[seq]
         for name, key in (("q_tilde", "q_tilde"), ("k_tilde", "k_tilde"), ("k_r", "k_r")):
             got = tiles[name][tile].float()
             expected = record[key].float()
@@ -453,12 +474,12 @@ def test_prologue_reports_malformed_metadata(mutate, bit) -> None:
     inputs = make_inputs(lengths=[20, 20], heads=2, seed=43, device=device, checkpoint=[(16, 6), (0, 0)])
     binding, tensors = make_binding(inputs, max_tokens=64, max_seqs=8)
     mutate(tensors)
-    binding.ws_inv.fill_(float("nan"))
+    binding.ws.fill_(0xFF)
     run_prologue(binding)
     run_prepare(binding, lower_bound=-5.0, scale=HEAD_DIM**-0.5, eps=1e-6)
     torch.cuda.synchronize(device)
     assert binding.error_code.item() & bit
-    assert torch.isnan(binding.ws_inv.float()).all(), "prepare must not run after a metadata error"
+    assert (binding.ws == 0xFF).all(), "prepare must not run after a metadata error"
     trusted, trusted_tensors = make_binding(inputs, max_tokens=64, max_seqs=8, metadata_validation="trusted")
     mutate(trusted_tensors)
     trusted.error_code.fill_(0)
@@ -566,9 +587,12 @@ def test_op_lower_bounds_and_saturated_gates(lower_bound, gate_profile) -> None:
     binding, tensors = make_binding(inputs, max_tokens=64, max_seqs=2)
     _run(binding, inputs)
     torch.cuda.synchronize(device)
+    from b12x.sequence.kda_prefill._cute_kernels import workspace_tiles
+
     live_tiles = inputs["num_tokens"] // 16
-    assert torch.isfinite(binding.ws_inv[:live_tiles].float()).all()
-    assert torch.isfinite(binding.ws_mqk[:live_tiles].float()).all()
+    tiles = workspace_tiles(binding)
+    assert torch.isfinite(tiles["inv"][:live_tiles].float()).all()
+    assert torch.isfinite(tiles["mqk"][:live_tiles].float()).all()
     _assert_op_matches_oracle(binding, tensors, inputs)
 
 
