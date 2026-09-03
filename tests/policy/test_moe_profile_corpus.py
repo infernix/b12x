@@ -244,8 +244,8 @@ def test_default_sweep_has_stable_complete_cross_product() -> None:
     geometries = expand_physical_geometries()
     cases = expand_sweep_cases(geometries=geometries)
 
-    assert len(geometries) == 421
-    assert len(cases) == 230_724
+    assert len(geometries) == 422
+    assert len(cases) == 231_268
     assert {case.num_tokens for case in cases} == set(COMMON_PLAN_TOKEN_COUNTS)
     assert {case.route_pattern for case in cases} == set(COMMON_ROUTE_PATTERNS)
     assert len({case.case_id for case in cases}) == len(cases)
