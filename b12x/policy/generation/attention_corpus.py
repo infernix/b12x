@@ -19,6 +19,9 @@ GLM53_TP3_KDA_SERVING_CASES = (
     ("ordinary", 16, 16, 1),
     ("mtp3", 16, 64, 4),
     ("dflash7", 16, 128, 8),
+    ("ordinary-c8", 8, 8, 1),
+    ("mtp3-c8", 8, 32, 4),
+    ("dflash7-c8", 8, 64, 8),
 )
 GLM53_TP3_KDA_PROFILE_IDS = ("nvidia.rtx.pro.6000.blackwell",)
 QSA_BATCHES = COMMON_SEQUENCE_CAPACITIES

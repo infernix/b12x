@@ -113,7 +113,7 @@ def test_attention_corpora_have_stable_reviewed_cross_products() -> None:
     assert len(MLA_GEOMETRIES) == 1
     assert len(QSA_GEOMETRIES) == 3
     assert len(SPARSE_MLA_GEOMETRIES) == 12
-    assert len(gdn_cases()) == 1_465
+    assert len(gdn_cases()) == 1_468
     assert len(gqa_cases()) == 14_400
     assert len(mla_cases()) == 200
     assert len(qsa_cases()) == 6_348
@@ -136,7 +136,7 @@ def test_gdn_corpus_includes_qwen_and_glm_decay_contracts() -> None:
     glm_cases = [case for case in cases if case.metadata["decay_recipe"] == "kda"]
 
     assert recipes == {"gdn", "kda"}
-    assert len(glm_cases) == 813
+    assert len(glm_cases) == 816
     assert {case.query["key_heads"] for case in glm_cases} == {4, 8, 16, 22, 32, 64}
     assert all(
         case.query["key_heads"] == case.query["value_heads"] for case in glm_cases
@@ -357,8 +357,16 @@ def test_rtx_pro_6000_profile_preplans_glm_5_3_tp3_kda_capacities() -> None:
         "attention.gdn"
     )
     assert component is not None
+    expected_block_v = {
+        "ordinary": 16,
+        "mtp3": 32,
+        "dflash7": 32,
+        "ordinary-c8": 16,
+        "mtp3-c8": 16,
+        "dflash7-c8": 16,
+    }
 
-    for _mode, max_seqs, max_tokens, state_index_columns in GLM53_TP3_KDA_SERVING_CASES:
+    for mode, max_seqs, max_tokens, state_index_columns in GLM53_TP3_KDA_SERVING_CASES:
         query = GdnQuery(
             gate_activation="sigmoid",
             qk_l2norm=True,
@@ -377,10 +385,10 @@ def test_rtx_pro_6000_profile_preplans_glm_5_3_tp3_kda_capacities() -> None:
 
         assert leaf is not None
         assert leaf.config["backend"] == "triton"
-        assert leaf.config["recurrent_block_v"] == 16
+        assert leaf.config["recurrent_block_v"] == expected_block_v[mode]
         assert resolution.source is PolicySource.PREPLANNED
         assert resolution.config.backend == "triton"
-        assert resolution.config.recurrent_block_v == 16
+        assert resolution.config.recurrent_block_v == expected_block_v[mode]
 
 
 def test_generated_gdn_profile_covers_dense_and_sparse_capacity_ranges(
