@@ -251,23 +251,29 @@ class DiscreteSweepGenerator:
         if not frozenset(self._nearest_range_bounds) <= self._range_fields:
             raise ValueError("nearest range fields must also be range_fields")
 
-    def estimate(self, context: GenerationContext) -> WorkEstimate:
+    def _cases_for_context(
+        self,
+        context: GenerationContext,
+    ) -> tuple[SweepCase, ...]:
         del context
-        query_count = len(
-            {_query_key(case, self._query_fields) for case in self._cases}
-        )
-        group_count = len({case.group_id for case in self._cases})
+        return self._cases
+
+
+    def estimate(self, context: GenerationContext) -> WorkEstimate:
+        cases = self._cases_for_context(context)
+        query_count = len({_query_key(case, self._query_fields) for case in cases})
+        group_count = len({case.group_id for case in cases})
         return WorkEstimate(
             component_id=self.component_id,
-            work_units=len(self._cases) + query_count,
-            case_count=len(self._cases),
+            work_units=len(cases) + query_count,
+            case_count=len(cases),
             description=(
                 f"{group_count} allocation groups; correctness-gated GPU race "
                 "and decision-tree reduction"
             ),
             dimensions={
                 "allocation_groups": group_count,
-                "measurement_cases": len(self._cases),
+                "measurement_cases": len(cases),
                 "runtime_queries": query_count,
             },
         )
@@ -276,9 +282,8 @@ class DiscreteSweepGenerator:
         self,
         context: GenerationContext,
     ) -> tuple[MeasurementPartition, ...]:
-        del context
         cases_by_group: dict[str, list[SweepCase]] = defaultdict(list)
-        for case in self._cases:
+        for case in self._cases_for_context(context):
             cases_by_group[case.group_id].append(case)
         partitions = []
         for group_id in sorted(cases_by_group):
@@ -456,8 +461,9 @@ class DiscreteSweepGenerator:
         other sources before building a planner; :meth:`generate` builds the
         planner from these records alone.
         """
+        cases = self._cases_for_context(context)
         cases_by_group: dict[str, list[SweepCase]] = defaultdict(list)
-        for case in self._cases:
+        for case in cases:
             cases_by_group[case.group_id].append(case)
         measured: list[tuple[SweepCase, tuple[SweepMeasurement, ...]]] = []
         qualification_cases = 0
@@ -465,7 +471,7 @@ class DiscreteSweepGenerator:
         progress.start_stage(
             self.component_id,
             stage="correctness and candidate races",
-            total=len(self._cases),
+            total=len(cases),
         )
         for group_id in sorted(cases_by_group):
             group_cases = tuple(cases_by_group[group_id])
@@ -608,7 +614,7 @@ class DiscreteSweepGenerator:
         coverage.update(
             {
                 "allocation_groups": len(cases_by_group),
-                "measurement_cases": len(self._cases),
+                "measurement_cases": len(cases),
                 "runtime_query_points": len(records),
             }
         )
