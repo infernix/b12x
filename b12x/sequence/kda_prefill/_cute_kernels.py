@@ -652,10 +652,13 @@ class _PrologueKernel:
                             flags[2] = Int32(1)
             seq += Int32(_PROLOGUE_THREADS)
         cute.arch.sync_threads()
-        if cutlass.const_expr(self.validate):
-            if thread == Int32(0):
+        # Always publish the code, including the zero of a trusted run, so a
+        # run never inherits a stale or uninitialized word from the scratch.
+        if thread == Int32(0):
+            code = Int32(0)
+            if cutlass.const_expr(self.validate):
                 code = flags[0] | (flags[1] << Int32(1)) | (flags[2] << Int32(2)) | (flags[3] << Int32(3))
-                error_code[Int32(0)] = code
+            error_code[Int32(0)] = code
 
 
 class _PrepareKernel:

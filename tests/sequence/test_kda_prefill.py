@@ -787,13 +787,12 @@ def test_op_trusted_mode_accepts_strided_views() -> None:
         num_tokens=torch.tensor([tokens], dtype=torch.int32, device=device),
         output=torch.zeros(tokens, heads, HEAD_DIM, dtype=torch.bfloat16, device=device),
     )
+    # A run owns the error word: trusted mode clears it, so scratch that was
+    # never zeroed cannot poison the output.
     binding.error_code.fill_(7)
     impl.run(binding, lower_bound=-5.0)
     torch.cuda.synchronize(device)
-    assert binding.error_code.item() == 7, "trusted mode must not touch the error code"
-    binding.error_code.fill_(0)
-    impl.run(binding, lower_bound=-5.0)
-    torch.cuda.synchronize(device)
+    assert binding.error_code.item() == 0, "trusted mode must clear the error code"
     expected_out, expected_pool = run_oracle(inputs)
     assert_kda_close("out", expected_out, binding.output, ratio=1e-2)
     for slot in inputs["final"].tolist():
