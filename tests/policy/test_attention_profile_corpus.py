@@ -28,6 +28,7 @@ from b12x.policy.generation.attention_corpus import (
     COMMON_SEQUENCE_CAPACITIES,
     GDN_GEOMETRIES,
     GQA_GEOMETRIES,
+    GLM53_TP3_KDA_SERVING_CASES,
     MLA_GEOMETRIES,
     QSA_GEOMETRIES,
     SPARSE_MLA_GEOMETRIES,
@@ -106,7 +107,7 @@ def test_attention_corpora_have_stable_reviewed_cross_products() -> None:
     assert len(MLA_GEOMETRIES) == 1
     assert len(QSA_GEOMETRIES) == 3
     assert len(SPARSE_MLA_GEOMETRIES) == 12
-    assert len(gdn_cases()) == 1_462
+    assert len(gdn_cases()) == 1_465
     assert len(gqa_cases()) == 14_400
     assert len(mla_cases()) == 200
     assert len(qsa_cases()) == 6_348
@@ -129,8 +130,8 @@ def test_gdn_corpus_includes_qwen_and_glm_decay_contracts() -> None:
     glm_cases = [case for case in cases if case.metadata["decay_recipe"] == "kda"]
 
     assert recipes == {"gdn", "kda"}
-    assert len(glm_cases) == 810
-    assert {case.query["key_heads"] for case in glm_cases} == {4, 8, 16, 32, 64}
+    assert len(glm_cases) == 813
+    assert {case.query["key_heads"] for case in glm_cases} == {4, 8, 16, 22, 32, 64}
     assert all(
         case.query["key_heads"] == case.query["value_heads"] for case in glm_cases
     )
@@ -145,6 +146,23 @@ def test_gdn_corpus_includes_qwen_and_glm_decay_contracts() -> None:
     }
     assert (16, 16, 1) in glm_tp4_capacities
     assert (16, 96, 6) in glm_tp4_capacities
+    tp3_cases = [
+        case
+        for case in glm_cases
+        if case.metadata.get("model_id") == "glm-5.3-flash-kda-tp3"
+    ]
+    assert [
+        (
+            case.metadata["serving_mode"],
+            case.query["max_seqs"],
+            case.query["max_tokens"],
+            case.query["state_index_columns"],
+            case.query["key_heads"],
+        )
+        for case in tp3_cases
+    ] == [
+        (*serving_case, 22) for serving_case in GLM53_TP3_KDA_SERVING_CASES
+    ]
     exercised = {
         case.query
         for case in cases
@@ -313,6 +331,43 @@ def test_rtx_pro_6000_profile_covers_glm_5_3_kda_serving_capacities() -> None:
         product_name="Synthetic RTX",
     )
     assert GDN_POLICY.heuristic(query, other_device).recurrent_block_v == 32
+
+def test_rtx_pro_6000_profile_preplans_glm_5_3_tp3_kda_capacities() -> None:
+    device = DeviceIdentity(
+        vendor="NVIDIA",
+        compute_capability=(12, 0),
+        sm_count=188,
+        product_name="NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    )
+    component = EMBEDDED_REGISTRY.get(
+        "nvidia.rtx.pro.6000.blackwell"
+    ).component("attention.gdn")
+    assert component is not None
+
+    for _mode, max_seqs, max_tokens, state_index_columns in (
+        GLM53_TP3_KDA_SERVING_CASES
+    ):
+        query = GdnQuery(
+            gate_activation="sigmoid",
+            qk_l2norm=True,
+            state_dtype="float32",
+            key_heads=22,
+            value_heads=22,
+            max_seqs=max_seqs,
+            max_tokens=max_tokens,
+            state_index_columns=state_index_columns,
+        )
+        leaf = component.lookup(query.profile_fields())
+        resolution = PolicyContext.for_identity(
+            device,
+            mode=PolicyMode.PREPLANNED_ONLY,
+        ).resolve(GDN_POLICY, query)
+
+        assert leaf is not None
+        assert leaf.config == {"backend": "triton", "recurrent_block_v": 16}
+        assert resolution.source is PolicySource.PREPLANNED
+        assert resolution.config.backend == "triton"
+        assert resolution.config.recurrent_block_v == 16
 
 
 def test_generated_gdn_profile_covers_dense_and_sparse_capacity_ranges(

@@ -15,6 +15,11 @@ COMMON_CONTEXT_TOKENS = (128, 16_384, 32_768, 65_536, 131_072)
 COMMON_PAGE_SIZES = (64, 128)
 COMMON_KV_DTYPES = ("bfloat16", "float8_e4m3fn")
 GDN_STATE_INDEX_COLUMNS = tuple(range(1, 9))
+GLM53_TP3_KDA_SERVING_CASES = (
+    ("ordinary", 16, 16, 1),
+    ("mtp3", 16, 64, 4),
+    ("dflash7", 16, 128, 8),
+)
 QSA_BATCHES = COMMON_SEQUENCE_CAPACITIES
 QSA_CONTEXT_TOKENS = (2_048, 8_192, 32_768, 65_536, 131_072, 262_144)
 QSA_PAGE_SIZES = (16, 64)
@@ -605,6 +610,33 @@ def gdn_cases() -> tuple[SweepCase, ...]:
                 label=f"{geometry.model_id}-columns{columns}-edge",
             )
         )
+    for serving_mode, max_seqs, max_tokens, columns in (
+        GLM53_TP3_KDA_SERVING_CASES
+    ):
+        cases.append(
+            SweepCase.create(
+                group_id="glm-5.3-flash-kda-tp3-serving",
+                query={
+                    "gate_activation": "sigmoid",
+                    "qk_l2norm": True,
+                    "key_heads": 22,
+                    "value_heads": 22,
+                    "state_dtype": "float32",
+                    "max_seqs": max_seqs,
+                    "max_tokens": max_tokens,
+                    "state_index_columns": columns,
+                },
+                metadata={
+                    "decay_recipe": "kda",
+                    "model_id": "glm-5.3-flash-kda-tp3",
+                    "query_lengths": [columns] * max_seqs,
+                    "serving_mode": serving_mode,
+                    "source": "GLM-5.3 Flash KDA physical-66-head TP3 geometry",
+                },
+                label=f"glm-5.3-flash-kda-tp3-{serving_mode}",
+            )
+        )
+
     return tuple(cases)
 
 
@@ -907,6 +939,7 @@ __all__ = [
     "COMMON_SEQUENCE_CAPACITIES",
     "GDN_GEOMETRIES",
     "GDN_STATE_INDEX_COLUMNS",
+    "GLM53_TP3_KDA_SERVING_CASES",
     "GQA_GEOMETRIES",
     "MLA_GEOMETRIES",
     "QSA_GEOMETRIES",
