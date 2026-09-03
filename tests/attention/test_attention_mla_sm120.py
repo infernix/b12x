@@ -1380,6 +1380,7 @@ def _make_glm_sparse_scratch(device, *, topk, max_chunks, num_heads, s_kv):
     )
 
     caps = B12XSparseMLAScratchCaps(
+        softmax_scale=1.0,
         device=device,
         num_q_heads=num_heads,
         max_q_rows=1,
@@ -1627,6 +1628,7 @@ def test_unified_decode_glm_multitoken_per_token_length(num_tokens) -> None:
 
     n_chunks = (topk + 64 - 1) // 64
     caps = B12XSparseMLAScratchCaps(
+        softmax_scale=1.0,
         device=device,
         num_q_heads=_GLM_NUM_HEADS,
         max_q_rows=num_tokens,

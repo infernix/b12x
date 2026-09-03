@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 import torch
 
@@ -35,11 +37,14 @@ def _glm_next_plan_and_binding(
     *,
     device: torch.device,
     q: torch.Tensor,
+    cache: torch.Tensor,
     selected: torch.Tensor,
     active: torch.Tensor,
     cache_seqlens: torch.Tensor,
     mode: str = "decode",
     page_size: int = _GLM_NEXT_PAGE_SIZE,
+    return_lse: bool = False,
+    lse_scale: str = "base2",
 ):
     plan = sparse_mla.plan(
         sparse_mla.Caps(
@@ -48,6 +53,7 @@ def _glm_next_plan_and_binding(
             max_q_rows=int(q.shape[0]),
             max_batch=int(cache_seqlens.shape[0]),
             max_width=int(selected.shape[1]),
+            softmax_scale=_GLM_NEXT_SM_SCALE,
             max_kv_rows=max(int(active.max().item()), 1),
             kv_dtype=torch.uint8,
             head_dim=_GLM_NEXT_HEAD_DIM,
@@ -55,6 +61,8 @@ def _glm_next_plan_and_binding(
             page_size=page_size,
             model_type=ModelType.GLM_NEXT,
             mode=mode,
+            return_lse=return_lse,
+            lse_scale=lse_scale,
         )
     )
     spec = plan.scratch_specs()[0]
@@ -62,9 +70,10 @@ def _glm_next_plan_and_binding(
         plan,
         scratch=torch.empty(spec.shape, dtype=spec.dtype, device=device),
         q=q,
+        kv_cache=cache,
         selected_indices=selected,
-        cache_seqlens_int32=cache_seqlens,
-        nsa_cache_seqlens_int32=active,
+        cache_lengths=cache_seqlens,
+        selected_lengths=active,
     )
     return plan, binding
 
@@ -554,6 +563,7 @@ def test_glm_next_public_cpu_reference_path_preserves_model_identity() -> None:
             num_q_heads=heads,
             max_q_rows=rows,
             max_width=width,
+            softmax_scale=_GLM_NEXT_SM_SCALE,
             kv_dtype=torch.uint8,
             head_dim=512,
             v_head_dim=512,
@@ -562,20 +572,23 @@ def test_glm_next_public_cpu_reference_path_preserves_model_identity() -> None:
         )
     )
     spec = plan.scratch_specs()[0]
+    scratch = torch.full(spec.shape, 0xA5, dtype=spec.dtype)
+    before = scratch.clone()
     binding = sparse_mla.bind(
         plan,
-        scratch=torch.empty(spec.shape, dtype=spec.dtype),
+        scratch=scratch,
         q=q,
-        selected_indices=selected,
-        cache_seqlens_int32=cache_seqlens,
-        nsa_cache_seqlens_int32=active,
-    )
-
-    actual = sparse_mla.run_decode(
-        binding=binding,
         kv_cache=cache,
-        sm_scale=256**-0.5,
+        selected_indices=selected,
+        cache_lengths=cache_seqlens,
+        selected_lengths=active,
     )
+    torch.testing.assert_close(scratch, before)
+    assert tuple(inspect.signature(sparse_mla.run).parameters) == ("binding",)
+    assert "run_decode" not in sparse_mla.__all__
+    assert "run_extend" not in sparse_mla.__all__
+
+    actual = sparse_mla.run(binding)
     expected = sparse_mla_reference(
         q_all=q,
         kv_cache=cache,
@@ -589,20 +602,8 @@ def test_glm_next_public_cpu_reference_path_preserves_model_identity() -> None:
     assert sparse_mla.ModelType.GLM_NEXT == ModelType.GLM_NEXT
     assert callable(sparse_mla.compile_glm_next_mla_cache_writer)
     assert callable(sparse_mla.concat_and_cache_glm_next_mla)
-    with pytest.raises(ValueError, match="does not match its plan"):
-        sparse_mla.run_decode(
-            binding=binding,
-            kv_cache=cache,
-            sm_scale=256**-0.5,
-            model_type=ModelType.GLM_NSA,
-        )
-    with pytest.raises(ValueError, match="no RoPE cache payload"):
-        sparse_mla.run_decode(
-            binding=binding,
-            kv_cache=cache,
-            sm_scale=256**-0.5,
-            fp8_rope=True,
-        )
+    with pytest.raises(TypeError, match="binding must be sparse_mla.Binding"):
+        sparse_mla.run(binding.runtime)
 
 
 @pytest.mark.parametrize("container_width", [2051, 2112])
@@ -696,18 +697,14 @@ def test_glm_next_production_decode_matches_packed_record_oracle() -> None:
     _, binding = _glm_next_plan_and_binding(
         device=device,
         q=q,
+        cache=cache,
         selected=selected,
         active=active,
         cache_seqlens=cache_seqlens,
+        return_lse=True,
     )
 
-    actual, actual_lse = sparse_mla.run_decode(
-        binding=binding,
-        kv_cache=cache,
-        sm_scale=_GLM_NEXT_SM_SCALE,
-        return_lse=True,
-        forced_num_splits=2,
-    )
+    actual, actual_lse = sparse_mla.run(binding)
     expected, expected_lse = sparse_mla_reference(
         q_all=q,
         kv_cache=cache.view(num_records, 1, _GLM_NEXT_RECORD_BYTES),
@@ -775,20 +772,16 @@ def test_glm_next_hybrid_manager_page_replays_across_page_boundary() -> None:
     _, binding = _glm_next_plan_and_binding(
         device=device,
         q=q,
+        cache=cache,
         selected=selected,
         active=active,
         cache_seqlens=cache_seqlens,
         page_size=page_size,
-    )
-
-    actual, actual_lse = sparse_mla.run_decode(
-        binding=binding,
-        kv_cache=cache,
-        sm_scale=_GLM_NEXT_SM_SCALE,
         return_lse=True,
         lse_scale="natural",
-        forced_num_splits=1,
     )
+
+    actual, actual_lse = sparse_mla.run(binding)
     flat_cache = cache.contiguous().view(
         num_pages * page_size, 1, _GLM_NEXT_RECORD_BYTES
     )
@@ -811,14 +804,7 @@ def test_glm_next_hybrid_manager_page_replays_across_page_boundary() -> None:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
-        captured_output, captured_lse = sparse_mla.run_decode(
-            binding=binding,
-            kv_cache=cache,
-            sm_scale=_GLM_NEXT_SM_SCALE,
-            return_lse=True,
-            lse_scale="natural",
-            forced_num_splits=1,
-        )
+        captured_output, captured_lse = sparse_mla.run(binding)
     assert captured_output.data_ptr() == actual.data_ptr()
     assert captured_lse.data_ptr() == actual_lse.data_ptr()
 
@@ -916,18 +902,15 @@ def test_glm_next_production_prefill_2051_replays_without_allocation() -> None:
     _, binding = _glm_next_plan_and_binding(
         device=device,
         q=q,
+        cache=cache,
         selected=selected,
         active=active,
         cache_seqlens=cache_seqlens,
         mode="extend",
-    )
-
-    actual, actual_lse = sparse_mla.run_extend(
-        binding=binding,
-        kv_cache=cache,
-        sm_scale=_GLM_NEXT_SM_SCALE,
         return_lse=True,
     )
+
+    actual, actual_lse = sparse_mla.run(binding)
     expected, expected_lse = sparse_mla_reference(
         q_all=q,
         kv_cache=cache.view(num_records, 1, _GLM_NEXT_RECORD_BYTES),
@@ -941,19 +924,14 @@ def test_glm_next_production_prefill_2051_replays_without_allocation() -> None:
     _assert_glm_next_attention_close(actual, expected)
     torch.testing.assert_close(actual_lse, expected_lse, rtol=0.0, atol=0.05)
 
-    assert actual.data_ptr() == binding.scratch.output_buffer.data_ptr()
-    assert binding.scratch.final_lse is not None
-    assert actual_lse.data_ptr() == binding.scratch.final_lse.data_ptr()
+    assert actual.data_ptr() == binding.runtime.scratch.output_buffer.data_ptr()
+    assert binding.runtime.scratch.final_lse is not None
+    assert actual_lse.data_ptr() == binding.runtime.scratch.final_lse.data_ptr()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
-        captured_output, captured_lse = sparse_mla.run_extend(
-            binding=binding,
-            kv_cache=cache,
-            sm_scale=_GLM_NEXT_SM_SCALE,
-            return_lse=True,
-        )
+        captured_output, captured_lse = sparse_mla.run(binding)
     assert captured_output.data_ptr() == actual.data_ptr()
     assert captured_lse.data_ptr() == actual_lse.data_ptr()
 
@@ -1038,19 +1016,16 @@ def test_glm_next_tp4_hybrid_page_prefill_matches_oracle_and_replays() -> None:
     _, binding = _glm_next_plan_and_binding(
         device=device,
         q=q,
+        cache=cache,
         selected=selected,
         active=active,
         cache_seqlens=cache_seqlens,
         mode="extend",
         page_size=page_size,
-    )
-
-    actual, actual_lse = sparse_mla.run_extend(
-        binding=binding,
-        kv_cache=cache,
-        sm_scale=_GLM_NEXT_SM_SCALE,
         return_lse=True,
     )
+
+    actual, actual_lse = sparse_mla.run(binding)
     flat_cache = cache.contiguous().view(
         num_pages * page_size, 1, _GLM_NEXT_RECORD_BYTES
     )
@@ -1079,12 +1054,7 @@ def test_glm_next_tp4_hybrid_page_prefill_matches_oracle_and_replays() -> None:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
-        captured_output, captured_lse = sparse_mla.run_extend(
-            binding=binding,
-            kv_cache=cache,
-            sm_scale=_GLM_NEXT_SM_SCALE,
-            return_lse=True,
-        )
+        captured_output, captured_lse = sparse_mla.run(binding)
     assert captured_output.data_ptr() == actual.data_ptr()
     assert captured_lse.data_ptr() == actual_lse.data_ptr()
 
@@ -1190,16 +1160,12 @@ def test_glm_next_writer_and_reader_use_int64_for_live_high_page() -> None:
     _, binding = _glm_next_plan_and_binding(
         device=device,
         q=q,
+        cache=cache,
         selected=selected,
         active=active,
         cache_seqlens=cache_seqlens,
     )
-    actual = sparse_mla.run_decode(
-        binding=binding,
-        kv_cache=cache,
-        sm_scale=_GLM_NEXT_SM_SCALE,
-        forced_num_splits=1,
-    )
+    actual = sparse_mla.run(binding)
     expected_value = unpack_mla_kv_cache_reference(
         cache[high_page, local_slot].reshape(1, 1, _GLM_NEXT_RECORD_BYTES)
     )[0, 0]

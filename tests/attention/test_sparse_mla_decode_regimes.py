@@ -34,6 +34,7 @@ def _plan(device: torch.device, rows: int):
             num_q_heads=_HEADS,
             max_q_rows=rows,
             max_width=_WIDTH,
+            softmax_scale=_SM_SCALE,
             kv_dtype=torch.uint8,
         )
     )
@@ -105,13 +106,12 @@ def test_decode_padded_rows_and_short_lengths_match_reference(seed: int) -> None
         plan,
         scratch=scratch,
         q=q,
+        kv_cache=kv,
         selected_indices=selected,
-        cache_seqlens_int32=lengths,
-        nsa_cache_seqlens_int32=active,
+        cache_lengths=lengths,
+        selected_lengths=active,
     )
-    output = sparse_mla.run_decode(
-        binding=binding, kv_cache=kv, sm_scale=_SM_SCALE, v_head_dim=_V_DIM
-    )
+    output = sparse_mla.run(binding)
     torch.cuda.synchronize(device)
     _assert_matches_reference(output, q, kv, kv_rows, selected, active)
 
@@ -138,21 +138,18 @@ def test_decode_wide_plan_with_short_live_lengths_replays_under_graph() -> None:
         plan,
         scratch=scratch,
         q=q,
+        kv_cache=kv,
         selected_indices=selected,
-        cache_seqlens_int32=lengths,
-        nsa_cache_seqlens_int32=active,
+        cache_lengths=lengths,
+        selected_lengths=active,
     )
-    output = sparse_mla.run_decode(
-        binding=binding, kv_cache=kv, sm_scale=_SM_SCALE, v_head_dim=_V_DIM
-    )
+    output = sparse_mla.run(binding)
     torch.cuda.synchronize(device)
     _assert_matches_reference(output, q, kv, kv_rows, selected, active)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = sparse_mla.run_decode(
-            binding=binding, kv_cache=kv, sm_scale=_SM_SCALE, v_head_dim=_V_DIM
-        )
+        captured = sparse_mla.run(binding)
     # Replay with different live lengths written in place: no pointer, shape,
     # or plan changes.
     selected.copy_(selected_b.to(device))
