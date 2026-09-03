@@ -380,11 +380,13 @@ def run(
     return binding.output
 
 
-def prewarm(plan: Plan) -> None:
-    """Compile every kernel specialization of ``plan`` against fake pointers."""
-    from ._cute_kernels import prewarm_plan
+def prewarm(binding: Binding) -> None:
+    """Compile every kernel specialization of ``binding`` without launching."""
+    if not isinstance(binding, Binding):
+        raise TypeError("binding must be kda_prefill.Binding")
+    from ._cute_kernels import prewarm_binding
 
-    prewarm_plan(plan)
+    prewarm_binding(binding)
 
 
 __all__ = [

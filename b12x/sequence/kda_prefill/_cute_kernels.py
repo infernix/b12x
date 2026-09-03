@@ -20,17 +20,29 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Int32, Int64
+from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
-from b12x._lib.intrinsics import atomic_cas_global_i32, warp_reduce
+from b12x._lib.intrinsics import (
+    atomic_cas_global_i32,
+    bf16_mma_m16n8k16_f32,
+    ld_global_nc_v4_u32,
+    ld_shared_v4_u32,
+    ldmatrix_m8n8x4_b16,
+    ldmatrix_m8n8x4_trans_b16,
+    pack_f32x2_to_bfloat2,
+    shared_ptr_to_u32,
+    st_global_v4_u32,
+    st_shared_v4_u32,
+    warp_reduce,
+)
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
-from ._impl import MISC_RECORD_ELEMENTS, Binding, Plan
+from ._impl import MISC_RECORD_ELEMENTS, Binding
 
 _HEAD_DIM = 128
 _CHUNK = 16
@@ -40,6 +52,7 @@ _LOG2E = 1.4426950408889634
 
 _PROLOGUE_CACHE: dict[tuple, Callable[..., None]] = {}
 _PREPARE_CACHE: dict[tuple, Callable[..., None]] = {}
+_RECURRENCE_CACHE: dict[tuple, Callable[..., None]] = {}
 _WARMED: set[tuple] = set()
 
 
@@ -66,7 +79,7 @@ def _exp2_approx_ftz_f32(a: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def _pointer_address(ptr: cute.Pointer, offset: Int32, *, loc=None, ip=None) -> Int64:
+def _pointer_address(ptr: cute.Pointer, offset, *, loc=None, ip=None) -> Int64:
     """Return the global address of ``ptr[offset]`` as an Int64."""
     element = ptr + offset
     return Int64(llvm.ptrtoint(T.i64(), element.llvm_ptr, loc=loc, ip=ip))
@@ -369,9 +382,10 @@ class _PrologueKernel:
             tile_seq[tile] = Int32(-1)
             tile += Int32(_PROLOGUE_THREADS)
         cute.arch.sync_threads()
-        if thread == Int32(0):
-            code = flags[0] | (flags[1] << Int32(1)) | (flags[2] << Int32(2)) | (flags[3] << Int32(3))
-            error_code[Int32(0)] = code
+        if cutlass.const_expr(self.validate):
+            if thread == Int32(0):
+                code = flags[0] | (flags[1] << Int32(1)) | (flags[2] << Int32(2)) | (flags[3] << Int32(3))
+                error_code[Int32(0)] = code
 
 
 class _PrepareKernel:
@@ -668,6 +682,589 @@ class _PrepareKernel:
                 ws_inv[square_base + index.to(Int64)] = BFloat16(s_inv[index])
 
 
+class _RecurrenceKernel:
+    """Per (sequence, head, value split): walk the tiles with the state in registers.
+
+    The state ``S^T`` rows owned by a warp live in sixteen ``m16n8`` fp32
+    accumulator fragments (one per 8-column key block) plus a bf16 shadow
+    packed as eight k16 A-fragments. Every per-tile product is arranged so that
+    the previous accumulator is reused as the next A operand.
+    """
+
+    def __init__(
+        self,
+        *,
+        heads: int,
+        max_seqs: int,
+        v_split: int,
+        checkpoint_export: bool,
+        null_state_index: int | None,
+        index_type: type[cutlass.Numeric],
+    ) -> None:
+        self.heads = int(heads)
+        self.max_seqs = int(max_seqs)
+        self.v_split = int(v_split)
+        self.splits = _HEAD_DIM // self.v_split
+        self.warps = self.v_split // 16
+        self.threads = 32 * self.warps
+        self.checkpoint_export = bool(checkpoint_export)
+        self.has_null = null_state_index is not None
+        self.null_state_index = 0 if null_state_index is None else int(null_state_index)
+        self.index_type = index_type
+        self.v_chunks_per_row = self.v_split // 8
+
+    @cute.jit
+    def __call__(
+        self,
+        v: cute.Pointer,
+        cu_seqlens: cute.Pointer,
+        seq_tile_base: cute.Pointer,
+        seq_order: cute.Pointer,
+        initial_indices: cute.Pointer,
+        final_indices: cute.Pointer,
+        checkpoint_indices: cute.Pointer,
+        checkpoint_offsets: cute.Pointer,
+        num_seqs: cute.Pointer,
+        error_code: cute.Pointer,
+        ws_q: cute.Pointer,
+        ws_k: cute.Pointer,
+        ws_kr: cute.Pointer,
+        ws_misc: cute.Pointer,
+        ws_inv: cute.Pointer,
+        ws_mqk: cute.Pointer,
+        recurrent_state: cute.Pointer,
+        output: cute.Pointer,
+        v_stride: Int64,
+        out_stride: Int64,
+        slot_stride: Int64,
+        token_capacity: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            v, cu_seqlens, seq_tile_base, seq_order, initial_indices, final_indices,
+            checkpoint_indices, checkpoint_offsets, num_seqs, error_code, ws_q, ws_k,
+            ws_kr, ws_misc, ws_inv, ws_mqk, recurrent_state, output, v_stride, out_stride,
+            slot_stride, token_capacity,
+        ).launch(
+            grid=(self.heads * self.splits, self.max_seqs, 1),
+            block=(self.threads, 1, 1),
+            stream=stream,
+        )
+
+    @cute.jit
+    def _is_null(self, slot: Int64) -> cutlass.Boolean:
+        result = slot != slot
+        if cutlass.const_expr(self.has_null):
+            result = slot == Int64(self.null_state_index)
+        return result
+
+    @cute.jit
+    def _store_state(
+        self,
+        recurrent_state: cute.Pointer,
+        acc: cute.Tensor,
+        base: Int64,
+        row0: Int32,
+        row1: Int32,
+        tid: Int32,
+    ):
+        for nb in cutlass.range_constexpr(16):
+            kcol = Int32(nb * 8) + tid * Int32(2)
+            offset0 = base + row0.to(Int64) * Int64(_HEAD_DIM) + kcol.to(Int64)
+            offset1 = base + row1.to(Int64) * Int64(_HEAD_DIM) + kcol.to(Int64)
+            recurrent_state[offset0] = acc[nb, 0]
+            recurrent_state[offset0 + Int64(1)] = acc[nb, 1]
+            recurrent_state[offset1] = acc[nb, 2]
+            recurrent_state[offset1 + Int64(1)] = acc[nb, 3]
+
+    @cute.jit
+    def _refresh_shadow(self, acc: cute.Tensor, shadow: cute.Tensor):
+        for kb in cutlass.range_constexpr(8):
+            shadow[kb, 0] = pack_f32x2_to_bfloat2(acc[2 * kb, 0], acc[2 * kb, 1])
+            shadow[kb, 1] = pack_f32x2_to_bfloat2(acc[2 * kb, 2], acc[2 * kb, 3])
+            shadow[kb, 2] = pack_f32x2_to_bfloat2(acc[2 * kb + 1, 0], acc[2 * kb + 1, 1])
+            shadow[kb, 3] = pack_f32x2_to_bfloat2(acc[2 * kb + 1, 2], acc[2 * kb + 1, 3])
+
+    @cute.kernel
+    def kernel(
+        self,
+        v: cute.Pointer,
+        cu_seqlens: cute.Pointer,
+        seq_tile_base: cute.Pointer,
+        seq_order: cute.Pointer,
+        initial_indices: cute.Pointer,
+        final_indices: cute.Pointer,
+        checkpoint_indices: cute.Pointer,
+        checkpoint_offsets: cute.Pointer,
+        num_seqs: cute.Pointer,
+        error_code: cute.Pointer,
+        ws_q: cute.Pointer,
+        ws_k: cute.Pointer,
+        ws_kr: cute.Pointer,
+        ws_misc: cute.Pointer,
+        ws_inv: cute.Pointer,
+        ws_mqk: cute.Pointer,
+        recurrent_state: cute.Pointer,
+        output: cute.Pointer,
+        v_stride: Int64,
+        out_stride: Int64,
+        slot_stride: Int64,
+        token_capacity: Int32,
+    ):
+        bx, by, _ = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        thread = Int32(thread)
+        head = Int32(bx) // Int32(self.splits)
+        split = Int32(bx) % Int32(self.splits)
+        warp = thread // Int32(32)
+        lane = Int32(cute.arch.lane_idx())
+        gid = lane >> Int32(2)
+        tid = lane & Int32(3)
+        matrix = lane >> Int32(3)
+        matrix_row = lane & Int32(7)
+        error = error_code[Int32(0)].to(Int32)
+        live_seqs = num_seqs[Int32(0)].to(Int32)
+        vd = self.v_split
+        if error != Int32(0):
+            # Transactional failure: poison every output row of this CTA's
+            # value columns; no state is written.
+            if Int32(by) == Int32(0):
+                nan_pair = Uint32(0x7FC07FC0)
+                chunk = thread
+                while chunk < token_capacity * Int32(self.v_chunks_per_row):
+                    row = chunk // Int32(self.v_chunks_per_row)
+                    col_chunk = chunk % Int32(self.v_chunks_per_row)
+                    element = (
+                        row.to(Int64) * out_stride
+                        + head.to(Int64) * Int64(_HEAD_DIM)
+                        + (split * Int32(vd) + col_chunk * Int32(8)).to(Int64)
+                    )
+                    st_global_v4_u32(
+                        _pointer_address(output, element), nan_pair, nan_pair, nan_pair, nan_pair
+                    )
+                    chunk += Int32(self.threads)
+        elif Int32(by) < live_seqs:
+            seq = seq_order[Int32(by)].to(Int32)
+            start = cu_seqlens[seq].to(Int32)
+            end = cu_seqlens[seq + Int32(1)].to(Int32)
+            length = cutlass.max(Int32(0), end - start)
+            tiles = (length + Int32(_CHUNK - 1)) // Int32(_CHUNK)
+            base_tile = seq_tile_base[seq].to(Int32)
+            initial = Int64(initial_indices[seq])
+            final = Int64(final_indices[seq])
+            checkpoint = Int64(checkpoint_indices[seq])
+            offset = checkpoint_offsets[seq].to(Int32)
+
+            allocator = cutlass.utils.SmemAllocator()
+            tile_elements = _CHUNK * _HEAD_DIM
+            s_qt = allocator.allocate_tensor(
+                element_type=BFloat16,
+                layout=cute.make_layout((tile_elements,), stride=(1,)),
+                byte_alignment=128,
+            )
+            s_kt = allocator.allocate_tensor(
+                element_type=BFloat16,
+                layout=cute.make_layout((tile_elements,), stride=(1,)),
+                byte_alignment=128,
+            )
+            s_kr = allocator.allocate_tensor(
+                element_type=BFloat16,
+                layout=cute.make_layout((tile_elements,), stride=(1,)),
+                byte_alignment=128,
+            )
+            s_inv = allocator.allocate_tensor(
+                element_type=BFloat16,
+                layout=cute.make_layout((_CHUNK * _CHUNK,), stride=(1,)),
+                byte_alignment=128,
+            )
+            s_mqk = allocator.allocate_tensor(
+                element_type=BFloat16,
+                layout=cute.make_layout((_CHUNK * _CHUNK,), stride=(1,)),
+                byte_alignment=128,
+            )
+            s_v = allocator.allocate_tensor(
+                element_type=BFloat16,
+                layout=cute.make_layout((_CHUNK * vd,), stride=(1,)),
+                byte_alignment=128,
+            )
+            s_out = allocator.allocate_tensor(
+                element_type=BFloat16,
+                layout=cute.make_layout((_CHUNK * vd,), stride=(1,)),
+                byte_alignment=128,
+            )
+            s_lam = allocator.allocate_tensor(
+                element_type=Float32,
+                layout=cute.make_layout((_HEAD_DIM,), stride=(1,)),
+                byte_alignment=128,
+            )
+            s_beta = allocator.allocate_tensor(
+                element_type=Float32,
+                layout=cute.make_layout((_CHUNK,), stride=(1,)),
+                byte_alignment=128,
+            )
+            qt_addr = shared_ptr_to_u32(s_qt.iterator)
+            kt_addr = shared_ptr_to_u32(s_kt.iterator)
+            kr_addr = shared_ptr_to_u32(s_kr.iterator)
+            inv_addr = shared_ptr_to_u32(s_inv.iterator)
+            mqk_addr = shared_ptr_to_u32(s_mqk.iterator)
+            v_addr = shared_ptr_to_u32(s_v.iterator)
+            out_addr = shared_ptr_to_u32(s_out.iterator)
+            lam_addr = shared_ptr_to_u32(s_lam.iterator)
+            beta_addr = shared_ptr_to_u32(s_beta.iterator)
+
+            # State fragments: rows row0/row1 of this head's [V, K] slab.
+            row_local0 = warp * Int32(16) + gid
+            row_local1 = row_local0 + Int32(8)
+            row0 = split * Int32(vd) + row_local0
+            row1 = row0 + Int32(8)
+            head_base = head.to(Int64) * Int64(_HEAD_DIM * _HEAD_DIM)
+            acc = cute.make_rmem_tensor((16, 4), Float32)
+            shadow = cute.make_rmem_tensor((8, 4), Uint32)
+            for nb in cutlass.range_constexpr(16):
+                acc[nb, 0] = Float32(0.0)
+                acc[nb, 1] = Float32(0.0)
+                acc[nb, 2] = Float32(0.0)
+                acc[nb, 3] = Float32(0.0)
+            if not self._is_null(initial):
+                base = initial * slot_stride + head_base
+                for nb in cutlass.range_constexpr(16):
+                    kcol = Int32(nb * 8) + tid * Int32(2)
+                    offset0 = base + row0.to(Int64) * Int64(_HEAD_DIM) + kcol.to(Int64)
+                    offset1 = base + row1.to(Int64) * Int64(_HEAD_DIM) + kcol.to(Int64)
+                    acc[nb, 0] = Float32(recurrent_state[offset0])
+                    acc[nb, 1] = Float32(recurrent_state[offset0 + Int64(1)])
+                    acc[nb, 2] = Float32(recurrent_state[offset1])
+                    acc[nb, 3] = Float32(recurrent_state[offset1 + Int64(1)])
+            self._refresh_shadow(acc, shadow)
+
+            v_chunks = self.v_chunks_per_row
+            v_chunk_total = _CHUNK * v_chunks
+            for local in cutlass.range(tiles, unroll=1):
+                tile = base_tile + local
+                record = tile.to(Int64) * Int64(self.heads) + head.to(Int64)
+                tile_base = record * Int64(tile_elements)
+                square_base = record * Int64(_CHUNK * _CHUNK)
+                misc_base = record * Int64(MISC_RECORD_ELEMENTS)
+                token_base = start + local * Int32(_CHUNK)
+                rows_live = cutlass.min(Int32(_CHUNK), end - token_base)
+
+                # Stage the tile: three swizzled operand tiles (256 chunks of
+                # 16 bytes each), INV and Mqk (32 chunks each), lambda_c and
+                # beta (36 chunks), and the value rows (zero past the tail).
+                chunk = thread
+                while chunk < Int32(3 * 256 + 64 + 36):
+                    if chunk < Int32(256):
+                        c0, c1, c2, c3 = ld_global_nc_v4_u32(
+                            _pointer_address(ws_q, tile_base + chunk.to(Int64) * Int64(8))
+                        )
+                        st_shared_v4_u32(qt_addr + chunk * Int32(16), c0, c1, c2, c3)
+                    elif chunk < Int32(512):
+                        local_chunk = chunk - Int32(256)
+                        c0, c1, c2, c3 = ld_global_nc_v4_u32(
+                            _pointer_address(ws_k, tile_base + local_chunk.to(Int64) * Int64(8))
+                        )
+                        st_shared_v4_u32(kt_addr + local_chunk * Int32(16), c0, c1, c2, c3)
+                    elif chunk < Int32(768):
+                        local_chunk = chunk - Int32(512)
+                        c0, c1, c2, c3 = ld_global_nc_v4_u32(
+                            _pointer_address(ws_kr, tile_base + local_chunk.to(Int64) * Int64(8))
+                        )
+                        st_shared_v4_u32(kr_addr + local_chunk * Int32(16), c0, c1, c2, c3)
+                    elif chunk < Int32(800):
+                        local_chunk = chunk - Int32(768)
+                        c0, c1, c2, c3 = ld_global_nc_v4_u32(
+                            _pointer_address(ws_inv, square_base + local_chunk.to(Int64) * Int64(8))
+                        )
+                        st_shared_v4_u32(inv_addr + local_chunk * Int32(16), c0, c1, c2, c3)
+                    elif chunk < Int32(832):
+                        local_chunk = chunk - Int32(800)
+                        c0, c1, c2, c3 = ld_global_nc_v4_u32(
+                            _pointer_address(ws_mqk, square_base + local_chunk.to(Int64) * Int64(8))
+                        )
+                        st_shared_v4_u32(mqk_addr + local_chunk * Int32(16), c0, c1, c2, c3)
+                    elif chunk < Int32(864):
+                        local_chunk = chunk - Int32(832)
+                        c0, c1, c2, c3 = ld_global_nc_v4_u32(
+                            _pointer_address(ws_misc, misc_base + local_chunk.to(Int64) * Int64(4))
+                        )
+                        st_shared_v4_u32(lam_addr + local_chunk * Int32(16), c0, c1, c2, c3)
+                    else:
+                        local_chunk = chunk - Int32(864)
+                        c0, c1, c2, c3 = ld_global_nc_v4_u32(
+                            _pointer_address(
+                                ws_misc, misc_base + Int64(_HEAD_DIM) + local_chunk.to(Int64) * Int64(4)
+                            )
+                        )
+                        st_shared_v4_u32(beta_addr + local_chunk * Int32(16), c0, c1, c2, c3)
+                    chunk += Int32(self.threads)
+                chunk = thread
+                while chunk < Int32(v_chunk_total):
+                    row = chunk // Int32(v_chunks)
+                    col_chunk = chunk % Int32(v_chunks)
+                    c0 = Uint32(0)
+                    c1 = Uint32(0)
+                    c2 = Uint32(0)
+                    c3 = Uint32(0)
+                    if row < rows_live:
+                        element = (
+                            (token_base + row).to(Int64) * v_stride
+                            + head.to(Int64) * Int64(_HEAD_DIM)
+                            + (split * Int32(vd) + col_chunk * Int32(8)).to(Int64)
+                        )
+                        c0, c1, c2, c3 = ld_global_nc_v4_u32(_pointer_address(v, element))
+                    st_shared_v4_u32(v_addr + chunk * Int32(16), c0, c1, c2, c3)
+                    chunk += Int32(self.threads)
+                cute.arch.sync_threads()
+
+                # Phase A: v'^T = v^T - S^T k~^T, scaled by beta per token column.
+                vp = cute.make_rmem_tensor((2, 4), Float32)
+                for half in cutlass.range_constexpr(2):
+                    for item in cutlass.range_constexpr(4):
+                        vp[half, item] = Float32(0.0)
+                for kb in cutlass.range_constexpr(8):
+                    tok = (matrix >> Int32(1)) * Int32(8) + matrix_row
+                    logical_chunk = Int32(kb * 2) + (matrix & Int32(1))
+                    physical = logical_chunk ^ (tok & Int32(7))
+                    b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(
+                        kt_addr + tok * Int32(256) + physical * Int32(16)
+                    )
+                    vp[0, 0], vp[0, 1], vp[0, 2], vp[0, 3] = bf16_mma_m16n8k16_f32(
+                        vp[0, 0], vp[0, 1], vp[0, 2], vp[0, 3],
+                        shadow[kb, 0], shadow[kb, 1], shadow[kb, 2], shadow[kb, 3], b0, b1,
+                    )
+                    vp[1, 0], vp[1, 1], vp[1, 2], vp[1, 3] = bf16_mma_m16n8k16_f32(
+                        vp[1, 0], vp[1, 1], vp[1, 2], vp[1, 3],
+                        shadow[kb, 0], shadow[kb, 1], shadow[kb, 2], shadow[kb, 3], b2, b3,
+                    )
+                for half in cutlass.range_constexpr(2):
+                    tok0 = Int32(half * 8) + tid * Int32(2)
+                    tok1 = tok0 + Int32(1)
+                    beta0 = s_beta[tok0]
+                    beta1 = s_beta[tok1]
+                    vp[half, 0] = (Float32(s_v[tok0 * Int32(vd) + row_local0]) - vp[half, 0]) * beta0
+                    vp[half, 1] = (Float32(s_v[tok1 * Int32(vd) + row_local0]) - vp[half, 1]) * beta1
+                    vp[half, 2] = (Float32(s_v[tok0 * Int32(vd) + row_local1]) - vp[half, 2]) * beta0
+                    vp[half, 3] = (Float32(s_v[tok1 * Int32(vd) + row_local1]) - vp[half, 3]) * beta1
+                a_vp0 = pack_f32x2_to_bfloat2(vp[0, 0], vp[0, 1])
+                a_vp1 = pack_f32x2_to_bfloat2(vp[0, 2], vp[0, 3])
+                a_vp2 = pack_f32x2_to_bfloat2(vp[1, 0], vp[1, 1])
+                a_vp3 = pack_f32x2_to_bfloat2(vp[1, 2], vp[1, 3])
+
+                # Phase B: U^T = v'^T INV^T.
+                square_row = (matrix >> Int32(1)) * Int32(8) + matrix_row
+                square_addr = square_row * Int32(32) + (matrix & Int32(1)) * Int32(16)
+                b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(inv_addr + square_addr)
+                u = cute.make_rmem_tensor((2, 4), Float32)
+                u[0, 0], u[0, 1], u[0, 2], u[0, 3] = bf16_mma_m16n8k16_f32(
+                    Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0),
+                    a_vp0, a_vp1, a_vp2, a_vp3, b0, b1,
+                )
+                u[1, 0], u[1, 1], u[1, 2], u[1, 3] = bf16_mma_m16n8k16_f32(
+                    Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0),
+                    a_vp0, a_vp1, a_vp2, a_vp3, b2, b3,
+                )
+                a_u0 = pack_f32x2_to_bfloat2(u[0, 0], u[0, 1])
+                a_u1 = pack_f32x2_to_bfloat2(u[0, 2], u[0, 3])
+                a_u2 = pack_f32x2_to_bfloat2(u[1, 0], u[1, 1])
+                a_u3 = pack_f32x2_to_bfloat2(u[1, 2], u[1, 3])
+
+                # Phase C: out^T = S^T q~^T + U^T Mqk^T.
+                out = cute.make_rmem_tensor((2, 4), Float32)
+                for half in cutlass.range_constexpr(2):
+                    for item in cutlass.range_constexpr(4):
+                        out[half, item] = Float32(0.0)
+                for kb in cutlass.range_constexpr(8):
+                    tok = (matrix >> Int32(1)) * Int32(8) + matrix_row
+                    logical_chunk = Int32(kb * 2) + (matrix & Int32(1))
+                    physical = logical_chunk ^ (tok & Int32(7))
+                    b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(
+                        qt_addr + tok * Int32(256) + physical * Int32(16)
+                    )
+                    out[0, 0], out[0, 1], out[0, 2], out[0, 3] = bf16_mma_m16n8k16_f32(
+                        out[0, 0], out[0, 1], out[0, 2], out[0, 3],
+                        shadow[kb, 0], shadow[kb, 1], shadow[kb, 2], shadow[kb, 3], b0, b1,
+                    )
+                    out[1, 0], out[1, 1], out[1, 2], out[1, 3] = bf16_mma_m16n8k16_f32(
+                        out[1, 0], out[1, 1], out[1, 2], out[1, 3],
+                        shadow[kb, 0], shadow[kb, 1], shadow[kb, 2], shadow[kb, 3], b2, b3,
+                    )
+                b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(mqk_addr + square_addr)
+                out[0, 0], out[0, 1], out[0, 2], out[0, 3] = bf16_mma_m16n8k16_f32(
+                    out[0, 0], out[0, 1], out[0, 2], out[0, 3], a_u0, a_u1, a_u2, a_u3, b0, b1,
+                )
+                out[1, 0], out[1, 1], out[1, 2], out[1, 3] = bf16_mma_m16n8k16_f32(
+                    out[1, 0], out[1, 1], out[1, 2], out[1, 3], a_u0, a_u1, a_u2, a_u3, b2, b3,
+                )
+                for half in cutlass.range_constexpr(2):
+                    tok0 = Int32(half * 8) + tid * Int32(2)
+                    tok1 = tok0 + Int32(1)
+                    s_out[tok0 * Int32(vd) + row_local0] = BFloat16(out[half, 0])
+                    s_out[tok1 * Int32(vd) + row_local0] = BFloat16(out[half, 1])
+                    s_out[tok0 * Int32(vd) + row_local1] = BFloat16(out[half, 2])
+                    s_out[tok1 * Int32(vd) + row_local1] = BFloat16(out[half, 3])
+
+                # Phase D: S^T <- S^T * lambda_c[k] + U^T k_r.
+                for nb in cutlass.range_constexpr(16):
+                    kcol = Int32(nb * 8) + tid * Int32(2)
+                    lam0 = s_lam[kcol]
+                    lam1 = s_lam[kcol + Int32(1)]
+                    acc[nb, 0] = acc[nb, 0] * lam0
+                    acc[nb, 1] = acc[nb, 1] * lam1
+                    acc[nb, 2] = acc[nb, 2] * lam0
+                    acc[nb, 3] = acc[nb, 3] * lam1
+                for pair in cutlass.range_constexpr(8):
+                    tok = (matrix & Int32(1)) * Int32(8) + matrix_row
+                    logical_chunk = Int32(pair * 2) + (matrix >> Int32(1))
+                    physical = logical_chunk ^ (tok & Int32(7))
+                    b0, b1, b2, b3 = ldmatrix_m8n8x4_trans_b16(
+                        kr_addr + tok * Int32(256) + physical * Int32(16)
+                    )
+                    acc[2 * pair, 0], acc[2 * pair, 1], acc[2 * pair, 2], acc[2 * pair, 3] = (
+                        bf16_mma_m16n8k16_f32(
+                            acc[2 * pair, 0], acc[2 * pair, 1], acc[2 * pair, 2], acc[2 * pair, 3],
+                            a_u0, a_u1, a_u2, a_u3, b0, b1,
+                        )
+                    )
+                    (
+                        acc[2 * pair + 1, 0],
+                        acc[2 * pair + 1, 1],
+                        acc[2 * pair + 1, 2],
+                        acc[2 * pair + 1, 3],
+                    ) = bf16_mma_m16n8k16_f32(
+                        acc[2 * pair + 1, 0], acc[2 * pair + 1, 1],
+                        acc[2 * pair + 1, 2], acc[2 * pair + 1, 3],
+                        a_u0, a_u1, a_u2, a_u3, b2, b3,
+                    )
+                self._refresh_shadow(acc, shadow)
+                cute.arch.sync_threads()
+
+                # Store the live output rows of this tile.
+                chunk = thread
+                while chunk < Int32(v_chunk_total):
+                    row = chunk // Int32(v_chunks)
+                    col_chunk = chunk % Int32(v_chunks)
+                    if row < rows_live:
+                        c0, c1, c2, c3 = ld_shared_v4_u32(out_addr + chunk * Int32(16))
+                        element = (
+                            (token_base + row).to(Int64) * out_stride
+                            + head.to(Int64) * Int64(_HEAD_DIM)
+                            + (split * Int32(vd) + col_chunk * Int32(8)).to(Int64)
+                        )
+                        st_global_v4_u32(_pointer_address(output, element), c0, c1, c2, c3)
+                    chunk += Int32(self.threads)
+                if cutlass.const_expr(self.checkpoint_export):
+                    if (offset > Int32(0)) & ((local + Int32(1)) * Int32(_CHUNK) == offset):
+                        if not self._is_null(checkpoint):
+                            self._store_state(
+                                recurrent_state, acc, checkpoint * slot_stride + head_base,
+                                row0, row1, tid,
+                            )
+                cute.arch.sync_threads()
+            if not self._is_null(final):
+                self._store_state(recurrent_state, acc, final * slot_stride + head_base, row0, row1, tid)
+
+
+def _recurrence_key(binding: Binding) -> tuple[object, ...]:
+    caps = binding.plan.caps
+    return (
+        "recurrence",
+        binding.output.device.index,
+        caps.heads,
+        caps.max_seqs,
+        binding.plan.v_split,
+        caps.checkpoint_export,
+        caps.null_state_index,
+        binding.initial_state_indices.dtype,
+    )
+
+
+def _compile_recurrence(binding: Binding) -> tuple[tuple[object, ...], Callable[..., None]]:
+    key = _recurrence_key(binding)
+    cached = _RECURRENCE_CACHE.get(key)
+    if cached is not None:
+        return key, cached
+    caps = binding.plan.caps
+    index_type = _numeric_type(binding.initial_state_indices.dtype)
+    kernel = _RecurrenceKernel(
+        heads=caps.heads,
+        max_seqs=caps.max_seqs,
+        v_split=binding.plan.v_split,
+        checkpoint_export=caps.checkpoint_export,
+        null_state_index=caps.null_state_index,
+        index_type=index_type,
+    )
+    raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=key)
+    raw = b12x_compile(
+        kernel,
+        _fake_pointer(BFloat16),
+        _fake_pointer(Int32),
+        _fake_pointer(Int32),
+        _fake_pointer(Int32),
+        _fake_pointer(index_type),
+        _fake_pointer(index_type),
+        _fake_pointer(index_type),
+        _fake_pointer(Int32),
+        _fake_pointer(Int32),
+        _fake_pointer(Int32),
+        _fake_pointer(BFloat16),
+        _fake_pointer(BFloat16),
+        _fake_pointer(BFloat16),
+        _fake_pointer(Float32),
+        _fake_pointer(BFloat16),
+        _fake_pointer(BFloat16),
+        _fake_pointer(Float32),
+        _fake_pointer(BFloat16),
+        Int64(1),
+        Int64(1),
+        Int64(1),
+        Int32(1),
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key("sequence.kda_prefill.recurrence", 1, key),
+    )
+
+    def launch(active: Binding) -> None:
+        if _recurrence_key(active) != key:
+            raise ValueError("compiled KDA recurrence kernel does not match the binding")
+        raw(
+            _pointer(active.v, BFloat16),
+            _pointer(active.cu_seqlens, Int32),
+            _pointer(active.seq_tile_base, Int32),
+            _pointer(active.seq_order, Int32),
+            _pointer(active.initial_state_indices, index_type),
+            _pointer(active.final_state_indices, index_type),
+            _pointer(active.checkpoint_state_indices, index_type),
+            _pointer(active.checkpoint_offsets, Int32),
+            _pointer(active.num_seqs, Int32),
+            _pointer(active.error_code, Int32),
+            _pointer(active.ws_q, BFloat16),
+            _pointer(active.ws_k, BFloat16),
+            _pointer(active.ws_kr, BFloat16),
+            _pointer(active.ws_misc, Float32),
+            _pointer(active.ws_inv, BFloat16),
+            _pointer(active.ws_mqk, BFloat16),
+            _pointer(active.recurrent_state, Float32),
+            _pointer(active.output, BFloat16),
+            int(active.v.stride(0)),
+            int(active.output.stride(0)),
+            int(active.recurrent_state.stride(0)),
+            int(active.token_capacity),
+            current_cuda_stream(),
+        )
+
+    _RECURRENCE_CACHE[key] = launch
+    return key, launch
+
+
+def run_recurrence(binding: Binding) -> None:
+    """Walk every live sequence's tiles (stage 2); requires stages 0 and 1."""
+    with torch.cuda.device(binding.output.device):
+        _launch_stage(
+            lambda b: (_recurrence_key(b), _RECURRENCE_CACHE.get(_recurrence_key(b))),
+            _compile_recurrence,
+            binding,
+        )
+
+
 def _prologue_key(binding: Binding) -> tuple[object, ...]:
     caps = binding.plan.caps
     return (
@@ -879,11 +1476,17 @@ def run_prepare(binding: Binding, *, lower_bound: float, scale: float, eps: floa
 def run_prefill(binding: Binding, *, lower_bound: float, scale: float, eps: float) -> None:
     run_prologue(binding)
     run_prepare(binding, lower_bound=lower_bound, scale=scale, eps=eps)
-    raise NotImplementedError("the KDA prefill recurrence kernel is not implemented yet")
+    run_recurrence(binding)
 
 
-def prewarm_plan(plan: Plan) -> None:
-    raise NotImplementedError("prewarm requires the recurrence kernel")
+def prewarm_binding(binding: Binding) -> None:
+    """Compile the three stages for ``binding`` without launching them."""
+    with torch.cuda.device(binding.output.device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("KDA prefill compilation is forbidden during CUDA capture")
+        _compile_prologue(binding)
+        _compile_prepare(binding)
+        _compile_recurrence(binding)
 
 
 def workspace_tiles(binding: Binding) -> dict[str, torch.Tensor]:
@@ -911,15 +1514,17 @@ def workspace_tiles(binding: Binding) -> dict[str, torch.Tensor]:
 def clear_caches() -> None:
     _PROLOGUE_CACHE.clear()
     _PREPARE_CACHE.clear()
+    _RECURRENCE_CACHE.clear()
     _WARMED.clear()
 
 
 __all__ = [
     "clear_caches",
-    "prewarm_plan",
+    "prewarm_binding",
     "run_prefill",
     "run_prepare",
     "run_prologue",
+    "run_recurrence",
     "swizzled_column",
     "workspace_tiles",
 ]
