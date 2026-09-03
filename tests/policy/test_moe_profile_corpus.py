@@ -198,6 +198,35 @@ def test_nondivisible_tp_shards_share_one_padded_physical_geometry() -> None:
     assert alias.logical_intermediate_sizes == (213, 214)
     assert geometry.intermediate_size == 224
 
+def test_glm53_flash_tp3_uses_model_specific_n704_without_global_alignment() -> None:
+    modelopt = next(
+        recipe for recipe in MOE_RECIPES if recipe.recipe_id == "modelopt-nvfp4"
+    )
+    assert modelopt.intermediate_alignment == 16
+
+    matches = [
+        (geometry, alias)
+        for geometry in expand_physical_geometries()
+        for alias in geometry.aliases
+        if alias.model_id == "glm-5.3-flash"
+        and alias.tp_size in (3, 4)
+        and geometry.recipe.recipe_id == "modelopt-nvfp4"
+    ]
+    assert len(matches) == 2
+    by_tp = {alias.tp_size: (geometry, alias) for geometry, alias in matches}
+
+    tp3_geometry, tp3_alias = by_tp[3]
+    assert tp3_alias.logical_intermediate_sizes == (682, 683)
+    assert tp3_alias.physical_intermediate_size == 704
+    assert tp3_alias.padding_per_tp_group == 64
+    assert tp3_geometry.intermediate_size == 704
+
+    tp4_geometry, tp4_alias = by_tp[4]
+    assert tp4_alias.logical_intermediate_sizes == (512,)
+    assert tp4_alias.physical_intermediate_size == 512
+    assert tp4_alias.padding_per_tp_group == 0
+    assert tp4_geometry.intermediate_size == 512
+
 
 def test_sweep_deduplicates_model_aliases_before_crossing_runtime_axes() -> None:
     recipe = MoeRecipe(
