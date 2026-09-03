@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import math
 from collections.abc import Sequence
@@ -13,7 +14,8 @@ from b12x.policy.generation.contracts import (
     GenerationContext,
     WorkEstimate,
 )
-from b12x.policy.generation.reducer import DecisionRecord, decision_node_to_dict
+from b12x.policy.generation.reducer import decision_node_to_dict
+from b12x.policy.types import DecisionNode, ProfileLeaf
 from b12x.policy.generation.sweep import (
     DiscreteSweepGenerator,
     SweepCandidate,
@@ -910,6 +912,33 @@ class DsaIndexerMergeGenerator(DiscreteSweepGenerator):
         )
 
 
+# Name of the planner leaf that carries the qualified production config, shared
+# with the single-leaf planners that qualification-only generators emit.
+_QUALIFIED_LEAF_NAME = "measured-production-implementation"
+
+
+def _with_default_leaf(node: DecisionNode, default: ProfileLeaf) -> DecisionNode:
+    """Attach ``default`` to every branching node of a raced planner.
+
+    A lookup consults a node's default only when none of that node's branch
+    values match, so a default at the root alone would not cover a query that
+    matches the root but misses deeper (for example a row count between two
+    raced anchors). Attaching the same leaf at every level makes every query
+    outside the raced points resolve to the qualified production config.
+    """
+    if isinstance(node, ProfileLeaf):
+        return node
+    if node.default is not None:
+        raise ValueError("raced planner already carries a default leaf")
+    return dataclasses.replace(
+        node,
+        branches=tuple(
+            (value, _with_default_leaf(child, default)) for value, child in node.branches
+        ),
+        default=default,
+    )
+
+
 class DsaIndexerProfileGenerator:
     """Profile generator for the DSA indexer component.
 
@@ -917,9 +946,10 @@ class DsaIndexerProfileGenerator:
     :class:`~b12x.policy.generation.providers.qualification.DsaIndexerGenerator`
     and races the fused route's cross-CTA merge arm through
     :class:`DsaIndexerMergeGenerator`. The emitted planner pins the raced
-    ``fused_merge`` winner at each raced decode query point (with the row
-    count as a nearest-anchor range axis) and keeps the qualified production
-    config for every other reviewed query.
+    ``fused_merge`` winner at each raced decode query point and carries the
+    qualified production config as its default leaf, so every other query the
+    profile receives resolves preplanned to the qualified config exactly as a
+    single-leaf qualification planner would.
     """
 
     def __init__(self) -> None:
@@ -963,27 +993,23 @@ class DsaIndexerProfileGenerator:
         progress,
         checkpoints,
     ) -> ComponentGenerationResult:
-        from b12x.attention.dsa_indexer._policy import DSA_INDEXER_POLICY
-
         qualification = self._qualification.qualify(
             context, progress=progress, checkpoints=checkpoints
         )
         race = self._race.race(context, progress=progress, checkpoints=checkpoints)
-        fields = _DSA_INDEXER_QUERY_FIELDS
-        records = list(race.records)
-        raced_points = {tuple(record.query[f] for f in fields) for record in records}
-        for query in self._qualification.reviewed_queries():
-            encoded = DSA_INDEXER_POLICY.encode_query(query)
-            if tuple(encoded[f] for f in fields) in raced_points:
-                continue
-            records.append(
-                DecisionRecord.create(query=encoded, config=qualification.encoded_config)
-            )
+        records = tuple(race.records)
+        if not records:
+            raise ValueError("the fused merge race produced no decision records")
+        default_leaf = ProfileLeaf.create(
+            name=_QUALIFIED_LEAF_NAME,
+            config=qualification.encoded_config,
+        )
         coverage = dict(race.coverage)
         coverage.update(
             {
                 "qualified_runtime_queries": len(self._qualification.reviewed_queries()),
-                "runtime_query_points": len(records),
+                "raced_query_points": len(records),
+                "default": _QUALIFIED_LEAF_NAME,
             }
         )
         return ComponentGenerationResult(
@@ -992,7 +1018,9 @@ class DsaIndexerProfileGenerator:
                 "query_schema_version": self.query_schema_version,
                 "config_schema_version": self.config_schema_version,
                 "coverage": coverage,
-                "planner": decision_node_to_dict(self._race.build_planner(records)),
+                "planner": decision_node_to_dict(
+                    _with_default_leaf(self._race.build_planner(records), default_leaf)
+                ),
             },
             evidence={
                 "selection": "production_qualification_plus_fused_merge_race",

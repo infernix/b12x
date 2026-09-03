@@ -961,12 +961,12 @@ def test_fused_indexer_cooperative_pack_path_pads_absent_slots_across_launches()
 
 def test_dsa_indexer_profile_generator_merges_qualification_and_race(monkeypatch) -> None:
     """The composite pins raced winners and keeps the qualified config elsewhere."""
-    import json
     from types import SimpleNamespace
 
     from b12x.attention.dsa_indexer._policy import DSA_INDEXER_POLICY
     from b12x.policy.generation.reducer import DecisionRecord
     from b12x.policy.generation.providers.tunable import DsaIndexerProfileGenerator
+    from b12x.policy.serialization import _planner_node
     from b12x.policy.types import FrozenMapping
 
     generator = DsaIndexerProfileGenerator()
@@ -996,7 +996,18 @@ def test_dsa_indexer_profile_generator_merges_qualification_and_race(monkeypatch
     result = generator.generate(context=None, progress=None, checkpoints=None)
     assert result.evidence["gpu_measurement_cases"] == 5
     assert result.completed_work_units == 12
-    assert result.component["coverage"]["runtime_query_points"] == len(queries)
-    planner = json.dumps(result.component["planner"], sort_keys=True)
-    assert '"fused_merge": "serial"' in planner
-    assert '"fused_merge": "auto"' in planner
+    coverage = result.component["coverage"]
+    assert coverage["qualified_runtime_queries"] == len(queries)
+    assert coverage["raced_query_points"] == 1
+    planner = _planner_node(result.component["planner"], name="planner")
+    assert planner.lookup(raced_query).config.to_dict() == dict(race_config)
+    # Row counts between raced anchors and unraced layouts take the default
+    # leaf at whichever depth the lookup misses.
+    unraced_rows = dict(raced_query)
+    unraced_rows["max_q_rows"] = int(raced_query["max_q_rows"]) + 1
+    contiguous = dict(raced_query)
+    contiguous["source_layout"] = "contiguous"
+    for query in (unraced_rows, contiguous):
+        leaf = planner.lookup(query)
+        assert leaf is not None and leaf.name == "measured-production-implementation"
+        assert leaf.config.to_dict() == dict(qualified)
