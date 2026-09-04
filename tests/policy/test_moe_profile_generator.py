@@ -4,7 +4,7 @@ import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import pytest
@@ -145,6 +145,44 @@ def test_rtx_profile_resolves_qualified_glm53_tp3_n704_geometry(
     hit = component.lookup(query)
     assert hit is not None
     assert _config_covers_query(query, hit.config)
+
+
+def test_context_corpus_matches_equivalent_physical_geometry_keys(tmp_path) -> None:
+    profile_id = "nvidia.rtx.pro.6000.blackwell"
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.intermediate_size == 704
+        and geometry.profile_ids == (profile_id,)
+        and any(
+            alias.model_id == "glm-5.3-flash" and alias.tp_size == 3
+            for alias in geometry.aliases
+        )
+    )
+    case_geometry = replace(geometry, aliases=(), profile_ids=())
+    cases = expand_sweep_cases(
+        geometries=(case_geometry,),
+        top_ks=(8,),
+        token_counts=(1,),
+    )
+    generator = MoeDecodeGenerator(
+        benchmark_factory=_Factory([]),
+        geometries=(geometry,),
+        cases=cases,
+    )
+    context = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="abc123",
+        settings=GenerationSettings(),
+        profile_id=profile_id,
+    )
+
+    selected_geometries, selected_cases = generator._corpus_for_context(context)
+
+    assert selected_geometries == (geometry,)
+    assert selected_cases == cases
 
 
 def test_rtx_generator_reproduces_profiled_glm53_tp3_n704_geometry(

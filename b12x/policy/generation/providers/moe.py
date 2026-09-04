@@ -536,8 +536,10 @@ class MoeDecodeGenerator:
             for geometry in self._geometries
             if geometry.applies_to_profile(context.profile_id)
         )
-        applicable = frozenset(geometries)
-        cases = tuple(case for case in self._cases if case.geometry in applicable)
+        applicable_keys = frozenset(geometry.key for geometry in geometries)
+        cases = tuple(
+            case for case in self._cases if case.geometry.key in applicable_keys
+        )
         return geometries, cases
 
     def estimate(self, context: GenerationContext) -> WorkEstimate:
