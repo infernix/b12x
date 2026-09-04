@@ -577,15 +577,15 @@ def test_glm53_tp3_n704_micro_m1_rowpair_fc2_live_graph_oracle(
     recorded: dict[str, object] = {}
     spec = tp_moe_impl._ACTIVATION_KERNEL_SPECS["silu"]
 
-    def make_recorded_kernel(**kwargs):
-        kernel = spec.micro_kernel_cls(**kwargs)
-        recorded["micro_kernel"] = kernel
-        return kernel
+    class RecordingMicroKernel(spec.micro_kernel_cls):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            recorded["micro_kernel"] = self
 
     monkeypatch.setitem(
         tp_moe_impl._ACTIVATION_KERNEL_SPECS,
         "silu",
-        replace(spec, micro_kernel_cls=make_recorded_kernel),
+        replace(spec, micro_kernel_cls=RecordingMicroKernel),
     )
     intermediate_size = 704
     weights = _make_nvfp4_weights(
@@ -613,12 +613,9 @@ def test_glm53_tp3_n704_micro_m1_rowpair_fc2_live_graph_oracle(
         quant_mode="nvfp4",
         source_format="modelopt_nvfp4",
     )
-    kernel = recorded["micro_kernel"]
 
     assert case.scratch_plan.launch_plan.implementation == "micro"
     assert case.binding.implementation == "micro"
-    assert kernel._cfg.n == intermediate_size
-    assert kernel._cfg.fc2_n_chunks == 3
     _run_live_graph_check(
         case,
         initial=initial,
@@ -629,6 +626,9 @@ def test_glm53_tp3_n704_micro_m1_rowpair_fc2_live_graph_oracle(
         min_cos=0.999,
         max_normalized_rmse=0.03,
     )
+    kernel = recorded["micro_kernel"]
+    assert kernel._cfg.n == intermediate_size
+    assert kernel._cfg.fc2_n_chunks == 3
 
 
 def test_standard_moe_glm53_m1_rowpair_live_graph_oracle(
@@ -944,13 +944,9 @@ def test_glm53_dynamic_small_batch_native_shard_geometry_live_graph_oracle(
         quant_mode="nvfp4",
         source_format="modelopt_nvfp4",
     )
-    kernel = recorded["dynamic_kernel"]
 
     assert case.scratch_plan.launch_plan.implementation == "dynamic"
     assert case.binding.implementation == "dynamic"
-    assert kernel.swap_ab is expected_swap_ab
-    assert kernel.w4a4_fc1_fused is expected_fused_fc1
-    assert kernel.sa_tile_shape_mk[0] == expected_sa_m
     _run_live_graph_check(
         case,
         initial=initial,
@@ -961,6 +957,10 @@ def test_glm53_dynamic_small_batch_native_shard_geometry_live_graph_oracle(
         min_cos=0.999,
         max_normalized_rmse=0.03,
     )
+    kernel = recorded["dynamic_kernel"]
+    assert kernel.swap_ab is expected_swap_ab
+    assert kernel.w4a4_fc1_fused is expected_fused_fc1
+    assert kernel.sa_tile_shape_mk[0] == expected_sa_m
 
 
 def test_standard_moe_dynamic_prefill_live_graph_oracle(
@@ -1041,15 +1041,9 @@ def test_dynamic_relu2_refreshes_a_and_sfa_across_fc1_k_blocks(
         source_format="modelopt_nvfp4",
         activation="relu2",
     )
-    kernel = recorded["dynamic_kernel"]
 
     assert case.scratch_plan.launch_plan.implementation == "dynamic"
     assert case.binding.implementation == "dynamic"
-    assert not kernel.is_w6a8
-    assert not kernel.w4a4_fc1_fused
-    assert not kernel.swap_ab
-    assert _K // kernel.tile_shape_mnk[2] == 4
-    assert kernel.num_k_blocks > 1
     _run_live_graph_check(
         case,
         initial=initial,
@@ -1060,6 +1054,12 @@ def test_dynamic_relu2_refreshes_a_and_sfa_across_fc1_k_blocks(
         min_cos=0.999,
         max_normalized_rmse=0.03,
     )
+    kernel = recorded["dynamic_kernel"]
+    assert not kernel.is_w6a8
+    assert not kernel.w4a4_fc1_fused
+    assert not kernel.swap_ab
+    assert _K // kernel.tile_shape_mnk[2] == 4
+    assert kernel.num_k_blocks > 1
 
 
 @pytest.mark.parametrize("tile_m", [16, 32, 64, 128])
