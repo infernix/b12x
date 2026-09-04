@@ -646,7 +646,7 @@ def gdn_cases() -> tuple[SweepCase, ...]:
                 label=f"{geometry.model_id}-columns{columns}-edge",
             )
         )
-     for serving_case in GLM53_TP3_KDA_SERVING_CASES:
+    for serving_case in GLM53_TP3_KDA_SERVING_CASES:
         cases.append(
             SweepCase.create(
                 **_glm53_tp3_kda_serving_case_contract(*serving_case),
@@ -902,7 +902,7 @@ def _manifest_payload(component: str) -> dict[str, object]:
     }
     if component == "gdn":
         shared["geometries"] = [asdict(item) for item in GDN_GEOMETRIES]
-7:         shared["glm53_tp3_kda_profile_ids"] = list(GLM53_TP3_KDA_PROFILE_IDS)
+        shared["glm53_tp3_kda_profile_ids"] = list(GLM53_TP3_KDA_PROFILE_IDS)
         shared["glm53_tp3_kda_serving_cases"] = [
             _glm53_tp3_kda_serving_case_contract(*item)
             for item in GLM53_TP3_KDA_SERVING_CASES
