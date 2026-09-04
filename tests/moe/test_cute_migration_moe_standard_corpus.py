@@ -66,6 +66,7 @@ def _make_nvfp4_weights(
     device: torch.device,
     *,
     seed: int,
+    gated: bool = True,
     num_experts: int = _E,
     hidden_size: int = _K,
     intermediate_size: int = _N,
@@ -73,10 +74,11 @@ def _make_nvfp4_weights(
 ) -> _Weights:
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
+    w1_rows = (2 if gated else 1) * intermediate_size
     w1_fp4 = torch.randint(
         0,
         256,
-        (num_experts, 2 * intermediate_size, hidden_size // 2),
+        (num_experts, w1_rows, hidden_size // 2),
         dtype=torch.uint8,
         device=device,
         generator=generator,
@@ -94,7 +96,7 @@ def _make_nvfp4_weights(
     # A constant exact power of two keeps the synthetic layer well-conditioned
     # while the random FP4 payload still exercises every nibble value.
     w1_logical_scale = torch.full(
-        (num_experts, 2 * intermediate_size, hidden_size // 16),
+        (num_experts, w1_rows, hidden_size // 16),
         2.0**-5,
         dtype=torch.float32,
         device=device,
@@ -113,10 +115,12 @@ def _make_nvfp4_weights(
                 "no larger than intermediate_size"
             )
         w1_fp4[:, logical_n:intermediate_size].zero_()
-        w1_fp4[:, intermediate_size + logical_n :].zero_()
+        if gated:
+            w1_fp4[:, intermediate_size + logical_n :].zero_()
         w2_fp4[:, :, logical_n // 2 :].zero_()
         w1_logical_scale[:, logical_n:intermediate_size].fill_(0)
-        w1_logical_scale[:, intermediate_size + logical_n :].fill_(0)
+        if gated:
+            w1_logical_scale[:, intermediate_size + logical_n :].fill_(0)
         w2_logical_scale[:, :, logical_n // 16 :].fill_(0)
     w1_scale = swizzle_block_scale_reference(w1_logical_scale).contiguous()
     w2_scale = swizzle_block_scale_reference(w2_logical_scale).contiguous()
@@ -222,6 +226,7 @@ def _nvfp4_oracle(
     num_experts: int = _E,
     hidden_size: int = _K,
     intermediate_size: int = _N,
+    activation: str = "silu",
 ) -> torch.Tensor:
     # This is the pure-Torch GPU oracle; it does not instantiate or call a CuTe
     # kernel and consumes the original checkpoint layout directly.
@@ -247,7 +252,7 @@ def _nvfp4_oracle(
         num_experts,
         hidden_size,
         intermediate_size,
-        activation="silu",
+        activation=activation,
         quant_scale_math=quant_scale_math,
     )
 
@@ -290,6 +295,7 @@ def _prepare_and_bind(
     source_format: str,
     num_topk: int = _TOPK,
     fast_math: bool = False,
+    activation: str = "silu",
 ) -> _BoundCase:
     from b12x.moe.fused_moe._impl import TPMoEScratchCaps, plan_tp_moe_scratch
 
@@ -303,7 +309,7 @@ def _prepare_and_bind(
         w2_fp4=weights.w2_fp4,
         w2_blockscale=weights.w2_scale,
         w2_alphas=weights.w2_alpha,
-        activation="silu",
+        activation=activation,
         quant_mode=quant_mode,
         source_format=source_format,
         w13_layout="w13",
@@ -987,6 +993,70 @@ def test_standard_moe_dynamic_prefill_live_graph_oracle(
         initial_reference=initial_reference,
         changed_reference=changed_reference,
         context="standard-moe-dynamic-prefill-m128",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
+
+
+def test_dynamic_relu2_refreshes_a_and_sfa_across_fc1_k_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise main and tail K tiles with non-fused slot-zero FC1 operands."""
+
+    from b12x.moe.fused_moe import _impl as tp_moe_impl
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    monkeypatch.setenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", "0")
+    recorded: dict[str, object] = {}
+    spec = tp_moe_impl._ACTIVATION_KERNEL_SPECS["relu2"]
+
+    def make_recorded_kernel(**kwargs):
+        kernel = spec.dynamic_kernel_cls(**kwargs)
+        recorded["dynamic_kernel"] = kernel
+        return kernel
+
+    monkeypatch.setitem(
+        tp_moe_impl._ACTIVATION_KERNEL_SPECS,
+        "relu2",
+        replace(spec, dynamic_kernel_cls=make_recorded_kernel),
+    )
+    weights = _make_nvfp4_weights(device, seed=221, gated=False)
+    initial = _make_inputs(device, m=32, seed=222, route_shift=0)
+    changed = _make_inputs(device, m=32, seed=223, route_shift=2)
+    initial_reference = _nvfp4_oracle(
+        weights,
+        initial,
+        activation="relu2",
+    )
+    changed_reference = _nvfp4_oracle(
+        weights,
+        changed,
+        activation="relu2",
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        activation="relu2",
+    )
+    kernel = recorded["dynamic_kernel"]
+
+    assert case.scratch_plan.launch_plan.implementation == "dynamic"
+    assert case.binding.implementation == "dynamic"
+    assert not kernel.is_w6a8
+    assert not kernel.w4a4_fc1_fused
+    assert not kernel.swap_ab
+    assert _K // kernel.tile_shape_mnk[2] == 4
+    assert kernel.num_k_blocks > 1
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context="dynamic-relu2-multi-k-slot-zero-refresh",
         min_cos=0.999,
         max_normalized_rmse=0.03,
     )

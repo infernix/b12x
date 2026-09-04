@@ -2,11 +2,6 @@
 
 from __future__ import annotations
 
-import ast
-import inspect
-import textwrap
-from collections import Counter
-
 # TODO(port): the FP6 extensions of the fused-MoE backends (the static backend
 # base `_MoEStaticKernelBase`, the micro backend's `MXFP6_BLOCK_SIZE` /
 # `is_supported_mxfp6`) were not ported upstream; the b12x FP6 MoE route
@@ -21,51 +16,6 @@ from b12x.moe._shared.kernels import mxfp6_moe
 from b12x.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
 
 
-def _indexed_name(node: ast.expr) -> tuple[str, tuple[str | int | None, ...]] | None:
-    if not isinstance(node, ast.Subscript) or not isinstance(node.value, ast.Name):
-        return None
-    indices = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
-    values: list[str | int | None] = []
-    for index in indices:
-        if isinstance(index, ast.Name):
-            values.append(index.id)
-        elif isinstance(index, ast.Constant):
-            values.append(index.value)
-        else:
-            return None
-    return node.value.id, tuple(values)
-
-
-def _direct_copy_signatures(
-    statements: list[ast.stmt],
-) -> list[
-    tuple[
-        tuple[str, tuple[str | int | None, ...]],
-        tuple[str, tuple[str | int | None, ...]],
-    ]
-]:
-    signatures = []
-    for statement in statements:
-        if not isinstance(statement, ast.Expr) or not isinstance(
-            statement.value, ast.Call
-        ):
-            continue
-        call = statement.value
-        if not (
-            isinstance(call.func, ast.Attribute)
-            and isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "cute"
-            and call.func.attr == "copy"
-            and len(call.args) >= 3
-        ):
-            continue
-        source = _indexed_name(call.args[1])
-        destination = _indexed_name(call.args[2])
-        if source is not None and destination is not None:
-            signatures.append((source, destination))
-    return signatures
-
-
 def test_mxfp6_moe_helpers_import():
     assert mxfp6_moe.moe_emit_mma_k_block is not None
 
@@ -73,56 +23,6 @@ def test_mxfp6_moe_helpers_import():
 def test_mxfp6_tile_k_matches_moe_expectation():
     assert mxfp6_tile_k() == 128
     assert mxfp6_num_k_blocks(128) == 4
-
-
-def test_w6a8_staged_a_and_sfa_refresh_matching_k_block_fragments():
-    tree = ast.parse(textwrap.dedent(inspect.getsource(MoEDynamicKernelBackend.kernel)))
-    expected = Counter(
-        {
-            ("csA_p", "crA_fc1_cur", "crA"): 2,
-            ("fz_csSFA_cur", "fz_crSFA_fc1_cur", "fz_crSFA"): 1,
-            ("fz_csSFA_p", "fz_crSFA_fc1_cur", "fz_crSFA"): 1,
-        }
-    )
-    observed: Counter[tuple[str, str, str]] = Counter()
-
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        condition = node.test
-        if not (
-            isinstance(condition, ast.Call)
-            and isinstance(condition.func, ast.Attribute)
-            and condition.func.attr == "const_expr"
-            and len(condition.args) == 1
-            and isinstance(condition.args[0], ast.Attribute)
-            and condition.args[0].attr == "w4a4_fc1_fused"
-        ):
-            continue
-
-        fused_copies = _direct_copy_signatures(node.body)
-        non_fused_copies = _direct_copy_signatures(node.orelse)
-        for (source_name, source_indices), (
-            fused_destination,
-            fused_indices,
-        ) in fused_copies:
-            destinations = {
-                "csA_p": ("crA_fc1_cur", "crA"),
-                "fz_csSFA_cur": ("fz_crSFA_fc1_cur", "fz_crSFA"),
-                "fz_csSFA_p": ("fz_crSFA_fc1_cur", "fz_crSFA"),
-            }.get(source_name)
-            if source_indices[-1] != "k_next" or destinations is None:
-                continue
-
-            fused_name, non_fused_name = destinations
-            assert (fused_destination, fused_indices[-1]) == (fused_name, 0)
-            assert (
-                (source_name, source_indices),
-                (non_fused_name, source_indices),
-            ) in non_fused_copies
-            observed[(source_name, fused_name, non_fused_name)] += 1
-
-    assert observed == expected
 
 
 def test_moe_static_dynamic_init_tile_k_default():
