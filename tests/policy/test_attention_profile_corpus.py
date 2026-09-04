@@ -661,6 +661,8 @@ def test_gdn_manifest_hash_tracks_serving_cases_and_profile_ids(monkeypatch) -> 
     serving_cases = attention_corpus_module.GLM53_TP3_KDA_SERVING_CASES
     profile_ids = attention_corpus_module.GLM53_TP3_KDA_PROFILE_IDS
     original = attention_corpus_manifest("gdn")
+    serving_group = "glm-5.3-flash-kda-tp3-serving"
+    generated_cases = [case for case in gdn_cases() if case.group_id == serving_group]
 
     monkeypatch.setattr(
         attention_corpus_module,
@@ -681,11 +683,48 @@ def test_gdn_manifest_hash_tracks_serving_cases_and_profile_ids(monkeypatch) -> 
     profiles_changed = attention_corpus_manifest("gdn")
 
     assert original["glm53_tp3_kda_serving_cases"] == [
-        list(item) for item in serving_cases
+        {
+            "group_id": case.group_id,
+            "query": case.query.to_dict(),
+            "scenario": case.scenario,
+            "metadata": case.metadata.to_dict(),
+            "label": case.case_id.rsplit("-", 1)[0],
+        }
+        for case in generated_cases
     ]
     assert original["glm53_tp3_kda_profile_ids"] == list(profile_ids)
     assert serving_changed["corpus_sha256"] != original["corpus_sha256"]
     assert profiles_changed["corpus_sha256"] != original["corpus_sha256"]
+
+
+def test_gdn_manifest_hash_tracks_fixed_serving_query_fields(monkeypatch) -> None:
+    original_contract = attention_corpus_module._glm53_tp3_kda_serving_case_contract
+    original = attention_corpus_manifest("gdn")
+
+    def with_changed_key_heads(
+        serving_mode: str,
+        max_seqs: int,
+        max_tokens: int,
+        columns: int,
+    ) -> dict[str, object]:
+        contract = original_contract(serving_mode, max_seqs, max_tokens, columns)
+        query = contract["query"]
+        assert isinstance(query, dict)
+        return {**contract, "query": {**query, "key_heads": 23}}
+
+    monkeypatch.setattr(
+        attention_corpus_module,
+        "_glm53_tp3_kda_serving_case_contract",
+        with_changed_key_heads,
+    )
+    changed = attention_corpus_manifest("gdn")
+    changed_case = changed["glm53_tp3_kda_serving_cases"][0]
+    assert isinstance(changed_case, dict)
+    changed_query = changed_case["query"]
+    assert isinstance(changed_query, dict)
+
+    assert changed_query["key_heads"] == 23
+    assert changed["corpus_sha256"] != original["corpus_sha256"]
 
 
 def test_mhc_tuner_races_the_medium_prefill_plan() -> None:

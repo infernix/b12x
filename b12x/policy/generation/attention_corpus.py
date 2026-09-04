@@ -543,6 +543,38 @@ ATTENTION_BENCHMARK_PRESETS = (
 )
 
 
+def _glm53_tp3_kda_serving_case_contract(
+    serving_mode: str,
+    max_seqs: int,
+    max_tokens: int,
+    columns: int,
+) -> dict[str, object]:
+    """Return the complete SweepCase construction contract for one TP3 shape."""
+    return {
+        "group_id": "glm-5.3-flash-kda-tp3-serving",
+        "query": {
+            "gate_activation": "sigmoid",
+            "qk_l2norm": True,
+            "key_heads": 22,
+            "value_heads": 22,
+            "state_dtype": "float32",
+            "max_seqs": max_seqs,
+            "max_tokens": max_tokens,
+            "state_index_columns": columns,
+        },
+        "scenario": "default",
+        "metadata": {
+            "decay_recipe": "kda",
+            "model_id": "glm-5.3-flash-kda-tp3",
+            "profile_ids": list(GLM53_TP3_KDA_PROFILE_IDS),
+            "query_lengths": [columns] * max_seqs,
+            "serving_mode": serving_mode,
+            "source": "GLM-5.3 Flash KDA physical-66-head TP3 geometry",
+        },
+        "label": f"glm-5.3-flash-kda-tp3-{serving_mode}",
+    }
+
+
 def gdn_cases() -> tuple[SweepCase, ...]:
     cases = []
     exercised_queries = set()
@@ -614,29 +646,10 @@ def gdn_cases() -> tuple[SweepCase, ...]:
                 label=f"{geometry.model_id}-columns{columns}-edge",
             )
         )
-    for serving_mode, max_seqs, max_tokens, columns in GLM53_TP3_KDA_SERVING_CASES:
+    for serving_case in GLM53_TP3_KDA_SERVING_CASES:
         cases.append(
             SweepCase.create(
-                group_id="glm-5.3-flash-kda-tp3-serving",
-                query={
-                    "gate_activation": "sigmoid",
-                    "qk_l2norm": True,
-                    "key_heads": 22,
-                    "value_heads": 22,
-                    "state_dtype": "float32",
-                    "max_seqs": max_seqs,
-                    "max_tokens": max_tokens,
-                    "state_index_columns": columns,
-                },
-                metadata={
-                    "decay_recipe": "kda",
-                    "model_id": "glm-5.3-flash-kda-tp3",
-                    "profile_ids": list(GLM53_TP3_KDA_PROFILE_IDS),
-                    "query_lengths": [columns] * max_seqs,
-                    "serving_mode": serving_mode,
-                    "source": "GLM-5.3 Flash KDA physical-66-head TP3 geometry",
-                },
-                label=f"glm-5.3-flash-kda-tp3-{serving_mode}",
+                **_glm53_tp3_kda_serving_case_contract(*serving_case),
             )
         )
 
@@ -906,7 +919,8 @@ def _manifest_payload(component: str) -> dict[str, object]:
         shared["geometries"] = [asdict(item) for item in GDN_GEOMETRIES]
         shared["glm53_tp3_kda_profile_ids"] = list(GLM53_TP3_KDA_PROFILE_IDS)
         shared["glm53_tp3_kda_serving_cases"] = [
-            list(item) for item in GLM53_TP3_KDA_SERVING_CASES
+            _glm53_tp3_kda_serving_case_contract(*item)
+            for item in GLM53_TP3_KDA_SERVING_CASES
         ]
     elif component == "gqa":
         shared["geometries"] = [asdict(item) for item in GQA_GEOMETRIES]
