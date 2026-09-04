@@ -531,38 +531,53 @@ class MoeDecodeGenerator:
         if any(case.geometry.key not in known_keys for case in self._cases):
             raise ValueError("MoE sweep cases reference unknown geometries")
 
+    def _corpus_for_context(
+        self,
+        context: GenerationContext,
+    ) -> tuple[tuple[MoePhysicalGeometry, ...], tuple[MoeSweepCase, ...]]:
+        geometries = tuple(
+            geometry
+            for geometry in self._geometries
+            if geometry.applies_to_profile(context.profile_id)
+        )
+        applicable_keys = frozenset(geometry.key for geometry in geometries)
+        cases = tuple(
+            case for case in self._cases if case.geometry.key in applicable_keys
+        )
+        return geometries, cases
+
     def estimate(self, context: GenerationContext) -> WorkEstimate:
-        del context
+        geometries, cases = self._corpus_for_context(context)
         cases_by_geometry: dict[tuple[object, ...], list[MoeSweepCase]] = defaultdict(
             list
         )
-        for case in self._cases:
+        for case in cases:
             cases_by_geometry[case.geometry.key].append(case)
         coarse = tuple(
             case
-            for geometry in self._geometries
+            for geometry in geometries
             if _has_tunable_backend(geometry)
             for case in _coarse_cases(cases_by_geometry[geometry.key])
         )
         measured = tuple(
             case
-            for geometry in self._geometries
+            for geometry in geometries
             for case in _measurement_cases(cases_by_geometry[geometry.key])
         )
-        query_count = len({_query_key(case) for case in self._cases})
-        work_units = len(self._geometries) + len(coarse) + len(measured) + query_count
+        query_count = len({_query_key(case) for case in cases})
+        work_units = len(geometries) + len(coarse) + len(measured) + query_count
         return WorkEstimate(
             component_id=self.component_id,
             work_units=work_units,
             case_count=len(measured),
             description=(
-                f"{len(self._geometries)} physical geometries; concrete MoE "
+                f"{len(geometries)} physical geometries; concrete MoE "
                 "candidate races, fixed-backend qualification, tree reduction"
             ),
             dimensions={
-                "physical_geometries": len(self._geometries),
+                "physical_geometries": len(geometries),
                 "measurement_cases": len(measured),
-                "runtime_route_cases": len(self._cases),
+                "runtime_route_cases": len(cases),
                 "runtime_queries": query_count,
                 "coarse_cases": len(coarse),
             },
@@ -572,18 +587,18 @@ class MoeDecodeGenerator:
         self,
         context: GenerationContext,
     ) -> tuple[MeasurementPartition, ...]:
-        del context
+        geometries, cases = self._corpus_for_context(context)
         cases_by_geometry: dict[tuple[object, ...], list[MoeSweepCase]] = defaultdict(
             list
         )
-        for case in self._cases:
+        for case in cases:
             cases_by_geometry[case.geometry.key].append(case)
         partitions = []
-        for geometry in self._geometries:
-            cases = tuple(cases_by_geometry[geometry.key])
-            measured = _measurement_cases(cases)
-            coarse = _coarse_cases(cases) if _has_tunable_backend(geometry) else ()
-            query_count = len({_query_key(case) for case in cases})
+        for geometry in geometries:
+            part_cases = tuple(cases_by_geometry[geometry.key])
+            measured = _measurement_cases(part_cases)
+            coarse = _coarse_cases(part_cases) if _has_tunable_backend(geometry) else ()
+            query_count = len({_query_key(case) for case in part_cases})
             partitions.append(
                 MeasurementPartition(
                     component_id=self.component_id,
@@ -830,11 +845,12 @@ class MoeDecodeGenerator:
         progress: ProgressReporter,
         checkpoints: CheckpointStore,
     ) -> ComponentGenerationResult:
+        geometries, cases = self._corpus_for_context(context)
         cases_by_geometry: dict[
             tuple[object, ...],
             list[MoeSweepCase],
         ] = defaultdict(list)
-        for case in self._cases:
+        for case in cases:
             cases_by_geometry[case.geometry.key].append(case)
         full_results: list[tuple[MoeSweepCase, tuple[MoeMeasurement, ...]]] = []
         fixed_configs: dict[tuple[object, ...], FrozenMapping] = {}
