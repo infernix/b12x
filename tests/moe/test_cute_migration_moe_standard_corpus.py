@@ -1327,6 +1327,7 @@ def test_standard_moe_dynamic_inactive_route_live_graph_oracle(
         pytest.param(False, True, id="expert-scales-fast-math"),
         pytest.param(True, True, id="scalar-scales-fast-math"),
         pytest.param(False, False, id="expert-scales-precise-math"),
+        pytest.param(True, False, id="scalar-scales-precise-math"),
     ),
 )
 def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
