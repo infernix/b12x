@@ -195,6 +195,23 @@ def _scale_atom_offset(
 
 
 @cute.jit
+def _trellis_rotation_offset(
+    expert_idx: Int32,
+    rotations_per_expert: Int32,
+    intermediate_size: Int64,
+    rotation_idx: Int32,
+    column: Int64,
+) -> Int64:
+    """Return a flat Trellis rotation offset without overflowing Int32."""
+
+    return (
+        Int64(expert_idx) * Int64(rotations_per_expert) * intermediate_size
+        + Int64(rotation_idx) * intermediate_size
+        + column
+    )
+
+
+@cute.jit
 def _load_bf16x32_to_f32(
     a_input: cute.Tensor,
     linear_offset: Int32,
@@ -745,6 +762,10 @@ class MoEDynamicKernelBackend:
             "w6a8_mx",
         }:
             raise ValueError(f"unsupported quant_recipe {quant_recipe!r}")
+        if separate_w13_halves and quant_recipe == "w6a8_mx":
+            raise ValueError(
+                "separate_w13_halves is not supported with quant_recipe='w6a8_mx'"
+            )
         if work_source not in _WORK_SOURCES:
             raise ValueError(
                 f"unsupported work_source {work_source!r}; "
@@ -5995,11 +6016,16 @@ class MoEDynamicKernelBackend:
                                 ) // self.num_mma_warps
                                 tr_lane = Int32(tidx) & Int32(31)
                                 tr_warp = Int32(tidx) >> Int32(5)
-                                tr_isz = gate_tile_cnt * Int32(128)
-                                tr_rot_base = (
-                                    task_expert_idx * (Int32(3) * tr_isz)
-                                    + (task_slice_begin_idx + slice_idx) * Int32(128)
-                                    + tr_lane * Int32(4)
+                                tr_isz = Int64(gate_tile_cnt) * Int64(128)
+                                tr_column = (
+                                    Int64(task_slice_begin_idx) + Int64(slice_idx)
+                                ) * Int64(128) + Int64(tr_lane) * Int64(4)
+                                tr_rot_base = _trellis_rotation_offset(
+                                    task_expert_idx,
+                                    Int32(3),
+                                    tr_isz,
+                                    Int32(0),
+                                    tr_column,
                                 )
                                 tr_ig = cute.make_rmem_tensor(
                                     (tr_row_slots * 4,), cutlass.Float32
@@ -6027,13 +6053,13 @@ class MoEDynamicKernelBackend:
                                             trellis_rotations[tr_rot_base]
                                         )
                                         tr_ig[_sl * 4 + 1] = gh1 * cutlass.Float32(
-                                            trellis_rotations[tr_rot_base + Int32(1)]
+                                            trellis_rotations[tr_rot_base + Int64(1)]
                                         )
                                         tr_ig[_sl * 4 + 2] = gh2 * cutlass.Float32(
-                                            trellis_rotations[tr_rot_base + Int32(2)]
+                                            trellis_rotations[tr_rot_base + Int64(2)]
                                         )
                                         tr_ig[_sl * 4 + 3] = gh3 * cutlass.Float32(
-                                            trellis_rotations[tr_rot_base + Int32(3)]
+                                            trellis_rotations[tr_rot_base + Int64(3)]
                                         )
                                 self.epilog_sync_barrier.arrive_and_wait()
                                 if epi_m_valid > Int32(0):
@@ -6089,17 +6115,17 @@ class MoEDynamicKernelBackend:
                                         )
                                         iu1 = uh1 * cutlass.Float32(
                                             trellis_rotations[
-                                                tr_rot_base + tr_isz + Int32(1)
+                                                tr_rot_base + tr_isz + Int64(1)
                                             ]
                                         )
                                         iu2 = uh2 * cutlass.Float32(
                                             trellis_rotations[
-                                                tr_rot_base + tr_isz + Int32(2)
+                                                tr_rot_base + tr_isz + Int64(2)
                                             ]
                                         )
                                         iu3 = uh3 * cutlass.Float32(
                                             trellis_rotations[
-                                                tr_rot_base + tr_isz + Int32(3)
+                                                tr_rot_base + tr_isz + Int64(3)
                                             ]
                                         )
                                         sd_base = tr_rot_base + tr_isz + tr_isz
@@ -6109,17 +6135,17 @@ class MoEDynamicKernelBackend:
                                         a1 = self._gated_activation_value(
                                             tr_ig[_sl * 4 + 1], iu1
                                         ) * cutlass.Float32(
-                                            trellis_rotations[sd_base + Int32(1)]
+                                            trellis_rotations[sd_base + Int64(1)]
                                         )
                                         a2 = self._gated_activation_value(
                                             tr_ig[_sl * 4 + 2], iu2
                                         ) * cutlass.Float32(
-                                            trellis_rotations[sd_base + Int32(2)]
+                                            trellis_rotations[sd_base + Int64(2)]
                                         )
                                         a3 = self._gated_activation_value(
                                             tr_ig[_sl * 4 + 3], iu3
                                         ) * cutlass.Float32(
-                                            trellis_rotations[sd_base + Int32(3)]
+                                            trellis_rotations[sd_base + Int64(3)]
                                         )
                                         o0, o1, o2, o3 = _w4a8_had128_quad(
                                             a0, a1, a2, a3, tr_lane
@@ -6152,10 +6178,10 @@ class MoEDynamicKernelBackend:
                                 ) // self.num_mma_warps
                                 tr_lane = Int32(tidx) & Int32(31)
                                 tr_warp = Int32(tidx) >> Int32(5)
-                                tr_isz = gate_tile_cnt * Int32(128)
+                                tr_isz = Int64(gate_tile_cnt) * Int64(128)
                                 tr_slice_col = (
-                                    task_slice_begin_idx + slice_idx
-                                ) * Int32(128)
+                                    Int64(task_slice_begin_idx) + Int64(slice_idx)
+                                ) * Int64(128)
                                 tr_chunk = tr_lane >> Int32(3)
                                 tr_chunk_lane = tr_lane & Int32(7)
                                 tr_slot = tr_chunk & Int32(1)
@@ -6257,48 +6283,53 @@ class MoEDynamicKernelBackend:
                                             h0, h1, h2, h3 = _w4a8_had128_quad(
                                                 p0, p1, p2, p3, tr_lane
                                             )
-                                            tr_coord = tr_slice_col + tr_ci
-                                            tr_scale = (
-                                                task_expert_idx * (Int32(6) * tr_isz)
-                                                + tr_slot * tr_isz
-                                                + tr_coord
+                                            tr_coord = tr_slice_col + Int64(tr_ci)
+                                            tr_scale = _trellis_rotation_offset(
+                                                task_expert_idx,
+                                                Int32(6),
+                                                tr_isz,
+                                                tr_slot,
+                                                tr_coord,
                                             )
                                             h0 = h0 * cutlass.Float32(
                                                 trellis_rotations[tr_scale]
                                             )
                                             h1 = h1 * cutlass.Float32(
-                                                trellis_rotations[tr_scale + Int32(1)]
+                                                trellis_rotations[tr_scale + Int64(1)]
                                             )
                                             h2 = h2 * cutlass.Float32(
-                                                trellis_rotations[tr_scale + Int32(2)]
+                                                trellis_rotations[tr_scale + Int64(2)]
                                             )
                                             h3 = h3 * cutlass.Float32(
-                                                trellis_rotations[tr_scale + Int32(3)]
+                                                trellis_rotations[tr_scale + Int64(3)]
                                             )
                                             h0, h1, h2, h3 = _w4a8_had128_quad(
                                                 h0, h1, h2, h3, tr_lane
                                             )
-                                            tr_sign = (
-                                                task_expert_idx * (Int32(6) * tr_isz)
-                                                + Int32(3) * tr_isz
-                                                + (
-                                                    tr_slice_col
-                                                    + tr_slice_col
-                                                    + Int32(_pb * 128)
-                                                )
-                                                + tr_lane * Int32(4)
+                                            tr_sign_column = (
+                                                tr_slice_col
+                                                + tr_slice_col
+                                                + Int64(_pb * 128)
+                                                + Int64(tr_lane) * Int64(4)
+                                            )
+                                            tr_sign = _trellis_rotation_offset(
+                                                task_expert_idx,
+                                                Int32(6),
+                                                tr_isz,
+                                                Int32(3),
+                                                tr_sign_column,
                                             )
                                             h0 = h0 * cutlass.Float32(
                                                 trellis_rotations[tr_sign]
                                             )
                                             h1 = h1 * cutlass.Float32(
-                                                trellis_rotations[tr_sign + Int32(1)]
+                                                trellis_rotations[tr_sign + Int64(1)]
                                             )
                                             h2 = h2 * cutlass.Float32(
-                                                trellis_rotations[tr_sign + Int32(2)]
+                                                trellis_rotations[tr_sign + Int64(2)]
                                             )
                                             h3 = h3 * cutlass.Float32(
-                                                trellis_rotations[tr_sign + Int32(3)]
+                                                trellis_rotations[tr_sign + Int64(3)]
                                             )
                                             s0 = self._gated_activation_value(h0, h1)
                                             s1 = self._gated_activation_value(h2, h3)
@@ -6327,43 +6358,49 @@ class MoEDynamicKernelBackend:
                                             v1 = bv1
                                             v2 = bv2
                                             v3 = bv3
-                                        tr_col = tr_slice_col + tr_lane * Int32(4)
-                                        tr_ub = (
-                                            task_expert_idx * (Int32(6) * tr_isz)
-                                            + Int32(5) * tr_isz
-                                            + tr_col
+                                        tr_col = tr_slice_col + Int64(tr_lane) * Int64(
+                                            4
+                                        )
+                                        tr_ub = _trellis_rotation_offset(
+                                            task_expert_idx,
+                                            Int32(6),
+                                            tr_isz,
+                                            Int32(5),
+                                            tr_col,
                                         )
                                         v0 = v0 * cutlass.Float32(
                                             trellis_rotations[tr_ub]
                                         )
                                         v1 = v1 * cutlass.Float32(
-                                            trellis_rotations[tr_ub + Int32(1)]
+                                            trellis_rotations[tr_ub + Int64(1)]
                                         )
                                         v2 = v2 * cutlass.Float32(
-                                            trellis_rotations[tr_ub + Int32(2)]
+                                            trellis_rotations[tr_ub + Int64(2)]
                                         )
                                         v3 = v3 * cutlass.Float32(
-                                            trellis_rotations[tr_ub + Int32(3)]
+                                            trellis_rotations[tr_ub + Int64(3)]
                                         )
                                         v0, v1, v2, v3 = _w4a8_had128_quad(
                                             v0, v1, v2, v3, tr_lane
                                         )
-                                        tr_dn = (
-                                            task_expert_idx * (Int32(6) * tr_isz)
-                                            + Int32(2) * tr_isz
-                                            + tr_col
+                                        tr_dn = _trellis_rotation_offset(
+                                            task_expert_idx,
+                                            Int32(6),
+                                            tr_isz,
+                                            Int32(2),
+                                            tr_col,
                                         )
                                         v0 = v0 * cutlass.Float32(
                                             trellis_rotations[tr_dn]
                                         )
                                         v1 = v1 * cutlass.Float32(
-                                            trellis_rotations[tr_dn + Int32(1)]
+                                            trellis_rotations[tr_dn + Int64(1)]
                                         )
                                         v2 = v2 * cutlass.Float32(
-                                            trellis_rotations[tr_dn + Int32(2)]
+                                            trellis_rotations[tr_dn + Int64(2)]
                                         )
                                         v3 = v3 * cutlass.Float32(
-                                            trellis_rotations[tr_dn + Int32(3)]
+                                            trellis_rotations[tr_dn + Int64(3)]
                                         )
                                         v0, v1, v2, v3 = _w4a8_had128_quad(
                                             v0, v1, v2, v3, tr_lane
