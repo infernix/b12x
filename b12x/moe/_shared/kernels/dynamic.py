@@ -107,7 +107,6 @@ from b12x._lib.dense_gemm import (
 from b12x.moe._shared.kernels.mxfp6_moe import (
     moe_emit_mma_k_block,
     moe_mxfp6_quantize_input_block_containers,
-    moe_mxfp6_store_expanded_global,
 )
 from b12x._lib.intrinsics import (
     scatter_add_bf16x2,
@@ -167,6 +166,32 @@ _SPLIT_PHASES = {"fused", "prepare", "compute"}
 # alignment = copy size) and 20*g mod 32 spreads the eight g-rows a lane
 # quad touches across distinct bank groups.
 _W4A8_B_ROW_PAD = 80
+
+
+@cute.jit
+def _row_major_offset(row: Int32, row_stride: Int32, column: Int32) -> Int64:
+    """Return a byte/element row offset without overflowing Int32."""
+
+    return Int64(row) * Int64(row_stride) + Int64(column)
+
+
+@cute.jit
+def _scale_atom_offset(
+    phys_row: Int32,
+    num_k_tiles: Int32,
+    k_tile_idx: Int32,
+    inner_k_idx: Int32,
+) -> Int64:
+    """Return the swizzled scale offset for one routed row."""
+
+    sf_row = phys_row & Int32(127)
+    return (
+        (Int64(phys_row) >> Int64(7)) * Int64(num_k_tiles) * Int64(32 * 4 * 4)
+        + Int64(k_tile_idx) * Int64(32 * 4 * 4)
+        + Int64(sf_row % Int32(32)) * Int64(4 * 4)
+        + Int64(sf_row // Int32(32)) * Int64(4)
+        + Int64(inner_k_idx)
+    )
 
 
 @cute.jit
@@ -833,8 +858,7 @@ class MoEDynamicKernelBackend:
                     "w4a8_repacked=True"
                 )
             if mma_tiler_mn[0] > 32 and not (
-                materialize_intermediate
-                and mma_tiler_mn in {(64, 128), (128, 128)}
+                materialize_intermediate and mma_tiler_mn in {(64, 128), (128, 128)}
             ):
                 raise ValueError(
                     "w4a8_trellis supports mma_tiler_mn[0] <= 32 for the "
@@ -900,9 +924,7 @@ class MoEDynamicKernelBackend:
                 if self.w4a8_trellis and self.w4a8_split_materialized
                 else None
             ),
-            trellis_coupled=(
-                self.trellis_coupled and self.w4a8_split_materialized
-            ),
+            trellis_coupled=(self.trellis_coupled and self.w4a8_split_materialized),
             trellis_direct_lut=(
                 self.trellis_direct_lut and self.w4a8_split_materialized
             ),
@@ -2321,13 +2343,11 @@ class MoEDynamicKernelBackend:
             internal_type=cutlass.Int16,
         )
         if cutlass.const_expr(self.separate_w13_halves):
-            tma_b_w13_gate, gB_w13_gate = (
-                self._dense_cls._make_tma_atoms_and_tensors(
-                    b_w13_gate,
-                    self.b_smem_layout_staged,
-                    (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
-                    1,
-                )
+            tma_b_w13_gate, gB_w13_gate = self._dense_cls._make_tma_atoms_and_tensors(
+                b_w13_gate,
+                self.b_smem_layout_staged,
+                (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
+                1,
             )
             tma_sfb_w13_gate, gSFB_w13_gate = (
                 self._dense_cls._make_tma_atoms_and_tensors(
@@ -2378,9 +2398,9 @@ class MoEDynamicKernelBackend:
 
         if cutlass.const_expr(self.separate_w13_halves):
             n_int = Int32(b_w13.shape[0])
-            gate_tile_cnt = (
-                n_int + Int32(self.tile_shape_mnk[1]) - Int32(1)
-            ) // Int32(self.tile_shape_mnk[1])
+            gate_tile_cnt = (n_int + Int32(self.tile_shape_mnk[1]) - Int32(1)) // Int32(
+                self.tile_shape_mnk[1]
+            )
         elif cutlass.const_expr(self.swap_ab):
             # Non-128-aligned n: the scheduler's slice count must CEIL so the
             # partial last intermediate slice is issued. The plain floor below
@@ -2438,9 +2458,7 @@ class MoEDynamicKernelBackend:
             trellis_rotations = row_counts
         if cutlass.const_expr(self.w4a8_trellis):
             assert (
-                w13_rp is not None
-                and down_rp is not None
-                and trellis_lut is not None
+                w13_rp is not None and down_rp is not None and trellis_lut is not None
             ), (
                 "w4a8_trellis requires the flat trellis payload tensors "
                 "(via w13_rp/down_rp) and the T12 staircase table"
@@ -2789,9 +2807,7 @@ class MoEDynamicKernelBackend:
                 self.sC_storage_align_bytes,
             ]
             trellis_lut_smem: cute.struct.Align[
-                cute.struct.MemRange[
-                    cutlass.Uint8, 4096 if self.w4a8_trellis else 16
-                ],
+                cute.struct.MemRange[cutlass.Uint8, 4096 if self.w4a8_trellis else 16],
                 16,
             ]
             reduce_scratch: cute.struct.MemRange[cutlass.Float32, 5]
@@ -2811,11 +2827,7 @@ class MoEDynamicKernelBackend:
             barrier_storage=storage.pipeline_array.data_ptr(),
             cta_layout_vmnk=cta_layout_vmnk,
         )
-        up_tx_count = (
-            phase2_tma_copy_bytes
-            if self.w4a4_fc1_fused
-            else tma_copy_bytes
-        )
+        up_tx_count = phase2_tma_copy_bytes if self.w4a4_fc1_fused else tma_copy_bytes
         up_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=self.ab_stage,
             producer_group=prod_group,
@@ -3076,9 +3088,7 @@ class MoEDynamicKernelBackend:
                         m1_route_idx = total_pairs
                     else:
                         m1_route_idx += Int32(1)
-            m1_has_active_route = cute.arch.shuffle_sync(
-                m1_has_active_route, Int32(0)
-            )
+            m1_has_active_route = cute.arch.shuffle_sync(m1_has_active_route, Int32(0))
 
             if m1_has_active_route > Int32(0):
                 m1_blk_idx = flat_tid
@@ -3109,9 +3119,7 @@ class MoEDynamicKernelBackend:
                             ),
                             m1_packed64,
                         )
-                    scale_storage[m1_blk_idx] = Uint8(
-                        m1_mx_scale_byte & Uint32(0xFF)
-                    )
+                    scale_storage[m1_blk_idx] = Uint8(m1_mx_scale_byte & Uint32(0xFF))
                     m1_blk_idx += flat_stride
 
             if flat_tid < total_pairs:
@@ -3211,8 +3219,8 @@ class MoEDynamicKernelBackend:
         # Each cache is consumed by a compile-time recipe branch and eliminated
         # from the other one.
         shared_route_phys_rows = cute.make_rmem_tensor((8,), Int32)
-        route_output_base = cute.make_rmem_tensor((8,), Int32)
-        route_scale_base = cute.make_rmem_tensor((8,), Int32)
+        route_output_base = cute.make_rmem_tensor((8,), Int64)
+        route_scale_base = cute.make_rmem_tensor((8,), Int64)
         produce_active = (
             Int32(0)
             if cutlass.const_expr(self.w4a8_m1_materialized or self.compute_only)
@@ -3283,7 +3291,8 @@ class MoEDynamicKernelBackend:
                                         get_ptr_as_int64(token_map, phys_row), map_value
                                     )
                                     st_global_f32(
-                                        get_ptr_as_int64(token_weights, phys_row), weight
+                                        get_ptr_as_int64(token_weights, phys_row),
+                                        weight,
                                     )
                                 slot = route_slot_base + topk_slot
                                 _st_shared_i32(
@@ -3325,8 +3334,10 @@ class MoEDynamicKernelBackend:
                                 if num_topk == Int32(8):
                                     for cache_slot in cutlass.range_constexpr(8):
                                         slot = route_slot_base + Int32(cache_slot)
-                                        shared_route_phys_rows[cache_slot] = _ld_shared_i32(
-                                            route_phys_rows_addr + slot * Int32(4)
+                                        shared_route_phys_rows[cache_slot] = (
+                                            _ld_shared_i32(
+                                                route_phys_rows_addr + slot * Int32(4)
+                                            )
                                         )
 
                                     blk_idx = lane_id + token_partition * Int32(32)
@@ -3340,17 +3351,13 @@ class MoEDynamicKernelBackend:
                                         if cutlass.const_expr(self.w4a8_trellis):
                                             payload, mx_scale_byte = (
                                                 quantize_block_fp8_mx(
-                                                    _w4a8_trellis_permute_k32(
-                                                        values
-                                                    ),
+                                                    _w4a8_trellis_permute_k32(values),
                                                     block_max,
                                                 )
                                             )
                                         else:
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
-                                                    values, block_max
-                                                )
+                                                quantize_block_fp8_mx(values, block_max)
                                             )
                                         for payload_pair in cutlass.range_constexpr(4):
                                             packed64 = (
@@ -3360,10 +3367,11 @@ class MoEDynamicKernelBackend:
                                             if cutlass.const_expr(
                                                 self.materialize_intermediate
                                             ):
-                                                output_offset = (
-                                                    token_idx * output_bytes_per_row
-                                                    + block_start
-                                                    + Int32(payload_pair * 8)
+                                                output_offset = _row_major_offset(
+                                                    token_idx,
+                                                    output_bytes_per_row,
+                                                    block_start
+                                                    + Int32(payload_pair * 8),
                                                 )
                                                 st_global_u64(
                                                     get_ptr_as_int64(
@@ -3377,18 +3385,23 @@ class MoEDynamicKernelBackend:
                                                 # type on the inactive-route
                                                 # fall-through path of the
                                                 # dynamic guard below.
-                                                output_offset = Int32(0)
-                                                for cache_slot in cutlass.range_constexpr(
-                                                    8
-                                                ):
+                                                output_offset = Int64(0)
+                                                for (
+                                                    cache_slot
+                                                ) in cutlass.range_constexpr(8):
                                                     phys_row = shared_route_phys_rows[
                                                         cache_slot
                                                     ]
                                                     if phys_row >= Int32(0):
                                                         output_offset = (
-                                                            phys_row * output_bytes_per_row
-                                                            + block_start
-                                                            + Int32(payload_pair * 8)
+                                                            _row_major_offset(
+                                                                phys_row,
+                                                                output_bytes_per_row,
+                                                                block_start
+                                                                + Int32(
+                                                                    payload_pair * 8
+                                                                ),
+                                                            )
                                                         )
                                                         st_global_u64(
                                                             get_ptr_as_int64(
@@ -3401,20 +3414,32 @@ class MoEDynamicKernelBackend:
                                             self.materialize_intermediate
                                         ):
                                             scale_storage[
-                                                token_idx * mx_blocks_per_row + blk_idx
+                                                _row_major_offset(
+                                                    token_idx,
+                                                    mx_blocks_per_row,
+                                                    blk_idx,
+                                                )
                                             ] = Uint8(mx_scale_byte & Uint32(0xFF))
                                         else:
-                                            for cache_slot in cutlass.range_constexpr(8):
+                                            for cache_slot in cutlass.range_constexpr(
+                                                8
+                                            ):
                                                 phys_row = shared_route_phys_rows[
                                                     cache_slot
                                                 ]
                                                 if phys_row >= Int32(0):
                                                     scale_storage[
-                                                        phys_row * mx_blocks_per_row + blk_idx
+                                                        _row_major_offset(
+                                                            phys_row,
+                                                            mx_blocks_per_row,
+                                                            blk_idx,
+                                                        )
                                                     ] = Uint8(
                                                         mx_scale_byte & Uint32(0xFF)
                                                     )
-                                        blk_idx += Int32(self.input_warps_per_token * 32)
+                                        blk_idx += Int32(
+                                            self.input_warps_per_token * 32
+                                        )
                                 else:
                                     blk_idx = lane_id + token_partition * Int32(32)
                                     while blk_idx < mx_blocks_per_row:
@@ -3427,17 +3452,13 @@ class MoEDynamicKernelBackend:
                                         if cutlass.const_expr(self.w4a8_trellis):
                                             payload, mx_scale_byte = (
                                                 quantize_block_fp8_mx(
-                                                    _w4a8_trellis_permute_k32(
-                                                        values
-                                                    ),
+                                                    _w4a8_trellis_permute_k32(values),
                                                     block_max,
                                                 )
                                             )
                                         else:
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
-                                                    values, block_max
-                                                )
+                                                quantize_block_fp8_mx(values, block_max)
                                             )
                                         for payload_pair in cutlass.range_constexpr(4):
                                             packed64 = (
@@ -3447,10 +3468,11 @@ class MoEDynamicKernelBackend:
                                             if cutlass.const_expr(
                                                 self.materialize_intermediate
                                             ):
-                                                output_offset = (
-                                                    token_idx * output_bytes_per_row
-                                                    + block_start
-                                                    + Int32(payload_pair * 8)
+                                                output_offset = _row_major_offset(
+                                                    token_idx,
+                                                    output_bytes_per_row,
+                                                    block_start
+                                                    + Int32(payload_pair * 8),
                                                 )
                                                 st_global_u64(
                                                     get_ptr_as_int64(
@@ -3465,7 +3487,7 @@ class MoEDynamicKernelBackend:
                                                 # dynamic while.  Keep the address
                                                 # offset in rmem and update it for
                                                 # each routed copy below.
-                                                output_offset = Int32(0)
+                                                output_offset = Int64(0)
                                                 topk_slot = Int32(0)
                                                 while topk_slot < num_topk:
                                                     slot = route_slot_base + topk_slot
@@ -3475,9 +3497,14 @@ class MoEDynamicKernelBackend:
                                                     )
                                                     if phys_row >= Int32(0):
                                                         output_offset = (
-                                                            phys_row * output_bytes_per_row
-                                                            + block_start
-                                                            + Int32(payload_pair * 8)
+                                                            _row_major_offset(
+                                                                phys_row,
+                                                                output_bytes_per_row,
+                                                                block_start
+                                                                + Int32(
+                                                                    payload_pair * 8
+                                                                ),
+                                                            )
                                                         )
                                                         st_global_u64(
                                                             get_ptr_as_int64(
@@ -3491,23 +3518,34 @@ class MoEDynamicKernelBackend:
                                             self.materialize_intermediate
                                         ):
                                             scale_storage[
-                                                token_idx * mx_blocks_per_row + blk_idx
+                                                _row_major_offset(
+                                                    token_idx,
+                                                    mx_blocks_per_row,
+                                                    blk_idx,
+                                                )
                                             ] = Uint8(mx_scale_byte & Uint32(0xFF))
                                         else:
                                             topk_slot = Int32(0)
                                             while topk_slot < num_topk:
                                                 slot = route_slot_base + topk_slot
                                                 phys_row = _ld_shared_i32(
-                                                    route_phys_rows_addr + slot * Int32(4)
+                                                    route_phys_rows_addr
+                                                    + slot * Int32(4)
                                                 )
                                                 if phys_row >= Int32(0):
                                                     scale_storage[
-                                                        phys_row * mx_blocks_per_row + blk_idx
+                                                        _row_major_offset(
+                                                            phys_row,
+                                                            mx_blocks_per_row,
+                                                            blk_idx,
+                                                        )
                                                     ] = Uint8(
                                                         mx_scale_byte & Uint32(0xFF)
                                                     )
                                                 topk_slot += Int32(1)
-                                        blk_idx += Int32(self.input_warps_per_token * 32)
+                                        blk_idx += Int32(
+                                            self.input_warps_per_token * 32
+                                        )
                             else:
                                 gs_value = shared_input_gs_value
                                 if num_topk == Int32(8):
@@ -3516,22 +3554,25 @@ class MoEDynamicKernelBackend:
                                         phys_row = _ld_shared_i32(
                                             route_phys_rows_addr + slot * Int32(4)
                                         )
-                                        route_output_base[cache_slot] = Int32(-1)
-                                        route_scale_base[cache_slot] = Int32(-1)
+                                        route_output_base[cache_slot] = Int64(-1)
+                                        route_scale_base[cache_slot] = Int64(-1)
                                         if phys_row >= Int32(0):
                                             route_output_base[cache_slot] = (
-                                                phys_row * output_bytes_per_row
+                                                _row_major_offset(
+                                                    phys_row,
+                                                    output_bytes_per_row,
+                                                    Int32(0),
+                                                )
                                             )
                                             # Scale storage is tiled in 128-row SF
                                             # atoms, independently of the MMA tile.
-                                            sf_atom = phys_row >> Int32(7)
-                                            sf_row = phys_row & Int32(127)
                                             route_scale_base[cache_slot] = (
-                                                sf_atom
-                                                * num_k_tiles
-                                                * Int32(32 * 4 * 4)
-                                                + (sf_row % Int32(32)) * Int32(4 * 4)
-                                                + (sf_row // Int32(32)) * Int32(4)
+                                                _scale_atom_offset(
+                                                    phys_row,
+                                                    num_k_tiles,
+                                                    Int32(0),
+                                                    Int32(0),
+                                                )
                                             )
 
                                     sf_idx = lane_id
@@ -3544,16 +3585,21 @@ class MoEDynamicKernelBackend:
                                         for elem_idx in cutlass.range_constexpr(16):
                                             value = cutlass.Float32(
                                                 a_input[
-                                                    token_idx, block_start + Int32(elem_idx)
+                                                    token_idx,
+                                                    block_start + Int32(elem_idx),
                                                 ]
                                             )
                                             values[elem_idx] = value
-                                            block_max = fmax_f32(block_max, fabs_f32(value))
+                                            block_max = fmax_f32(
+                                                block_max, fabs_f32(value)
+                                            )
                                         packed64 = Uint64(0)
                                         scale_byte = Uint8(0)
                                         if self.is_gated and self.fast_math:
-                                            packed64, scale_byte = quantize_block_fp4_fast(
-                                                values, block_max, gs_value
+                                            packed64, scale_byte = (
+                                                quantize_block_fp4_fast(
+                                                    values, block_max, gs_value
+                                                )
                                             )
                                         else:
                                             packed64, scale_byte = quantize_block_fp4(
@@ -3562,15 +3608,15 @@ class MoEDynamicKernelBackend:
 
                                         k_tile_idx = sf_idx // Int32(4)
                                         inner_k_idx = sf_idx % Int32(4)
-                                        scale_k_base = (
-                                            k_tile_idx * Int32(32 * 4 * 4) + inner_k_idx
-                                        )
+                                        scale_k_base = Int64(k_tile_idx) * Int64(
+                                            32 * 4 * 4
+                                        ) + Int64(inner_k_idx)
                                         for cache_slot in cutlass.range_constexpr(8):
                                             output_base = route_output_base[cache_slot]
-                                            if output_base >= Int32(0):
-                                                output_offset = output_base + sf_idx * Int32(
-                                                    8
-                                                )
+                                            if output_base >= Int64(0):
+                                                output_offset = output_base + Int64(
+                                                    sf_idx
+                                                ) * Int64(8)
                                                 st_global_u64(
                                                     get_ptr_as_int64(
                                                         packed_a_storage, output_offset
@@ -3593,16 +3639,21 @@ class MoEDynamicKernelBackend:
                                         for elem_idx in cutlass.range_constexpr(16):
                                             value = cutlass.Float32(
                                                 a_input[
-                                                    token_idx, block_start + Int32(elem_idx)
+                                                    token_idx,
+                                                    block_start + Int32(elem_idx),
                                                 ]
                                             )
                                             values[elem_idx] = value
-                                            block_max = fmax_f32(block_max, fabs_f32(value))
+                                            block_max = fmax_f32(
+                                                block_max, fabs_f32(value)
+                                            )
                                         packed64 = Uint64(0)
                                         scale_byte = Uint8(0)
                                         if self.is_gated and self.fast_math:
-                                            packed64, scale_byte = quantize_block_fp4_fast(
-                                                values, block_max, gs_value
+                                            packed64, scale_byte = (
+                                                quantize_block_fp4_fast(
+                                                    values, block_max, gs_value
+                                                )
                                             )
                                         else:
                                             packed64, scale_byte = quantize_block_fp4(
@@ -3616,9 +3667,10 @@ class MoEDynamicKernelBackend:
                                                 route_phys_rows_addr + slot * Int32(4)
                                             )
                                             if phys_row >= Int32(0):
-                                                output_offset = (
-                                                    phys_row * output_bytes_per_row
-                                                    + sf_idx * Int32(8)
+                                                output_offset = _row_major_offset(
+                                                    phys_row,
+                                                    output_bytes_per_row,
+                                                    sf_idx * Int32(8),
                                                 )
                                                 st_global_u64(
                                                     get_ptr_as_int64(
@@ -3629,20 +3681,11 @@ class MoEDynamicKernelBackend:
 
                                                 # Scale storage uses 128-row SF atoms,
                                                 # independently of the MMA tile.
-                                                k_tile_idx = sf_idx // Int32(4)
-                                                sf_atom = phys_row >> Int32(7)
-                                                sf_row = phys_row & Int32(127)
-                                                outer_m_idx = sf_row % Int32(32)
-                                                inner_m_idx = sf_row // Int32(32)
-                                                inner_k_idx = sf_idx % Int32(4)
-                                                scale_offset = (
-                                                    sf_atom
-                                                    * num_k_tiles
-                                                    * Int32(32 * 4 * 4)
-                                                    + k_tile_idx * Int32(32 * 4 * 4)
-                                                    + outer_m_idx * Int32(4 * 4)
-                                                    + inner_m_idx * Int32(4)
-                                                    + inner_k_idx
+                                                scale_offset = _scale_atom_offset(
+                                                    phys_row,
+                                                    num_k_tiles,
+                                                    sf_idx // Int32(4),
+                                                    sf_idx % Int32(4),
                                                 )
                                                 scale_storage[scale_offset] = scale_byte
                                             topk_slot += Int32(1)
@@ -3769,28 +3812,29 @@ class MoEDynamicKernelBackend:
                                         for elem_idx in cutlass.range_constexpr(32):
                                             value = cutlass.Float32(
                                                 a_input[
-                                                    token_idx, block_start + Int32(elem_idx)
+                                                    token_idx,
+                                                    block_start + Int32(elem_idx),
                                                 ]
                                             )
                                             values[elem_idx] = value
-                                            block_max = fmax_f32(block_max, fabs_f32(value))
+                                            block_max = fmax_f32(
+                                                block_max, fabs_f32(value)
+                                            )
                                         if cutlass.const_expr(self.w4a8_trellis):
                                             payload, mx_scale_byte = (
                                                 quantize_block_fp8_mx(
-                                                    _w4a8_trellis_permute_k32(
-                                                        values
-                                                    ),
+                                                    _w4a8_trellis_permute_k32(values),
                                                     block_max,
                                                 )
                                             )
                                         else:
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
-                                                    values, block_max
-                                                )
+                                                quantize_block_fp8_mx(values, block_max)
                                             )
-                                        output_offset = (
-                                            phys_row * output_bytes_per_row + block_start
+                                        output_offset = _row_major_offset(
+                                            phys_row,
+                                            output_bytes_per_row,
+                                            block_start,
                                         )
                                         for pair_idx in cutlass.range_constexpr(4):
                                             packed64 = (
@@ -3800,12 +3844,16 @@ class MoEDynamicKernelBackend:
                                             st_global_u64(
                                                 get_ptr_as_int64(
                                                     packed_a_storage,
-                                                    output_offset + Int32(pair_idx * 8),
+                                                    output_offset + Int64(pair_idx * 8),
                                                 ),
                                                 packed64,
                                             )
                                         scale_storage[
-                                            phys_row * mx_blocks_per_row + blk_idx
+                                            _row_major_offset(
+                                                phys_row,
+                                                mx_blocks_per_row,
+                                                blk_idx,
+                                            )
                                         ] = Uint8(mx_scale_byte & Uint32(0xFF))
                                         blk_idx += Int32(32)
                                 elif cutlass.const_expr(self.is_w6a8):
@@ -3826,11 +3874,14 @@ class MoEDynamicKernelBackend:
                                         for elem_idx in cutlass.range_constexpr(32):
                                             value = cutlass.Float32(
                                                 a_input[
-                                                    token_idx, block_start + Int32(elem_idx)
+                                                    token_idx,
+                                                    block_start + Int32(elem_idx),
                                                 ]
                                             )
                                             values[elem_idx] = value
-                                            block_max = fmax_f32(block_max, fabs_f32(value))
+                                            block_max = fmax_f32(
+                                                block_max, fabs_f32(value)
+                                            )
                                         containers, scale_byte = (
                                             moe_mxfp6_quantize_input_block_containers(
                                                 values,
@@ -3839,35 +3890,26 @@ class MoEDynamicKernelBackend:
                                                 self.mxfp6_fmt_a,
                                             )
                                         )
-                                        output_offset = (
-                                            phys_tile * Int32(self.tile_shape_mnk[0])
-                                            + row % Int32(self.tile_shape_mnk[0])
-                                        ) * output_bytes_per_row + (
-                                            sf_idx * packed_bytes_per_sf_block
-                                        )
-                                        moe_mxfp6_store_expanded_global(
-                                            packed_a_storage,
-                                            output_offset,
-                                            containers,
-                                        )
-
-                                        k_tile_idx = sf_idx // Int32(4)
-                                        inner_k_idx = sf_idx % Int32(4)
-                                        # Scale storage uses 128-row SF atoms,
-                                        # independently of the MMA tile.
                                         phys_row = phys_tile * Int32(
                                             self.tile_shape_mnk[0]
                                         ) + row % Int32(self.tile_shape_mnk[0])
-                                        sf_atom = phys_row >> Int32(7)
-                                        sf_row = phys_row & Int32(127)
-                                        scale_offset = (
-                                            sf_atom
-                                            * num_k_tiles
-                                            * Int32(32 * 4 * 4)
-                                            + k_tile_idx * Int32(32 * 4 * 4)
-                                            + (sf_row % Int32(32)) * Int32(4 * 4)
-                                            + (sf_row // Int32(32)) * Int32(4)
-                                            + inner_k_idx
+                                        output_offset = _row_major_offset(
+                                            phys_row,
+                                            output_bytes_per_row,
+                                            sf_idx * packed_bytes_per_sf_block,
+                                        )
+                                        for byte_idx in cutlass.range_constexpr(32):
+                                            packed_a_storage[
+                                                output_offset + Int64(byte_idx)
+                                            ] = containers[byte_idx]
+
+                                        # Scale storage uses 128-row SF atoms,
+                                        # independently of the MMA tile.
+                                        scale_offset = _scale_atom_offset(
+                                            phys_row,
+                                            num_k_tiles,
+                                            sf_idx // Int32(4),
+                                            sf_idx % Int32(4),
                                         )
                                         scale_storage[scale_offset] = scale_byte
                                         sf_idx += Int32(32)
@@ -3882,26 +3924,35 @@ class MoEDynamicKernelBackend:
                                         for elem_idx in cutlass.range_constexpr(16):
                                             value = cutlass.Float32(
                                                 a_input[
-                                                    token_idx, block_start + Int32(elem_idx)
+                                                    token_idx,
+                                                    block_start + Int32(elem_idx),
                                                 ]
                                             )
                                             values[elem_idx] = value
-                                            block_max = fmax_f32(block_max, fabs_f32(value))
+                                            block_max = fmax_f32(
+                                                block_max, fabs_f32(value)
+                                            )
                                         packed64 = Uint64(0)
                                         scale_byte = Uint8(0)
                                         if self.is_gated and self.fast_math:
-                                            packed64, scale_byte = quantize_block_fp4_fast(
-                                                values, block_max, gs_value
+                                            packed64, scale_byte = (
+                                                quantize_block_fp4_fast(
+                                                    values, block_max, gs_value
+                                                )
                                             )
                                         else:
                                             packed64, scale_byte = quantize_block_fp4(
                                                 values, block_max, gs_value
                                             )
 
-                                        output_offset = (
-                                            phys_tile * Int32(self.tile_shape_mnk[0])
-                                            + row % Int32(self.tile_shape_mnk[0])
-                                        ) * output_bytes_per_row + sf_idx * Int32(8)
+                                        phys_row = phys_tile * Int32(
+                                            self.tile_shape_mnk[0]
+                                        ) + row % Int32(self.tile_shape_mnk[0])
+                                        output_offset = _row_major_offset(
+                                            phys_row,
+                                            output_bytes_per_row,
+                                            sf_idx * Int32(8),
+                                        )
                                         st_global_u64(
                                             get_ptr_as_int64(
                                                 packed_a_storage, output_offset
@@ -3909,23 +3960,11 @@ class MoEDynamicKernelBackend:
                                             packed64,
                                         )
 
-                                        k_tile_idx = sf_idx // Int32(4)
-                                        inner_k_idx = sf_idx % Int32(4)
-                                        # Scale storage uses 128-row SF atoms,
-                                        # independently of the MMA tile.
-                                        phys_row = phys_tile * Int32(
-                                            self.tile_shape_mnk[0]
-                                        ) + row % Int32(self.tile_shape_mnk[0])
-                                        sf_atom = phys_row >> Int32(7)
-                                        sf_row = phys_row & Int32(127)
-                                        scale_offset = (
-                                            sf_atom
-                                            * num_k_tiles
-                                            * Int32(32 * 4 * 4)
-                                            + k_tile_idx * Int32(32 * 4 * 4)
-                                            + (sf_row % Int32(32)) * Int32(4 * 4)
-                                            + (sf_row // Int32(32)) * Int32(4)
-                                            + inner_k_idx
+                                        scale_offset = _scale_atom_offset(
+                                            phys_row,
+                                            num_k_tiles,
+                                            sf_idx // Int32(4),
+                                            sf_idx % Int32(4),
                                         )
                                         scale_storage[scale_offset] = scale_byte
                                         sf_idx += Int32(32)
@@ -3940,7 +3979,9 @@ class MoEDynamicKernelBackend:
 
                                     if lane_id == Int32(0):
                                         completed = atomic_add_global_i32(
-                                            get_ptr_as_int64(tile_write_count, phys_tile),
+                                            get_ptr_as_int64(
+                                                tile_write_count, phys_tile
+                                            ),
                                             Int32(1),
                                         ) + Int32(1)
                                         if completed == Int32(self.tile_shape_mnk[0]):
@@ -3960,9 +4001,7 @@ class MoEDynamicKernelBackend:
                                             )
                         warp_item += Int32(1)
 
-        if cutlass.const_expr(
-            not self.compute_only and not self.w4a8_m1_materialized
-        ):
+        if cutlass.const_expr(not self.compute_only and not self.w4a8_m1_materialized):
             cute.arch.sync_threads()
             # Conservative publish fence before the last-producer CTA flushes
             # any partial tiles. All producer threads in the CTA must order
@@ -3989,10 +4028,7 @@ class MoEDynamicKernelBackend:
                     while pair_flush < total_pairs:
                         expert_flush = topk_ids[pair_flush].to(Int32)
                         valid_rows = Int32(0)
-                        if (
-                            expert_flush >= Int32(0)
-                            and expert_flush < num_experts
-                        ):
+                        if expert_flush >= Int32(0) and expert_flush < num_experts:
                             valid_rows = Int32(1)
                         else:
                             # Deferred direct tasks use an arithmetic slot per
@@ -4673,8 +4709,7 @@ class MoEDynamicKernelBackend:
                     Int32(tidx) & Int32(31), self.trellis_bits
                 )
                 trellis_lut_addr = Int64(
-                    ctrl_base_addr
-                    + Int32(Storage._offsets["trellis_lut_smem"])
+                    ctrl_base_addr + Int32(Storage._offsets["trellis_lut_smem"])
                 )
 
         # w4a8 TMA-B: per-mbarrier phase bits, owned by producer warps.
@@ -4892,10 +4927,7 @@ class MoEDynamicKernelBackend:
                 # its intermediate SF is quant-written to the atom's first half.)
                 if cutlass.const_expr(
                     (not self.is_w4a8)
-                    and (
-                        self.sa_tiles_per_block > 1
-                        or self.sfa_tiles_per_block > 1
-                    )
+                    and (self.sa_tiles_per_block > 1 or self.sfa_tiles_per_block > 1)
                 ):
                     _fc1_off = task_m_tile_idx % Int32(self.sfa_tiles_per_block)
                     if cutlass.const_expr(self.sa_tiles_per_block > 1):
@@ -4979,8 +5011,7 @@ class MoEDynamicKernelBackend:
                         self.deterministic_output
                         and (not self.is_w4a8)
                         and (
-                            self.sa_tiles_per_block > 1
-                            or self.sfa_tiles_per_block > 1
+                            self.sa_tiles_per_block > 1 or self.sfa_tiles_per_block > 1
                         )
                     ):
                         _fc1_off = task_m_tile_idx % Int32(self.sfa_tiles_per_block)
@@ -5294,8 +5325,7 @@ class MoEDynamicKernelBackend:
                             for byte_idx in cutlass.range_constexpr(8):
                                 src_pcol = packed_base + Int32(byte_idx)
                                 byte_val = Uint8(
-                                    (packed64 >> Uint64(byte_idx * 8))
-                                    & Uint64(0xFF)
+                                    (packed64 >> Uint64(byte_idx * 8)) & Uint64(0xFF)
                                 )
                                 if cutlass.const_expr(self.sa_tile_shape_mk[0] < 128):
                                     # Compact M16/M32/M64 A uses the same
@@ -5585,22 +5615,18 @@ class MoEDynamicKernelBackend:
                                                 tr_base0_u = tr_base0 + Int32(
                                                     512 * self.trellis_bits
                                                 )
-                                                blo_u, bhi_u = (
-                                                    _w4a8_trellis_pair_words(
-                                                        b_buf,
-                                                        Int32(lane_id),
-                                                        tr_base0_u,
-                                                        tr_base0_u
-                                                        + Int32(
-                                                            64 * self.trellis_bits
-                                                        ),
-                                                        tr_ia,
-                                                        tr_ib,
-                                                        tr_s2,
-                                                        tr_n_high,
-                                                        self.trellis_bits,
-                                                        trellis_lut_addr,
-                                                    )
+                                                blo_u, bhi_u = _w4a8_trellis_pair_words(
+                                                    b_buf,
+                                                    Int32(lane_id),
+                                                    tr_base0_u,
+                                                    tr_base0_u
+                                                    + Int32(64 * self.trellis_bits),
+                                                    tr_ia,
+                                                    tr_ib,
+                                                    tr_s2,
+                                                    tr_n_high,
+                                                    self.trellis_bits,
+                                                    trellis_lut_addr,
                                                 )
                                                 b_lo_u[_nt] = blo_u
                                                 b_hi_u[_nt] = bhi_u
@@ -5758,8 +5784,7 @@ class MoEDynamicKernelBackend:
                                         for _nt in cutlass.range_constexpr(fc1_n_tiles):
                                             _fi = ((_mt * fc1_n_tiles) + _nt) * 4
                                             if cutlass.const_expr(
-                                                self.w4a8_residual
-                                                or self.w4a8_trellis
+                                                self.w4a8_residual or self.w4a8_trellis
                                             ):
                                                 d0, d1, d2, d3 = (
                                                     mxfp8_mma_m16n8k32_f32_e4m3(
@@ -5917,8 +5942,7 @@ class MoEDynamicKernelBackend:
                                                 cute.size(tRS_rD_slice)
                                             ):
                                                 tRS_rD_slice[elem_idx] = (
-                                                    alpha_value
-                                                    * gate_slice[elem_idx]
+                                                    alpha_value * gate_slice[elem_idx]
                                                 )
                                         elif cutlass.const_expr(self.is_gated):
                                             up_slice = tRS_rUp[(None, mma_m, mma_n)]
@@ -5972,18 +5996,16 @@ class MoEDynamicKernelBackend:
                                 tr_lane = Int32(tidx) & Int32(31)
                                 tr_warp = Int32(tidx) >> Int32(5)
                                 tr_isz = gate_tile_cnt * Int32(128)
-                                tr_rot_base = task_expert_idx * (
-                                    Int32(3) * tr_isz
-                                ) + (
-                                    task_slice_begin_idx + slice_idx
-                                ) * Int32(128) + tr_lane * Int32(4)
+                                tr_rot_base = (
+                                    task_expert_idx * (Int32(3) * tr_isz)
+                                    + (task_slice_begin_idx + slice_idx) * Int32(128)
+                                    + tr_lane * Int32(4)
+                                )
                                 tr_ig = cute.make_rmem_tensor(
                                     (tr_row_slots * 4,), cutlass.Float32
                                 )
                                 for _sl in cutlass.range_constexpr(tr_row_slots):
-                                    tr_row = tr_warp + Int32(
-                                        _sl * self.num_mma_warps
-                                    )
+                                    tr_row = tr_warp + Int32(_sl * self.num_mma_warps)
                                     if tr_row < epi_rows:
                                         tr_c = tr_lane * Int32(4)
                                         g0 = cutlass.Float32(
@@ -6021,9 +6043,7 @@ class MoEDynamicKernelBackend:
                                         for mma_m_in_epi in cutlass.range_constexpr(
                                             MmaMPerEpiM
                                         ):
-                                            mma_m = (
-                                                epi_m * MmaMPerEpiM + mma_m_in_epi
-                                            )
+                                            mma_m = epi_m * MmaMPerEpiM + mma_m_in_epi
                                             mma_n = mma_n_in_epi
                                             tRS_rD_slice = tRS_rD[
                                                 (None, mma_m_in_epi, mma_n_in_epi)
@@ -6033,8 +6053,7 @@ class MoEDynamicKernelBackend:
                                                 cute.size(tRS_rD_slice)
                                             ):
                                                 tRS_rD_slice[elem_idx] = (
-                                                    alpha_value
-                                                    * up_slice[elem_idx]
+                                                    alpha_value * up_slice[elem_idx]
                                                 )
                                     acc_vec = tRS_rD.load()
                                     acc_vec = acc_vec.to(cutlass.BFloat16)
@@ -6044,14 +6063,10 @@ class MoEDynamicKernelBackend:
                                         tRS_rD_out,
                                         tRS_sD[(None, None, None, epi_buffer)],
                                     )
-                                    cute.arch.fence_proxy(
-                                        "async.shared", space="cta"
-                                    )
+                                    cute.arch.fence_proxy("async.shared", space="cta")
                                 self.epilog_sync_barrier.arrive_and_wait()
                                 for _sl in cutlass.range_constexpr(tr_row_slots):
-                                    tr_row = tr_warp + Int32(
-                                        _sl * self.num_mma_warps
-                                    )
+                                    tr_row = tr_warp + Int32(_sl * self.num_mma_warps)
                                     if tr_row < epi_rows:
                                         tr_c = tr_lane * Int32(4)
                                         u0 = cutlass.Float32(
@@ -6090,9 +6105,7 @@ class MoEDynamicKernelBackend:
                                         sd_base = tr_rot_base + tr_isz + tr_isz
                                         a0 = self._gated_activation_value(
                                             tr_ig[_sl * 4], iu0
-                                        ) * cutlass.Float32(
-                                            trellis_rotations[sd_base]
-                                        )
+                                        ) * cutlass.Float32(trellis_rotations[sd_base])
                                         a1 = self._gated_activation_value(
                                             tr_ig[_sl * 4 + 1], iu1
                                         ) * cutlass.Float32(
@@ -6111,8 +6124,8 @@ class MoEDynamicKernelBackend:
                                         o0, o1, o2, o3 = _w4a8_had128_quad(
                                             a0, a1, a2, a3, tr_lane
                                         )
-                                        sC[tr_row, tr_c, epi_buffer] = (
-                                            cutlass.BFloat16(o0)
+                                        sC[tr_row, tr_c, epi_buffer] = cutlass.BFloat16(
+                                            o0
                                         )
                                         sC[tr_row, tr_c + Int32(1), epi_buffer] = (
                                             cutlass.BFloat16(o1)
@@ -6150,31 +6163,24 @@ class MoEDynamicKernelBackend:
                                     (tr_row_slots * 8,), cutlass.Float32
                                 )
                                 for _sl in cutlass.range_constexpr(tr_row_slots):
-                                    tr_row = tr_warp + Int32(
-                                        _sl * self.num_mma_warps
-                                    )
+                                    tr_row = tr_warp + Int32(_sl * self.num_mma_warps)
                                     if tr_row < epi_rows:
                                         for _pb in cutlass.range_constexpr(2):
                                             tr_ci = (
                                                 Int32(_pb * 64)
-                                                + (
-                                                    (tr_chunk >> Int32(1))
-                                                    << Int32(5)
-                                                )
+                                                + ((tr_chunk >> Int32(1)) << Int32(5))
                                                 + tr_chunk_lane * Int32(4)
                                             )
                                             if tr_slot == Int32(0):
-                                                for _e in cutlass.range_constexpr(
-                                                    4
-                                                ):
-                                                    tr_pre[
-                                                        _sl * 8 + _pb * 4 + _e
-                                                    ] = cutlass.Float32(
-                                                        sC[
-                                                            tr_row,
-                                                            tr_ci + Int32(_e),
-                                                            epi_buffer,
-                                                        ]
+                                                for _e in cutlass.range_constexpr(4):
+                                                    tr_pre[_sl * 8 + _pb * 4 + _e] = (
+                                                        cutlass.Float32(
+                                                            sC[
+                                                                tr_row,
+                                                                tr_ci + Int32(_e),
+                                                                epi_buffer,
+                                                            ]
+                                                        )
                                                     )
                                 self.epilog_sync_barrier.arrive_and_wait()
                                 if epi_m_valid > Int32(0):
@@ -6184,9 +6190,7 @@ class MoEDynamicKernelBackend:
                                         for mma_m_in_epi in cutlass.range_constexpr(
                                             MmaMPerEpiM
                                         ):
-                                            mma_m = (
-                                                epi_m * MmaMPerEpiM + mma_m_in_epi
-                                            )
+                                            mma_m = epi_m * MmaMPerEpiM + mma_m_in_epi
                                             mma_n = mma_n_in_epi
                                             tRS_rD_slice = tRS_rD[
                                                 (None, mma_m_in_epi, mma_n_in_epi)
@@ -6196,8 +6200,7 @@ class MoEDynamicKernelBackend:
                                                 cute.size(tRS_rD_slice)
                                             ):
                                                 tRS_rD_slice[elem_idx] = (
-                                                    alpha_value
-                                                    * up_slice[elem_idx]
+                                                    alpha_value * up_slice[elem_idx]
                                                 )
                                     acc_vec = tRS_rD.load()
                                     acc_vec = acc_vec.to(cutlass.BFloat16)
@@ -6207,14 +6210,10 @@ class MoEDynamicKernelBackend:
                                         tRS_rD_out,
                                         tRS_sD[(None, None, None, epi_buffer)],
                                     )
-                                    cute.arch.fence_proxy(
-                                        "async.shared", space="cta"
-                                    )
+                                    cute.arch.fence_proxy("async.shared", space="cta")
                                 self.epilog_sync_barrier.arrive_and_wait()
                                 for _sl in cutlass.range_constexpr(tr_row_slots):
-                                    tr_row = tr_warp + Int32(
-                                        _sl * self.num_mma_warps
-                                    )
+                                    tr_row = tr_warp + Int32(_sl * self.num_mma_warps)
                                     if tr_row < epi_rows:
                                         aa0 = cutlass.Float32(0.0)
                                         aa1 = cutlass.Float32(0.0)
@@ -6223,10 +6222,7 @@ class MoEDynamicKernelBackend:
                                         for _pb in cutlass.range_constexpr(2):
                                             tr_ci = (
                                                 Int32(_pb * 64)
-                                                + (
-                                                    (tr_chunk >> Int32(1))
-                                                    << Int32(5)
-                                                )
+                                                + ((tr_chunk >> Int32(1)) << Int32(5))
                                                 + tr_chunk_lane * Int32(4)
                                             )
                                             p0 = tr_pre[_sl * 8 + _pb * 4]
@@ -6263,8 +6259,7 @@ class MoEDynamicKernelBackend:
                                             )
                                             tr_coord = tr_slice_col + tr_ci
                                             tr_scale = (
-                                                task_expert_idx
-                                                * (Int32(6) * tr_isz)
+                                                task_expert_idx * (Int32(6) * tr_isz)
                                                 + tr_slot * tr_isz
                                                 + tr_coord
                                             )
@@ -6272,26 +6267,19 @@ class MoEDynamicKernelBackend:
                                                 trellis_rotations[tr_scale]
                                             )
                                             h1 = h1 * cutlass.Float32(
-                                                trellis_rotations[
-                                                    tr_scale + Int32(1)
-                                                ]
+                                                trellis_rotations[tr_scale + Int32(1)]
                                             )
                                             h2 = h2 * cutlass.Float32(
-                                                trellis_rotations[
-                                                    tr_scale + Int32(2)
-                                                ]
+                                                trellis_rotations[tr_scale + Int32(2)]
                                             )
                                             h3 = h3 * cutlass.Float32(
-                                                trellis_rotations[
-                                                    tr_scale + Int32(3)
-                                                ]
+                                                trellis_rotations[tr_scale + Int32(3)]
                                             )
                                             h0, h1, h2, h3 = _w4a8_had128_quad(
                                                 h0, h1, h2, h3, tr_lane
                                             )
                                             tr_sign = (
-                                                task_expert_idx
-                                                * (Int32(6) * tr_isz)
+                                                task_expert_idx * (Int32(6) * tr_isz)
                                                 + Int32(3) * tr_isz
                                                 + (
                                                     tr_slice_col
@@ -6304,26 +6292,16 @@ class MoEDynamicKernelBackend:
                                                 trellis_rotations[tr_sign]
                                             )
                                             h1 = h1 * cutlass.Float32(
-                                                trellis_rotations[
-                                                    tr_sign + Int32(1)
-                                                ]
+                                                trellis_rotations[tr_sign + Int32(1)]
                                             )
                                             h2 = h2 * cutlass.Float32(
-                                                trellis_rotations[
-                                                    tr_sign + Int32(2)
-                                                ]
+                                                trellis_rotations[tr_sign + Int32(2)]
                                             )
                                             h3 = h3 * cutlass.Float32(
-                                                trellis_rotations[
-                                                    tr_sign + Int32(3)
-                                                ]
+                                                trellis_rotations[tr_sign + Int32(3)]
                                             )
-                                            s0 = self._gated_activation_value(
-                                                h0, h1
-                                            )
-                                            s1 = self._gated_activation_value(
-                                                h2, h3
-                                            )
+                                            s0 = self._gated_activation_value(h0, h1)
+                                            s1 = self._gated_activation_value(h2, h3)
                                             if cutlass.const_expr(_pb == 0):
                                                 aa0 = s0
                                                 aa1 = s1
@@ -6351,8 +6329,7 @@ class MoEDynamicKernelBackend:
                                             v3 = bv3
                                         tr_col = tr_slice_col + tr_lane * Int32(4)
                                         tr_ub = (
-                                            task_expert_idx
-                                            * (Int32(6) * tr_isz)
+                                            task_expert_idx * (Int32(6) * tr_isz)
                                             + Int32(5) * tr_isz
                                             + tr_col
                                         )
@@ -6372,8 +6349,7 @@ class MoEDynamicKernelBackend:
                                             v0, v1, v2, v3, tr_lane
                                         )
                                         tr_dn = (
-                                            task_expert_idx
-                                            * (Int32(6) * tr_isz)
+                                            task_expert_idx * (Int32(6) * tr_isz)
                                             + Int32(2) * tr_isz
                                             + tr_col
                                         )
@@ -6518,12 +6494,8 @@ class MoEDynamicKernelBackend:
                         csSFA_p = csSFA[None, None, None, cons_state.index]
                         csSFB_p = csSFB[None, None, None, cons_state.index]
                         if cutlass.const_expr(self.w4a4_fc1_fused):
-                            csB_up_p = csB_up[
-                                None, None, None, up_cons_state.index
-                            ]
-                            csSFB_up_p = csSFB_up[
-                                None, None, None, up_cons_state.index
-                            ]
+                            csB_up_p = csB_up[None, None, None, up_cons_state.index]
+                            csSFB_up_p = csSFB_up[None, None, None, up_cons_state.index]
                         if cutlass.const_expr(self.w4a4_fc1_fused):
                             cute.copy(
                                 smem_copy_A,
@@ -6601,9 +6573,7 @@ class MoEDynamicKernelBackend:
                                     fz_csSFA_p = cute.filter_zeros(csSFA_p)
                                     fz_csSFB_p = cute.filter_zeros(csSFB_p)
                                     if cutlass.const_expr(self.w4a4_fc1_fused):
-                                        fz_csSFB_up_p = cute.filter_zeros(
-                                            csSFB_up_p
-                                        )
+                                        fz_csSFB_up_p = cute.filter_zeros(csSFB_up_p)
                                     ml_pipeline.consumer_wait(cons_state, peek)
                                     if cutlass.const_expr(self.w4a4_fc1_fused):
                                         up_pipeline.consumer_wait(
@@ -6643,9 +6613,7 @@ class MoEDynamicKernelBackend:
                                         else:
                                             mma_atom.set(
                                                 WarpField.SFA,
-                                                tCrSFA_fc1_cur[
-                                                    None, _mt, 0
-                                                ].iterator,
+                                                tCrSFA_fc1_cur[None, _mt, 0].iterator,
                                             )
                                             mma_atom.set(
                                                 WarpField.SFB,
@@ -6658,9 +6626,7 @@ class MoEDynamicKernelBackend:
                                                 tCrB[None, _nt, k_block_idx],
                                                 gate_acc[None, _mt, _nt],
                                             )
-                                            if cutlass.const_expr(
-                                                self.w4a4_fc1_fused
-                                            ):
+                                            if cutlass.const_expr(self.w4a4_fc1_fused):
                                                 mma_atom.set(
                                                     WarpField.SFA,
                                                     tCrSFA_fc1_cur[
@@ -6682,11 +6648,25 @@ class MoEDynamicKernelBackend:
                                                     ],
                                                     up_acc[None, _mt, _nt],
                                                 )
-                                cute.copy(
-                                    smem_copy_A,
-                                    csA_p[None, None, k_next],
-                                    crA_fc1_cur[None, None, 0],
-                                )
+                                if cutlass.const_expr(self.w4a4_fc1_fused):
+                                    cute.copy(
+                                        smem_copy_A,
+                                        csA_p[None, None, k_next],
+                                        crA_fc1_cur[None, None, 0],
+                                    )
+                                else:
+                                    if cutlass.const_expr(self.is_w6a8):
+                                        cute.copy(
+                                            smem_copy_A,
+                                            csA_p[None, None, k_next],
+                                            crA[None, None, k_next],
+                                        )
+                                    else:
+                                        cute.copy(
+                                            smem_copy_A,
+                                            csA_p[None, None, k_next],
+                                            crA[None, None, 0],
+                                        )
                                 cute.copy(
                                     smem_copy_B,
                                     csB_p[None, None, k_next],
@@ -6704,11 +6684,25 @@ class MoEDynamicKernelBackend:
                                 fz_csSFB_cur = cute.filter_zeros(
                                     csSFB[None, None, None, cons_state.index]
                                 )
-                                cute.copy(
-                                    smem_copy_SFA,
-                                    fz_csSFA_cur[None, None, k_next],
-                                    fz_crSFA_fc1_cur[None, None, 0],
-                                )
+                                if cutlass.const_expr(self.w4a4_fc1_fused):
+                                    cute.copy(
+                                        smem_copy_SFA,
+                                        fz_csSFA_cur[None, None, k_next],
+                                        fz_crSFA_fc1_cur[None, None, 0],
+                                    )
+                                else:
+                                    if cutlass.const_expr(self.is_w6a8):
+                                        cute.copy(
+                                            smem_copy_SFA,
+                                            fz_csSFA_cur[None, None, k_next],
+                                            fz_crSFA[None, None, k_next],
+                                        )
+                                    else:
+                                        cute.copy(
+                                            smem_copy_SFA,
+                                            fz_csSFA_cur[None, None, k_next],
+                                            fz_crSFA[None, None, 0],
+                                        )
                                 cute.copy(
                                     smem_copy_SFB,
                                     fz_csSFB_cur[None, None, k_next],
@@ -6787,14 +6781,10 @@ class MoEDynamicKernelBackend:
                                             tCrB[None, _nt, k_block_idx],
                                             gate_acc[None, _mt, _nt],
                                         )
-                                        if cutlass.const_expr(
-                                            self.w4a4_fc1_fused
-                                        ):
+                                        if cutlass.const_expr(self.w4a4_fc1_fused):
                                             mma_atom.set(
                                                 WarpField.SFA,
-                                                tCrSFA_fc1_cur[
-                                                    None, _mt, 0
-                                                ].iterator,
+                                                tCrSFA_fc1_cur[None, _mt, 0].iterator,
                                             )
                                             mma_atom.set(
                                                 WarpField.SFB,
@@ -6806,22 +6796,44 @@ class MoEDynamicKernelBackend:
                                                 mma_atom,
                                                 up_acc[None, _mt, _nt],
                                                 tCrA_fc1_cur[None, _mt, 0],
-                                                tCrB_up_fused[
-                                                    None, _nt, k_block_idx
-                                                ],
+                                                tCrB_up_fused[None, _nt, k_block_idx],
                                                 up_acc[None, _mt, _nt],
                                             )
                             if k_next > 0 and fc1_k_tile_cnt > Int32(0):
-                                cute.copy(
-                                    smem_copy_A,
-                                    csA_p[None, None, k_next],
-                                    crA_fc1_cur[None, None, 0],
-                                )
-                                cute.copy(
-                                    smem_copy_SFA,
-                                    fz_csSFA_p[None, None, k_next],
-                                    fz_crSFA_fc1_cur[None, None, 0],
-                                )
+                                if cutlass.const_expr(self.w4a4_fc1_fused):
+                                    cute.copy(
+                                        smem_copy_A,
+                                        csA_p[None, None, k_next],
+                                        crA_fc1_cur[None, None, 0],
+                                    )
+                                    cute.copy(
+                                        smem_copy_SFA,
+                                        fz_csSFA_p[None, None, k_next],
+                                        fz_crSFA_fc1_cur[None, None, 0],
+                                    )
+                                else:
+                                    if cutlass.const_expr(self.is_w6a8):
+                                        cute.copy(
+                                            smem_copy_A,
+                                            csA_p[None, None, k_next],
+                                            crA[None, None, k_next],
+                                        )
+                                        cute.copy(
+                                            smem_copy_SFA,
+                                            fz_csSFA_p[None, None, k_next],
+                                            fz_crSFA[None, None, k_next],
+                                        )
+                                    else:
+                                        cute.copy(
+                                            smem_copy_A,
+                                            csA_p[None, None, k_next],
+                                            crA[None, None, 0],
+                                        )
+                                        cute.copy(
+                                            smem_copy_SFA,
+                                            fz_csSFA_p[None, None, k_next],
+                                            fz_crSFA[None, None, 0],
+                                        )
                         # Signal FC1 gate/only completion before producer warps
                         # reuse the shared A/gate buffers for the next pass.
                         self.pass_gate_barrier.arrive_unaligned()
@@ -7290,9 +7302,7 @@ class MoEDynamicKernelBackend:
                                             dst_row = (
                                                 (src_pcol ^ xor_bits) << Int32(1)
                                             ) + row_high
-                                            dst_flat = (
-                                                dst_row * packed_cols + dst_pcol
-                                            )
+                                            dst_flat = dst_row * packed_cols + dst_pcol
                                             sA_u8[dst_flat] = byte_val
 
                                 outer_m_idx = row % Int32(32)
@@ -7635,9 +7645,9 @@ class MoEDynamicKernelBackend:
                                             ) & Int32(1)
                                             tr2_base0 = Int32(
                                                 _ot * 512 * self.trellis_bits
-                                            ) + (
-                                                Int32(_kb * 16) + n16_local2
-                                            ) * Int32(8 * self.trellis_bits)
+                                            ) + (Int32(_kb * 16) + n16_local2) * Int32(
+                                                8 * self.trellis_bits
+                                            )
                                             blo, bhi = _w4a8_trellis_pair_words(
                                                 b_buf,
                                                 Int32(lane_id),
@@ -7774,8 +7784,7 @@ class MoEDynamicKernelBackend:
                                                 + _nt
                                             ) * 4
                                             if cutlass.const_expr(
-                                                self.w4a8_residual
-                                                or self.w4a8_trellis
+                                                self.w4a8_residual or self.w4a8_trellis
                                             ):
                                                 d0, d1, d2, d3 = (
                                                     mxfp8_mma_m16n8k32_f32_e4m3(
@@ -8348,21 +8357,17 @@ class MoEDynamicKernelBackend:
                                         tr_k16_stride = tr_n16_cnt * Int32(
                                             8 * self.trellis_bits
                                         )
-                                        tr_expert_u32 = Int64(
-                                            w4a8_KT * 8
-                                        ) * Int64(tr_k16_stride)
+                                        tr_expert_u32 = Int64(w4a8_KT * 8) * Int64(
+                                            tr_k16_stride
+                                        )
                                         tr_proj = Int32(0)
                                         if cutlass.const_expr(_pp != 0):
                                             tr_proj = Int32(1)
-                                        tr_w13_half = Int64(
-                                            w13_rp.shape[0]
-                                        ) >> Int64(1)
+                                        tr_w13_half = Int64(w13_rp.shape[0]) >> Int64(1)
                                         tr_base = (
                                             Int64(tr_proj) * tr_w13_half
-                                            + Int64(task_expert_idx)
-                                            * tr_expert_u32
-                                            + Int64(_pkt * 8)
-                                            * Int64(tr_k16_stride)
+                                            + Int64(task_expert_idx) * tr_expert_u32
+                                            + Int64(_pkt * 8) * Int64(tr_k16_stride)
                                             + Int64(cur_slice_p * Int32(8))
                                             * Int64(8 * self.trellis_bits)
                                         )
@@ -8379,9 +8384,7 @@ class MoEDynamicKernelBackend:
                                             _w4a8_stage_trellis_b_tile(
                                                 w13_rp,
                                                 w4a8_b_dst
-                                                + Int32(
-                                                    2048 * self.trellis_bits
-                                                ),
+                                                + Int32(2048 * self.trellis_bits),
                                                 tr_base + tr_w13_half,
                                                 tr_k16_stride,
                                                 self.trellis_bits,
@@ -8555,8 +8558,7 @@ class MoEDynamicKernelBackend:
                                     # Trellis B is fully scaled E4M3 with an
                                     # identity SFB word; no SFB staging.
                                     if cutlass.const_expr(
-                                        self.w4a8_repacked
-                                        and not self.w4a8_trellis
+                                        self.w4a8_repacked and not self.w4a8_trellis
                                     ):
                                         _w4a8_stage_repacked_sfb_half(
                                             w13_sfb_rp,
@@ -8805,8 +8807,7 @@ class MoEDynamicKernelBackend:
                                         Int64(task_expert_idx) * tr2_expert_u32
                                         + Int64(cur_slice_p * Int32(8))
                                         * Int64(tr2_k16_stride)
-                                        + Int64(_pt)
-                                        * Int64(64 * self.trellis_bits)
+                                        + Int64(_pt) * Int64(64 * self.trellis_bits)
                                     )
                                     _w4a8_stage_trellis_b_tile(
                                         down_rp,
@@ -8822,8 +8823,7 @@ class MoEDynamicKernelBackend:
                                             down_rp,
                                             w4a8_b2_dst
                                             + Int32(2048 * self.trellis_bits),
-                                            tr2_base
-                                            + Int64(64 * self.trellis_bits),
+                                            tr2_base + Int64(64 * self.trellis_bits),
                                             tr2_k16_stride,
                                             self.trellis_bits,
                                             Int32(lane_id),
