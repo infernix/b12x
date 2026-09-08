@@ -8,18 +8,17 @@ import torch
 
 from b12x.attention import sparse_mla
 from b12x.attention._shared.mla import api as mla_api
-from b12x.attention.sparse_mla import api as sparse_mla_api
-from b12x.attention._shared.mla.reference import (
-    _sparse_attention_reference,
-    pack_mla_kv_cache_reference,
-    sparse_mla_reference,
-    unpack_mla_kv_cache_reference,
-)
 from b12x.attention._shared.mla.kv_cache import (
     _glm_next_cache_byte_offset,
     _glm_next_cache_record_address,
     clear_glm_next_mla_kv_cache_kernel_cache,
     concat_and_cache_glm_next_mla,
+)
+from b12x.attention._shared.mla.reference import (
+    _sparse_attention_reference,
+    pack_mla_kv_cache_reference,
+    sparse_mla_reference,
+    unpack_mla_kv_cache_reference,
 )
 from b12x.attention._shared.mla.traits import (
     ComputeMode,
@@ -29,10 +28,10 @@ from b12x.attention._shared.mla.traits import (
     make_unified_traits,
     resolve_unplanned_traits,
 )
+from b12x.attention.sparse_mla import api as sparse_mla_api
 from tests._reference.helpers import dequantize_nvfp4_mla_nope
 
 from ..conftest import require_b12x as require_sm120
-
 
 _GLM_NEXT_RECORD_BYTES = 528
 _GLM_NEXT_NVFP4_RECORD_BYTES = 304

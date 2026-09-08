@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import os
+from functools import lru_cache
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -13,10 +13,10 @@ import cutlass.utils as cutlass_utils
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 import torch
 from cutlass import Float32, Int32, Uint32, const_expr
-from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import LayoutEnum
 
 from b12x._lib.compiler import (

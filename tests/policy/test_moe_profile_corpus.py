@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from benchmarks.benchmark_moe import MODEL_PROFILES
 from b12x.policy.generation.moe_corpus import (
     COMMON_DECODE_TOKENS,
     COMMON_MOE_MODELS,
@@ -16,6 +15,7 @@ from b12x.policy.generation.moe_corpus import (
     expand_physical_geometries,
     expand_sweep_cases,
 )
+from benchmarks.benchmark_moe import MODEL_PROFILES
 
 
 def test_common_models_expand_across_tp1_through_tp16() -> None:

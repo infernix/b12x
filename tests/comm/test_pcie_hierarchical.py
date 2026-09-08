@@ -9,8 +9,8 @@ import pytest
 import torch
 
 import b12x.comm.pcie.pcie_allreduce as pcie_allreduce
-import b12x.comm.pcie.pcie_island_rs as pcie_island_rs
 import b12x.comm.pcie.pcie_dma as pcie_dma
+import b12x.comm.pcie.pcie_island_rs as pcie_island_rs
 import b12x.comm.pcie.pcie_oneshot as pcie_oneshot
 import b12x.comm.pcie.pcie_twoshot as pcie_twoshot
 from b12x.comm.pcie import _hierarchical_cute

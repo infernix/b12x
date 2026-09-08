@@ -11,7 +11,6 @@ import torch.multiprocessing as mp
 
 from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
 
-
 pytestmark = pytest.mark.skipif(
     os.getenv("B12X_RUN_PCIE_ONESHOT_TORTURE") != "1",
     reason="set B12X_RUN_PCIE_ONESHOT_TORTURE=1 to run PCIe oneshot CUDA torture tests",

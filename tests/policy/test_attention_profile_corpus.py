@@ -4,9 +4,6 @@ from contextlib import AbstractContextManager
 from types import SimpleNamespace
 
 import b12x.policy.generation.attention_corpus as attention_corpus_module
-from benchmarks.benchmark_gdn_decode import QWEN38_GDN_CASES
-from benchmarks.benchmark_paged_attention import BENCHMARK_PROFILES
-from benchmarks.benchmark_qsa import PROFILES as QSA_PROFILES
 from b12x.policy import (
     EMBEDDED_REGISTRY,
     DeviceIdentity,
@@ -29,9 +26,9 @@ from b12x.policy.generation.attention_corpus import (
     COMMON_PREFILL_TOKEN_CAPACITIES,
     COMMON_SEQUENCE_CAPACITIES,
     GDN_GEOMETRIES,
-    GQA_GEOMETRIES,
     GLM53_TP3_KDA_PROFILE_IDS,
     GLM53_TP3_KDA_SERVING_CASES,
+    GQA_GEOMETRIES,
     MLA_GEOMETRIES,
     QSA_DIRECT_PREFILL_ROWS,
     QSA_GEOMETRIES,
@@ -44,28 +41,31 @@ from b12x.policy.generation.attention_corpus import (
     qsa_cases,
     sparse_mla_cases,
 )
-from b12x.policy.generation.providers import register_builtin_generators
 from b12x.policy.generation.progress import NullProgressReporter
+from b12x.policy.generation.providers import register_builtin_generators
 from b12x.policy.generation.providers.attention import (
     GdnAttentionGenerator,
     QsaAttentionGenerator,
     _QsaSession,
 )
 from b12x.policy.generation.providers.gpu_workers import GdnBenchmarkFactory
-from b12x.policy.generation.providers.qualification import (
-    _DsaIndexerProbe,
-    DsaIndexerGenerator,
-    SparseMlaGenerator,
-)
 from b12x.policy.generation.providers.norm_sequence import (
     MhcGenerator,
-    _MhcSession,
     _hyperconnection_cases,
     _mhc_cases,
+    _MhcSession,
     _mtp_feedback_cases,
+)
+from b12x.policy.generation.providers.qualification import (
+    DsaIndexerGenerator,
+    SparseMlaGenerator,
+    _DsaIndexerProbe,
 )
 from b12x.policy.generation.registry import ComponentGeneratorRegistry
 from b12x.sequence.gdn_decode._policy import GDN_POLICY, GdnQuery
+from benchmarks.benchmark_gdn_decode import QWEN38_GDN_CASES
+from benchmarks.benchmark_paged_attention import BENCHMARK_PROFILES
+from benchmarks.benchmark_qsa import PROFILES as QSA_PROFILES
 
 
 class _FixedGdnSession(AbstractContextManager["_FixedGdnSession"]):

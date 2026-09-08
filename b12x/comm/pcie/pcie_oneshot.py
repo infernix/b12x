@@ -18,7 +18,6 @@ from torch.distributed import ProcessGroup
 
 from ._cuda_ipc import CudaRTLibrary
 
-
 logger = logging.getLogger(__name__)
 
 SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 10)

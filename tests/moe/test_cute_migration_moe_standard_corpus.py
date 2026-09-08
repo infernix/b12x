@@ -18,13 +18,11 @@ from b12x.moe._shared.kernels.reference import (
     moe_reference_nvfp4,
     moe_reference_w4a8_mx,
 )
-
 from tests._reference.helpers import (
     prepare_tp_moe_fp4_experts,
     require_b12x,
     swizzle_block_scale_reference,
 )
-
 
 _E = 4
 _K = 512

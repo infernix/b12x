@@ -236,9 +236,9 @@ class _QsaSession(AbstractContextManager["_QsaSession"]):
 
         import torch
 
-        from benchmarks.benchmark_qsa import BenchmarkCase, PROFILES, _run_case
         from b12x.attention.qsa._policy import QsaConfig
         from b12x.policy import PolicyContext, PolicyMode
+        from benchmarks.benchmark_qsa import PROFILES, BenchmarkCase, _run_case
 
         from .gpu_workers import _l2_flush_fn
 

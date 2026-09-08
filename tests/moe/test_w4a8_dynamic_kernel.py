@@ -12,23 +12,18 @@ import cutlass
 import cutlass.cute as cute
 import pytest
 import torch
+from cutlass.base_dsl.compiler import OptLevel as _DSLOptLevel
 from cutlass.cute.runtime import make_ptr
 
-from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
+from b12x._lib.compiler import KernelCompileSpec
+from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.intrinsics import (
     _fp4_encode_nibbles,
     fp4_quantize_values_torch,
     st_global_u8,
 )
-from cutlass.base_dsl.compiler import OptLevel as _DSLOptLevel
 
 _OPT_LEVEL_2 = _DSLOptLevel(2)
-from b12x.moe.fused_moe._impl import (
-    _DynamicMoEW4A8Launch,
-    _pad_w4a8_grid_columns,
-    _pad_w4a8_grid_rows,
-    current_cuda_stream,
-)
 from b12x.moe._shared.kernels.dynamic import (
     MoEDynamicKernelBackend,
     _row_major_offset,
@@ -40,7 +35,12 @@ from b12x.moe._shared.kernels.reference import (
     decompose_nvfp4_scales_to_mx_residual,
     moe_reference_w4a8_mx,
 )
-
+from b12x.moe.fused_moe._impl import (
+    _DynamicMoEW4A8Launch,
+    _pad_w4a8_grid_columns,
+    _pad_w4a8_grid_rows,
+    current_cuda_stream,
+)
 from tests._reference.helpers import require_b12x
 
 _TILE_M = 128

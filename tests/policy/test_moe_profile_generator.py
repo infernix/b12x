@@ -26,18 +26,12 @@ from b12x.policy.generation.moe_corpus import (
 from b12x.policy.generation.progress import NullProgressReporter
 from b12x.policy.generation.providers import moe_gpu_worker
 from b12x.policy.generation.providers.moe import (
-    _config_covers_query,
-    _correctness_anchor_rank,
-    _synthesize_token_capacity_coverage,
     MoeCandidate,
     MoeDecodeGenerator,
     MoeMeasurement,
-)
-from b12x.policy.generation.reducer import (
-    DecisionRecord,
-    build_axis_tree,
-    decision_node_to_dict,
-    synthesize_integer_axis_coverage,
+    _config_covers_query,
+    _correctness_anchor_rank,
+    _synthesize_token_capacity_coverage,
 )
 from b12x.policy.generation.providers.moe_gpu_worker import (
     MoeGpuBenchmarkFactory,
@@ -46,23 +40,29 @@ from b12x.policy.generation.providers.moe_gpu_worker import (
     _candidate_environment,
     _candidate_reference_output,
     _candidates_for_geometry,
-    _condition_benchmark_inputs,
     _concrete_candidate_path,
+    _condition_benchmark_inputs,
     _cosine_similarity,
     _finite_float_or_none,
     _is_fatal_accelerator_error,
-    _measurement_seed,
     _maximum_relative_norm_error,
+    _measurement_seed,
     _MoeGeometrySession,
     _MoeProcessSession,
     _MoeRemoteWorkerError,
     _packed_weights,
-    _reset_cuda_graphs,
     _relative_norm_error,
+    _reset_cuda_graphs,
     _trellis_weights,
     _uniform_w4a16_reference,
     _w4a16_direct_path,
     _w4a16_weight_layout,
+)
+from b12x.policy.generation.reducer import (
+    DecisionRecord,
+    build_axis_tree,
+    decision_node_to_dict,
+    synthesize_integer_axis_coverage,
 )
 from b12x.policy.serialization import profile_from_dict
 
@@ -75,8 +75,8 @@ _DEVICE = DeviceIdentity(
 
 
 def test_embedded_moe_profiles_and_heuristics_cover_corpus_queries() -> None:
-    from b12x.policy import PolicyContext, PolicySource
     from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
+    from b12x.policy import PolicyContext, PolicySource
 
     cases = expand_sweep_cases()
 
@@ -2145,8 +2145,8 @@ def test_precision_reduction_confirms_aggregate_without_per_route_veto(confirmed
 
 
 def test_auto_precision_qualifies_each_capacity_and_preserves_exact_holes(tmp_path):
-    from b12x.policy import PolicyContext, PolicyMode, PolicySource, ProfileRegistry
     from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
+    from b12x.policy import PolicyContext, PolicyMode, PolicySource, ProfileRegistry
 
     calls = []
     class Session(_Session):
@@ -2208,8 +2208,13 @@ def test_auto_precision_qualifies_each_capacity_and_preserves_exact_holes(tmp_pa
 ])
 def test_embedded_auto_precision_retains_overrides_and_exact_capacity_coverage(profile_id, route):
     from dataclasses import replace
+
+    from b12x.moe.fused_moe._policy import (
+        MOE_DECODE_POLICY,
+        MoeDecodeConfig,
+        MoeDecodeQuery,
+    )
     from b12x.policy import MOE_DECODE, PolicyContext, PolicyMode, PolicySource
-    from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery, MoeDecodeConfig
 
     profile = EMBEDDED_REGISTRY.get(profile_id)
     context = PolicyContext.for_identity(profile.targets[0], mode=PolicyMode.PREPLANNED_ONLY)
@@ -2239,8 +2244,9 @@ def test_embedded_auto_precision_retains_overrides_and_exact_capacity_coverage(p
 @pytest.mark.parametrize("capacity", [*range(1, 10), 16])
 def test_auto_precision_heuristic_promotes_supported_decode(capability, capacity):
     from dataclasses import replace
-    from b12x.policy import PolicyContext, PolicyMode, PolicySource
+
     from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
+    from b12x.policy import PolicyContext, PolicyMode, PolicySource
 
     device = replace(_DEVICE, compute_capability=capability)
     policy = PolicyContext.for_identity(device, mode=PolicyMode.HEURISTIC_ONLY)

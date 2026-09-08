@@ -17,7 +17,6 @@ from b12x.comm.pcie.pcie_oneshot import (
     _CuTeOneshotBackend,
 )
 
-
 pytestmark = pytest.mark.skipif(
     os.getenv("B12X_RUN_PCIE_ONESHOT_RMS_TEST") != "1",
     reason=(
